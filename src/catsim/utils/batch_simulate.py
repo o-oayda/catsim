@@ -13,6 +13,30 @@ def batch_simulate(
         rng_key: Optional[NPKey] = None,
         parallel_kwargs: Optional[dict[str, Any]] = None
 ) -> tuple[NDArray, NDArray]:
+    """Run ``model_callable`` for each simulation defined in ``theta`` in parallel.
+
+    Parameters
+    ----------
+    theta
+        Mapping of parameter name to arrays/broadcastable scalars. The leading
+        dimension of any array determines the number of simulations to run.
+    model_callable
+        Callable that consumes the per-simulation parameters (and optional
+        ``rng_key``) and returns a tuple ``(x, mask)``.
+    n_workers
+        Number of worker processes/threads passed to ``joblib.Parallel``.
+    rng_key
+        Optional PRNG key. When provided, a unique ``rng_key`` is folded in for
+        each simulation so the runs are reproducible and decorrelated.
+    parallel_kwargs
+        Extra keyword arguments forwarded to ``joblib.Parallel``.
+
+    Returns
+    -------
+    tuple[NDArray, NDArray]
+        The stacked ``x`` and ``mask`` outputs from each simulation, ordered to
+        match the input parameter batches.
+    """
     theta_np = {key: np.asarray(val) for key, val in theta.items()}
 
     def _leading_dim(arr: np.ndarray) -> Optional[int]:
