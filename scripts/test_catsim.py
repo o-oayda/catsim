@@ -1,7 +1,6 @@
-from catsim import CatwiseConfig, Catwise
+from catsim import CatwiseConfig, Catwise, smooth_map
 import healpy as hp
 import matplotlib.pyplot as plt
-from catsim.utils.plotting import smooth_map
 
 
 config = CatwiseConfig(

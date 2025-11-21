@@ -1,7 +1,5 @@
-from catsim import CatwiseConfig, Catwise
-from catsim.utils.batch_simulate import batch_simulate
+from catsim import CatwiseConfig, Catwise, batch_simulate, prng_key
 import numpy as np
-from catsim.utils.rng import prng_key
 
 
 N_SIMS = 10
