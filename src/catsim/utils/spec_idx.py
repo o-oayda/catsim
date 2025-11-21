@@ -10,14 +10,8 @@ class AlphaLookup:
     '''
     Adapted from lookup_alpha_catwise.py from Secrest+21.
     '''
-    def __init__(self, no_check: bool = False) -> None:
-        self.no_check = no_check
-
-        # load only smaller-size version of table if not needed
-        if self.no_check:
-            self.lookup_table_path = 'dipolesbi/catwise/alpha_w12_only.fits'
-        else:
-            self.lookup_table_path = 'dipolesbi/catwise/alpha_colors.fits'
+    def __init__(self) -> None:
+        self.lookup_table_path = 'src/catsim/data/spec_idx/alpha_w12_only.fits'
 
         assert os.path.exists(self.lookup_table_path), 'Cannot find lookup tab.'
         self._load_lookup_data()
@@ -61,9 +55,5 @@ class AlphaLookup:
         self.lookup_tab = Table.read(self.lookup_table_path)
         self.lookup_alpha = self.lookup_tab['alpha'].data.astype('float32')
         self.lookup_W1_W2 = self.lookup_tab['W1_W2'].data.astype('float32')
-
-        if not self.no_check:
-            self.lookup_k_W1 = self.lookup_tab['k_W1'].data.astype('float32')
-            self.lookup_nu_W1_iso = self.lookup_tab['nu_W1_iso'].data.astype('float32')
 
         del self.lookup_tab

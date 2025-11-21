@@ -1,8 +1,10 @@
 from collections import defaultdict
+from typing import Literal
 import healpy as hp
 import numpy as np
 from astropy.coordinates import SkyCoord
 from numpy.typing import NDArray
+import astropy.units as u
 
 
 def downgrade_ignore_nan(
@@ -129,22 +131,25 @@ class Mask:
         )
         return list(masked_pixel_indices)
     
-    def catwise_mask(self) -> list:
+    def catwise_mask(self, version: Literal['S21', 'S22']) -> list:
         '''
-        Return CatWISE2020 mask used in Secrest et al. (2021) in Galactic
-        coordinates, with `nside=64` and in nest ordering.
+        Return CatWISE2020 mask used in Secrest et al. (2021) or
+        Secrest et al. (2022) in Galactic coordinates, 
+        with `nside=64` and with a conversion from ring to nest ordering.
         '''
-        galactic_mask = hp.reorder(
-            np.load('dipolesbi/catwise/CatWISE_Mask_nside64.npy'),
-            r2n=True
-        )
+        if version not in ['S21', 'S22']:
+            raise ValueError(f'Mask version {version} not recognised.')
+
+        mask_path = f'src/catsim/data/mask/{version}_CatWISE_Mask_nside64.npy'
+
+        galactic_mask = hp.reorder(np.load(mask_path), r2n=True)
         masked_pixel_indices = list(np.where(galactic_mask == 0)[0])
         return masked_pixel_indices
     
     def north_ecliptic_mask(self) -> list:
         ecl_north_pole = SkyCoord(
-            lon=0 * u.deg,  # type: ignore
-            lat=90 * u.deg, # type: ignore
+            lon=0 * u.deg, # pyright: ignore[reportAttributeAccessIssue]
+            lat=90 * u.deg, # pyright: ignore[reportAttributeAccessIssue]
             frame='geocentrictrueecliptic'
         )
         gal_north_pole = ecl_north_pole.transform_to('galactic')

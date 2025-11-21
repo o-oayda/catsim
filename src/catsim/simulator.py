@@ -65,6 +65,7 @@ class Catwise:
             f'catwise2020_corr_w12{self.cat_w12_min_str}_w1{self.cat_w1_max_str}.fits'
         )
         self.catalogue_is_loaded = False
+        self.lookups_are_initialised = False
         self.real_file_path = (
             'dipolesbi/catwise/catwise_agns_masked_final_w1lt16p5_alpha.fits'
         )
@@ -108,6 +109,11 @@ class Catwise:
         '''
         :param observer_speed: Observer speed in units of CMB-derived speed.
         '''
+        assert self.lookups_are_initialised, (
+            "Lookup tables must be initialised before generating dipoles. "
+            "Run this class's `initialise_data` method first."
+        )
+
         self.observer_speed = observer_speed * CMB_BETA
         self.dipole_longitude = dipole_longitude
         self.dipole_latitude = dipole_latitude
@@ -451,7 +457,9 @@ class Catwise:
         self.mask_map = np.zeros(self.mask.npix)
 
         assert self.nside == 64, 'CatWISE mask requires nside=64.'
-        masked_pixel_indices = set(self.mask.catwise_mask())
+        masked_pixel_indices = set(
+            self.mask.catwise_mask(self.cfg.base_mask_version)
+        )
         
         if mask_north_ecliptic:
             north_pole_pixels = self.mask.north_ecliptic_mask()
@@ -833,26 +841,24 @@ class Catwise:
     def initialise_data(self):
         self.colour_mag_sampler = MultinomialSample2DHistogram()
         self.colour_mag_sampler.load_data(
-            f'dipolesbi/catwise/{self.cut_path}/data/colour_mag/'
+            f'src/catsim/data/{self.cut_path}/colour_mag/'
         )
         self.w1mag_coverage_rgi = self.load_interpolator(
-            f'dipolesbi/catwise/{self.cut_path}/data/'
-            'mag_coverage/w1_median_error_interpolator.pkl'
+            f'src/catsim/data/{self.cut_path}/mag_coverage/w1_median_error_interpolator.pkl'
         )
         self.w2mag_coverage_rgi = self.load_interpolator(
-            f'dipolesbi/catwise/{self.cut_path}/data/'
-            'mag_coverage/w2_median_error_interpolator.pkl'
+            f'src/catsim/data/{self.cut_path}/mag_coverage/w2_median_error_interpolator.pkl'
         )
-        path = f'dipolesbi/catwise/{self.cut_path}/data/coverage_map/'
+        covmap_path = f'src/catsim/data/{self.cut_path}/coverage_map/'
 
         # loads things back into numpy
         self.w1cov_map: NDArray[np.float32] = np.load(
-            f'{path}w1_coverage_map.npy',
+            f'{covmap_path}w1_coverage_map.npy',
             allow_pickle=False
         ).astype(np.float32, copy=False)
 
         self.w2cov_map: NDArray[np.float32] = np.load(
-            f'{path}w2_coverage_map.npy',
+            f'{covmap_path}w2_coverage_map.npy',
             allow_pickle=False
         ).astype(np.float32, copy=False)
 
@@ -860,10 +866,12 @@ class Catwise:
         self.log_w2cov_map = np.log10(self.w2cov_map).astype(self.dtype)
 
         # initialise AlphaLookup so table is not read in at each simulation
-        self.spectral_lookup = AlphaLookup(no_check=True)
+        self.spectral_lookup = AlphaLookup()
         
         # mask now instead of during each loop
         self.determine_masked_pixels()
+
+        self.lookups_are_initialised = True
         
     def create_error_map(self) -> None:
         assert self.catalogue_is_loaded

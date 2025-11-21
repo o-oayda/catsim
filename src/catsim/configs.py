@@ -6,6 +6,7 @@ class CatwiseConfig:
     cat_w1_max: float
     cat_w12_min: float
     magnitude_error_dist: Literal['gaussian', 'students-t']
+    base_mask_version: Literal['S21', 'S22'] = 'S21'
     use_float32: bool = False
     chunk_size: int = 25_000
     store_final_samples: bool = False

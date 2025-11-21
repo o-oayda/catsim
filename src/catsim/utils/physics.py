@@ -207,3 +207,13 @@ def rotation_matrices_for_dipole(
     forward = rotated_vectors.T
     inverse = forward.T
     return forward.astype(np.float64), inverse.astype(np.float64)
+
+
+def omega_to_theta(omega: float) -> np.float64:
+    '''
+    Convert solid angle in steradins to theta in radians for
+    a cone section of a sphere.
+
+    :param omega: solid angle in steradians.
+    '''
+    return np.arccos( 1 - omega / (2 * np.pi) )
