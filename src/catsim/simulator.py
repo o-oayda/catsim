@@ -13,6 +13,7 @@ import healpy as hp
 from tqdm import tqdm
 import os
 from .utils.healsphere import Mask, ParameterMap, downgrade_ignore_nan
+from .utils.package_data import data_path
 from collections import defaultdict
 import pickle
 from scipy.stats import binned_statistic_2d
@@ -821,12 +822,13 @@ class Catwise:
             print(f"✗ Error saving interpolator: {e}")
             return False
         
-    def load_interpolator(self, full_path: str) -> RegularGridInterpolator:
+    def load_interpolator(self, full_path: os.PathLike[str] | str) -> RegularGridInterpolator:
+        file_path = os.fspath(full_path)
         try:
-            with open(full_path, 'rb') as f:
+            with open(file_path, 'rb') as f:
                 save_data = pickle.load(f)
 
-            print(f"Interpolator loaded from: {full_path}")
+            print(f"Interpolator loaded from: {file_path}")
             print(f"Created: {save_data['metadata']['creation_date']}")
             print(f"Mag range: {save_data['metadata']['mag_range']}")
             print(f"Cov range: {save_data['metadata']['cov_range']}")
@@ -840,27 +842,41 @@ class Catwise:
 
     def initialise_data(self):
         self.colour_mag_sampler = MultinomialSample2DHistogram()
-        self.colour_mag_sampler.load_data(
-            f'src/catsim/data/{self.cut_path}/colour_mag/'
-        )
-        self.w1mag_coverage_rgi = self.load_interpolator(
-            f'src/catsim/data/{self.cut_path}/mag_coverage/w1_median_error_interpolator.pkl'
-        )
-        self.w2mag_coverage_rgi = self.load_interpolator(
-            f'src/catsim/data/{self.cut_path}/mag_coverage/w2_median_error_interpolator.pkl'
-        )
-        covmap_path = f'src/catsim/data/{self.cut_path}/coverage_map/'
+        with data_path(self.cut_path, 'colour_mag') as colour_mag_dir:
+            self.colour_mag_sampler.load_data(colour_mag_dir)
+        with data_path(
+            self.cut_path,
+            'mag_coverage',
+            'w1_median_error_interpolator.pkl'
+        ) as w1_mag_interpolator:
+            self.w1mag_coverage_rgi = self.load_interpolator(w1_mag_interpolator)
+        with data_path(
+            self.cut_path,
+            'mag_coverage',
+            'w2_median_error_interpolator.pkl'
+        ) as w2_mag_interpolator:
+            self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
 
         # loads things back into numpy
-        self.w1cov_map: NDArray[np.float32] = np.load(
-            f'{covmap_path}w1_coverage_map.npy',
-            allow_pickle=False
-        ).astype(np.float32, copy=False)
+        with data_path(
+            self.cut_path,
+            'coverage_map',
+            'w1_coverage_map.npy'
+        ) as w1_cov_path:
+            self.w1cov_map = np.load(
+                w1_cov_path,
+                allow_pickle=False
+            ).astype(np.float32, copy=False)
 
-        self.w2cov_map: NDArray[np.float32] = np.load(
-            f'{covmap_path}w2_coverage_map.npy',
-            allow_pickle=False
-        ).astype(np.float32, copy=False)
+        with data_path(
+            self.cut_path,
+            'coverage_map',
+            'w2_coverage_map.npy'
+        ) as w2_cov_path:
+            self.w2cov_map = np.load(
+                w2_cov_path,
+                allow_pickle=False
+            ).astype(np.float32, copy=False)
 
         self.log_w1cov_map = np.log10(self.w1cov_map).astype(self.dtype)
         self.log_w2cov_map = np.log10(self.w2cov_map).astype(self.dtype)

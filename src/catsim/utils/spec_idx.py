@@ -1,9 +1,10 @@
-import os
+from pathlib import Path
 from typing import Optional
 from astropy.table import Table
 import numpy as np
 from scipy.constants import speed_of_light
 from numpy.typing import NDArray
+from .package_data import data_path
 
 
 class AlphaLookup:
@@ -11,10 +12,8 @@ class AlphaLookup:
     Adapted from lookup_alpha_catwise.py from Secrest+21.
     '''
     def __init__(self) -> None:
-        self.lookup_table_path = 'src/catsim/data/spec_idx/alpha_w12_only.fits'
-
-        assert os.path.exists(self.lookup_table_path), 'Cannot find lookup tab.'
-        self._load_lookup_data()
+        with data_path('spec_idx', 'alpha_w12_only.fits') as lookup_path:
+            self._load_lookup_data(lookup_path)
         self._extrapolate_colour_alpha_relation()
 
         self.AB_VEGA_OFFSET = 2.673
@@ -51,8 +50,8 @@ class AlphaLookup:
 
         return result
     
-    def _load_lookup_data(self):
-        self.lookup_tab = Table.read(self.lookup_table_path)
+    def _load_lookup_data(self, lookup_path: Path) -> None:
+        self.lookup_tab = Table.read(lookup_path)
         self.lookup_alpha = self.lookup_tab['alpha'].data.astype('float32')
         self.lookup_W1_W2 = self.lookup_tab['W1_W2'].data.astype('float32')
 

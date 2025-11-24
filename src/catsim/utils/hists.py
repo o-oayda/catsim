@@ -1,5 +1,6 @@
 import os
 import pickle
+from pathlib import Path
 from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
@@ -82,10 +83,10 @@ class MultinomialSample2DHistogram:
         
         print(f"MultinomialSample2DHistogram built with {len(self.probs_flat)} active bins")
 
-    def save_data(self, save_dir: str) -> None:
+    def save_data(self, save_dir: os.PathLike[str] | str) -> None:
         """Save the multinomial sampler data."""
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+        save_dir_path = Path(save_dir)
+        save_dir_path.mkdir(parents=True, exist_ok=True)
         
         sampler_data = {
             'x_flat': self.x_flat,
@@ -98,12 +99,14 @@ class MultinomialSample2DHistogram:
             'original_shape': self.original_shape
         }
         
-        with open(f'{save_dir}multinomial_sampler_data.pkl', 'wb') as handle:
+        sampler_file = save_dir_path / 'multinomial_sampler_data.pkl'
+        with sampler_file.open('wb') as handle:
             pickle.dump(sampler_data, handle)
 
-    def load_data(self, save_dir: str) -> None:
+    def load_data(self, save_dir: os.PathLike[str] | str) -> None:
         """Load the multinomial sampler data."""
-        with open(f'{save_dir}multinomial_sampler_data.pkl', 'rb') as handle:
+        sampler_file = Path(save_dir) / 'multinomial_sampler_data.pkl'
+        with sampler_file.open('rb') as handle:
             sampler_data = pickle.load(handle)
         
         self.x_flat = sampler_data['x_flat']

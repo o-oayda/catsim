@@ -5,6 +5,7 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from numpy.typing import NDArray
 import astropy.units as u
+from .package_data import data_path
 
 
 def downgrade_ignore_nan(
@@ -140,9 +141,8 @@ class Mask:
         if version not in ['S21', 'S22']:
             raise ValueError(f'Mask version {version} not recognised.')
 
-        mask_path = f'src/catsim/data/mask/{version}_CatWISE_Mask_nside64.npy'
-
-        galactic_mask = hp.reorder(np.load(mask_path), r2n=True)
+        with data_path('mask', f'{version}_CatWISE_Mask_nside64.npy') as mask_path:
+            galactic_mask = hp.reorder(np.load(mask_path), r2n=True)
         masked_pixel_indices = list(np.where(galactic_mask == 0)[0])
         return masked_pixel_indices
     
