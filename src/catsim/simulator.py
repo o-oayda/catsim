@@ -861,10 +861,12 @@ class Catwise:
             self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
 
         # loads things back into numpy
+        # for now we just hardcode the use of the unmasked covmaps;
+        # their masked counterparts still remain in the data dir
         with data_path(
             self.cut_path,
             'coverage_map',
-            'w1_coverage_map.npy'
+            'w1_coverage_map_unmasked.npy'
         ) as w1_cov_path:
             self.w1cov_map = np.load(
                 w1_cov_path,
@@ -874,7 +876,7 @@ class Catwise:
         with data_path(
             self.cut_path,
             'coverage_map',
-            'w2_coverage_map.npy'
+            'w2_coverage_map_unmasked.npy'
         ) as w2_cov_path:
             self.w2cov_map = np.load(
                 w2_cov_path,
