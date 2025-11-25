@@ -12,6 +12,7 @@ import numpy as np
 import healpy as hp
 from tqdm import tqdm
 import os
+from pathlib import Path
 from .utils.healsphere import Mask, ParameterMap, downgrade_ignore_nan
 from .utils.package_data import data_path
 from collections import defaultdict
@@ -85,7 +86,7 @@ class Catwise:
         return f'{self.cat_w12_min_str}_{self.cat_w1_max_str}'
 
     def load_catalogue(self):
-        self.file_path = f'dipolesbi/catwise/{self.file_name}'
+        self.file_path = f'src/catsim/data/{self.file_name}'
         print('Loading CatWISE2020...')
         self.catalogue = Table.read(
             self.file_path,
@@ -637,49 +638,51 @@ class Catwise:
         self.masked_catalogue = self.catalogue[self.catalogue_mask]
         print('Done.')
 
-    def create_coverage_maps(self):
+    def create_coverage_maps(self, use_mask: bool = False):
+        if use_mask:
+            cat = self.masked_catalogue
+            file_descriptor = 'coverage_map'
+        else:
+            cat = self.catalogue
+            file_descriptor = 'coverage_map_unmasked'
+
         pixel_indices = hp.ang2pix(
             self.nside,
-            self.masked_catalogue['l'],
-            self.masked_catalogue['b'],
+            cat['l'],
+            cat['b'],
             lonlat=True,
             nest=True
         )
         print('Building coverage maps...')
         w1_covmap = ParameterMap(
             pixel_indices=pixel_indices,
-            parameter=self.masked_catalogue['w1cov'],
+            parameter=cat['w1cov'],
             nside=self.nside
         ).get_map()
         w2_covmap = ParameterMap(
             pixel_indices=pixel_indices,
-            parameter=self.masked_catalogue['w2cov'],
+            parameter=cat['w2cov'],
             nside=self.nside
         ).get_map()
         
-        file_path = f'dipolesbi/catwise/{self.cut_path}/data/coverage_map/'
-        if not os.path.exists(file_path):
-            os.makedirs(file_path)
-        
-        np.save(
-            f'{file_path}w1_coverage_map.npy',
-            w1_covmap.astype(np.float32, copy=False)
-        )
-        np.save(
-            f'{file_path}w2_coverage_map.npy',
-            w2_covmap.astype(np.float32, copy=False)
-        )
-        print(f'Saved coverage maps at {file_path}.')
+        with data_path(self.cut_path, 'coverage_map') as coverage_dir:
+            coverage_dir.mkdir(parents=True, exist_ok=True)
 
-        plt.figure()
-        hp.projview(w1_covmap, nest=True, norm='log')
-        plt.savefig(f'{file_path}w1_coverage_map.png', dpi=300)
+            w1_npy = coverage_dir / f'w1_{file_descriptor}.npy'
+            w2_npy = coverage_dir / f'w2_{file_descriptor}.npy'
+            np.save(w1_npy, w1_covmap.astype(np.float32, copy=False))
+            np.save(w2_npy, w2_covmap.astype(np.float32, copy=False))
+            print(f'Saved coverage maps at {coverage_dir}.')
 
-        plt.figure()
-        hp.projview(w2_covmap, nest=True, norm='log')
-        plt.savefig(f'{file_path}w2_coverage_map.png', dpi=300)
+            plt.figure()
+            hp.projview(w1_covmap, nest=True, norm='log')
+            plt.savefig(coverage_dir / f'w1_{file_descriptor}.png', dpi=300)
 
-        print(f'Saved coverage map figures at {file_path}.')
+            plt.figure()
+            hp.projview(w2_covmap, nest=True, norm='log')
+            plt.savefig(coverage_dir / f'w2_{file_descriptor}.png', dpi=300)
+
+            print(f'Saved coverage map figures at {coverage_dir}.')
 
     def create_magnitude_coverage_function(self):
         N_1D_BINS = 200
