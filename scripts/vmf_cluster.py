@@ -4,7 +4,7 @@ import numpy as np
 from scipy.stats import poisson, vonmises_fisher
 import healpy as hp
 import argparse
-
+from tqdm import tqdm
 from catsim.utils.plotting import smooth_map
 
 
@@ -33,28 +33,31 @@ if __name__ == '__main__':
         action='store_true'
     )
     parser.add_argument(
-        '--n_parents',
+        '--target_sources',
         type=int,
-        default=1_000
+        default=2_500_000
     )
     parser.add_argument(
-        '--child_rate_param',
+        '--cluster_rate_param',
         type=float,
-        default=100.
+        default=10
     )
-    parser.add_argument(
+    parser.add_argument( # kappa is probably very big to get what we want
         '--kappa',
         type=float,
         default=100.
     )
     args = parser.parse_args()
 
-    N_PARENTS = args.n_parents
-    CHILD_RATE_PARAM = args.child_rate_param
+    TARGET_N_SOURCES = args.target_sources
+    CLUSTER_RATE_PARAM = args.cluster_rate_param
     KAPPA = args.kappa
     DISABLE_3D = args.disable_3d_plots
 
-    long_deg, lat_deg = sample_spherical_points(N_PARENTS)
+    n_parents = int(TARGET_N_SOURCES / CLUSTER_RATE_PARAM)
+    print(CLUSTER_RATE_PARAM, n_parents)
+
+    long_deg, lat_deg = sample_spherical_points(n_parents)
     xyz = spherical_to_cart_deg(long_deg, lat_deg)
 
     x = xyz[:, 0]; y = xyz[:, 1]; z = xyz[:, 2]
@@ -62,8 +65,8 @@ if __name__ == '__main__':
         scatter_3D(x, y, z)
 
     all_offspring = []
-    n_offspring = poisson.rvs(CHILD_RATE_PARAM * np.ones(N_PARENTS))
-    for i in range(N_PARENTS):
+    n_offspring = poisson.rvs(CLUSTER_RATE_PARAM * np.ones(n_parents))
+    for i in tqdm(range(n_parents)):
         parent_direction = xyz[i, :]
         vmf = vonmises_fisher(parent_direction, kappa=KAPPA)
         child_points = vmf.rvs(size=n_offspring[i])
