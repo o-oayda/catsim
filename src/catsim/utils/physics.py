@@ -3,6 +3,7 @@ import numpy as np
 from numpy.typing import NDArray
 from astropy.modeling.rotations import RotateCelestial2Native
 import astropy.units as u
+import healpy as hp
 
 
 def sample_spherical_points(
@@ -217,3 +218,64 @@ def omega_to_theta(omega: float) -> np.float64:
     :param omega: solid angle in steradians.
     '''
     return np.arccos( 1 - omega / (2 * np.pi) )
+
+
+def make_tangent_basis(unit_point_vector: NDArray) -> tuple[NDArray, NDArray]:
+    '''
+    For a given unit vector on the sphere, determine two orthonormal unit vectors
+    lying in the tangent plane to the unit vector.
+    '''
+    zhat = np.asarray([0., 0., 1.])
+    yhat = np.asarray([0., 1., 0.])
+
+    cos_to_z = np.dot(unit_point_vector, zhat) 
+    use_z = np.abs(cos_to_z) < 0.9
+
+    ref = np.empty_like(unit_point_vector)
+    ref[use_z] = zhat
+    ref[~use_z] = yhat
+
+    e1 = np.cross(ref, unit_point_vector)
+    e1 /= np.linalg.norm(e1, axis=1, keepdims=True)
+
+    e2 = np.cross(unit_point_vector, e1)
+    e2 /= np.linalg.norm(e2, axis=1, keepdims=True)
+
+    assert np.isclose(np.linalg.norm(e1, axis=1), 1.).all()
+    assert np.isclose(np.linalg.norm(e2, axis=1), 1.).all()
+
+    return e1, e2
+
+
+def generate_clusters(
+        parent_unit_vectors: NDArray,
+        cluster_rate_param: float,
+        kappa: float,
+        rng: Optional[np.random.Generator]
+) -> tuple[NDArray, NDArray]:
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_parents = parent_unit_vectors.shape[0]
+    per_cluster_n_offspring = rng.poisson(cluster_rate_param * np.ones(n_parents))
+    parent_idxs = np.repeat(np.arange(n_parents), per_cluster_n_offspring)
+    total_n_offspring = np.sum(per_cluster_n_offspring)
+    sigma = kappa ** (-1/2)
+
+    e1, e2 = make_tangent_basis(parent_unit_vectors)
+
+    uv = rng.normal(scale=sigma, size=(int(total_n_offspring), 2))
+    u = uv[:, 0]; v = uv[:, 1]
+
+    # transform perturbation in tangent plane (u,v) back to xyz on unit sphere
+    cluster_vectors = (
+        parent_unit_vectors[parent_idxs, :]
+      + u[:, None] * e1[parent_idxs]
+      + v[:, None] * e2[parent_idxs]
+    )
+
+    norms = np.linalg.norm(cluster_vectors, axis=1, keepdims=True)
+    cluster_vectors /= norms
+    long_cluster_deg, lat_cluster_deg = hp.vec2ang(cluster_vectors, lonlat=True)
+
+    return long_cluster_deg, lat_cluster_deg

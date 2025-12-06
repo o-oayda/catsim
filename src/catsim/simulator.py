@@ -3,8 +3,8 @@ from astropy.table import Table
 from .configs import CatwiseConfig
 from .utils.hists import MultinomialSample2DHistogram
 from .utils.physics import (
-    sample_spherical_points, aberrate_points, boost_magnitudes,
-    rotation_matrices_for_dipole
+    generate_clusters, sample_spherical_points, aberrate_points, boost_magnitudes,
+    rotation_matrices_for_dipole, spherical_to_cart_deg
 )
 from .utils.constants import *
 from .utils.spec_idx import AlphaLookup
@@ -57,6 +57,8 @@ class Catwise:
         self.chunk_size = self.cfg.chunk_size
         self.use_common_extra_error = self.cfg.use_common_extra_error
 
+        self.generate_correlated_points = self.cfg.generate_correlated_points
+
         self.dipole_longitude = CMB_L
         self.dipole_latitude = CMB_B
         self.observer_speed = CMB_BETA
@@ -106,6 +108,8 @@ class Catwise:
             w1_extra_error: Optional[float] = 1.,
             w2_extra_error: Optional[float] = 1.,
             log10_magnitude_error_shape_param: float = 0.,
+            cluster_rate_param: Optional[float] = 10.,
+            log10_cluster_scale_param: Optional[float] = 3.,
             rng_key: Optional[NPKey] = None,
         ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         '''
@@ -187,6 +191,9 @@ class Catwise:
             )
             rest_source_lon_deg, rest_source_lat_deg = self.sample_points(
                 current_chunk,
+                generate_correlated_points=self.generate_correlated_points,
+                cluster_rate_param=cluster_rate_param,
+                log10_cluster_scale_param=log10_cluster_scale_param,
                 rng=rng
             )
 
@@ -1031,9 +1038,56 @@ class Catwise:
             self,
             n_points: int,
             dtype: type = np.float64,
+            generate_correlated_points: bool = False,
+            log10_cluster_scale_param: Optional[float] = None,
+            cluster_rate_param: Optional[float] = None,
             rng: Optional[np.random.Generator] = None
     ) -> tuple[NDArray, NDArray]:
-        longitudes_deg, latitudes_deg = sample_spherical_points(n_points, rng=rng)
+        if generate_correlated_points:
+            assert log10_cluster_scale_param is not None
+            assert cluster_rate_param is not None
+
+            if rng is None:
+                rng = np.random.default_rng()
+
+            longitudes_deg_list: list[NDArray] = []
+            latitudes_deg_list: list[NDArray] = []
+            total = 0
+
+            kappa = 10 ** log10_cluster_scale_param
+
+            while total < n_points:
+                remaining = n_points - total
+                n_parents = max(1, int(np.ceil(remaining / cluster_rate_param)))
+                long_parent_deg, lat_parent_deg = sample_spherical_points(
+                    n_parents, rng=rng
+                )
+                xyz = spherical_to_cart_deg(long_parent_deg, lat_parent_deg)
+
+                child_lon_deg, child_lat_deg = generate_clusters(
+                    parent_unit_vectors=xyz,
+                    cluster_rate_param=cluster_rate_param,
+                    kappa=kappa,
+                    rng=rng
+                )
+
+                if child_lon_deg.size == 0:
+                    continue
+
+                longitudes_deg_list.append(child_lon_deg)
+                latitudes_deg_list.append(child_lat_deg)
+                total += child_lon_deg.size
+
+            longitudes_deg = np.concatenate(longitudes_deg_list)
+            latitudes_deg = np.concatenate(latitudes_deg_list)
+
+            if total > n_points:
+                keep_idx = rng.choice(total, n_points, replace=False)
+                longitudes_deg = longitudes_deg[keep_idx]
+                latitudes_deg = latitudes_deg[keep_idx]
+        else:
+            longitudes_deg, latitudes_deg = sample_spherical_points(n_points, rng=rng)
+
         return longitudes_deg.astype(dtype), latitudes_deg.astype(dtype)
     
     def aberrate_points(self,
