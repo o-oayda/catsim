@@ -71,7 +71,7 @@ class Catwise:
         self.catalogue_is_loaded = False
         self.lookups_are_initialised = False
         self.real_file_path = (
-            'dipolesbi/catwise/catwise_agns_masked_final_w1lt16p5_alpha.fits'
+            'src/catsim/data/catwise_agns_masked_final_w1lt16p5_alpha.fits'
         )
 
         self._coarse_density_map: Optional[NDArray[np.float32]] = None
