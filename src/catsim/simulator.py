@@ -70,9 +70,10 @@ class Catwise:
         )
         self.catalogue_is_loaded = False
         self.lookups_are_initialised = False
-        self.real_file_path = (
-            'src/catsim/data/catwise_agns_masked_final_w1lt16p5_alpha.fits'
+        self.s21_cat_fname = (
+            'catwise_agns_masked_final_w1lt16p5_alpha.fits'
         )
+        self.s21_catalogue_path = self._resolve_s21_path()
 
         self._coarse_density_map: Optional[NDArray[np.float32]] = None
         self._coarse_mask: Optional[NDArray[np.bool_]] = None
@@ -86,6 +87,38 @@ class Catwise:
         self.cat_w1_max_str = str(cat_w1_max).replace('.', 'p')
         self.cat_w12_min_str = str(cat_w12_min).replace('.', 'p')
         return f'{self.cat_w12_min_str}_{self.cat_w1_max_str}'
+
+    def _resolve_s21_path(self) -> Path:
+        env_override = os.environ.get('CATSIM_S21_PATH')
+        if env_override:
+            override_path = Path(env_override).expanduser()
+            if override_path.exists():
+                return override_path
+            raise FileNotFoundError(
+                f"CATSIM_S21_PATH points to missing file: {override_path}"
+            )
+
+        if self.cfg.s21_catalogue_path is not None:
+            config_path = Path(self.cfg.s21_catalogue_path).expanduser()
+            if config_path.exists():
+                return config_path
+            raise FileNotFoundError(
+                'CatwiseConfig.s21_catalogue_path points to missing file: '
+                f'{config_path}'
+            )
+
+        try:
+            with data_path(self.s21_cat_fname) as bundled_path:
+                if bundled_path.exists():
+                    return bundled_path
+        except FileNotFoundError:
+            pass
+
+        raise FileNotFoundError(
+            'CatWISE S21 catalogue not found. Provide the FITS file via '
+            'CatwiseConfig.s21_catalogue_path or set CATSIM_S21_PATH to the '
+            f'full path of {self.s21_cat_fname}.'
+        )
 
     def load_catalogue(self):
         self.file_path = f'src/catsim/data/{self.file_name}'
@@ -354,8 +387,10 @@ class Catwise:
         return output_map, output_mask
     
     def make_real_sample(self) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
-        print(f'Reading in CatWISE2020 from {self.real_file_path}...')
-        self.real_catalogue = Table.read(self.real_file_path)
+        print(f'Reading in CatWISE2020 from {self.s21_catalogue_path}...')
+
+        self.real_catalogue = Table.read(self.s21_catalogue_path)
+
         print(f'Loaded CatWISE2020.')
 
         print('Making flux cuts...')
