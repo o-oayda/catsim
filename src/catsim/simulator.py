@@ -107,6 +107,7 @@ class Catwise:
             dipole_latitude: float = CMB_B,
             w1_extra_error: Optional[float] = 1.,
             w2_extra_error: Optional[float] = 1.,
+            w12_extra_error: Optional[float] = 0.1,
             log10_magnitude_error_shape_param: float = 0.,
             cluster_rate_param: Optional[float] = 10.,
             log10_cluster_scale_param: Optional[float] = 3.,
@@ -182,6 +183,7 @@ class Catwise:
         spectral_buffer = np.empty(chunk_size, dtype=np.float32)
         noise_buffer_w1 = np.empty(chunk_size, dtype=np.float64)
         noise_buffer_w2 = np.empty(chunk_size, dtype=np.float64)
+        noise_buffer_w12 = np.empty(chunk_size, dtype=np.float64)
 
         for start in range(0, self.n_samples, chunk_size):
             current_chunk = min(chunk_size, self.n_samples - start)
@@ -275,6 +277,15 @@ class Catwise:
 
             # after adding error
             boosted_w12_samples = boosted_w1_samples - boosted_w2_samples
+            w12_formal_error = np.hypot(w1_error, w2_error)
+
+            # if w12_extra_error is None, no colour error is added
+            boosted_w12_samples = self.maybe_add_colour_error(
+                w12_magnitudes=boosted_w12_samples,
+                w12_formal_error=w12_formal_error,
+                w12_extra_error=w12_extra_error,
+                rng=rng
+            )
 
             cut = self.magnitude_cut_boolean(
                 w1_magnitudes=boosted_w1_samples,
@@ -596,6 +607,58 @@ class Catwise:
         ).astype(w2_dtype, copy=False)
 
         return noisy_w1, noisy_w2
+
+    def maybe_add_colour_error(
+        self,
+        w12_magnitudes: NDArray,
+        w12_formal_error: NDArray,
+        w12_extra_error: Optional[float],
+        rng: Optional[np.random.Generator] = None,
+        noise_buffer: Optional[NDArray[np.float64]] = None
+    ) -> NDArray:
+        '''
+        Add Gaussian magnitude error to the W12 colour (W1 - W2).
+
+        :param w12_magnitudes: Array of W12 magnitudes to perturb.
+        :param w12_formal_error: Array of formal errors propagated after
+            subtracting W2 from W1 (assuming no correlation for now, which is
+            handled here).
+        :param w12_extra_error: The fractional extra error to apply to the W12
+            magnitudes, i.e. eta. If ``None`` no extra noise is added.
+        :param rng: Optional numpy random generator to use. A default RNG is
+            created when not provided.
+        :param noise_buffer: Optional buffer reused to store the generated
+            noise. When supplied it must match the shape of ``w12_magnitudes``
+            and is overwritten in place.
+        :returns: ``w12_magnitudes`` with an independent Gaussian error added
+            to each element.
+        '''
+        if w12_extra_error is None:
+            return w12_magnitudes
+
+        if noise_buffer is not None:
+            noise_w12 = noise_buffer
+        else:
+            noise_w12 = None
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if noise_w12 is None:
+            noise_w12 = rng.normal(
+                scale=w12_extra_error * w12_formal_error,
+                size=w12_magnitudes.shape
+            )
+        else:
+            rng.normal( # pyright: ignore[reportCallIssue]
+                scale=w12_extra_error * w12_formal_error,
+                size=w12_magnitudes.shape,
+                out=noise_w12
+            )
+        
+        w12_with_added_error = w12_magnitudes + noise_w12
+
+        return w12_with_added_error
     
     def magnitude_cut_boolean(self,
             w1_magnitudes: NDArray,
