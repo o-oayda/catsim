@@ -220,3 +220,4 @@ __marimo__/
 
 # data
 src/catsim/data/catwise2020_corr_*
+src/catsim/data/catwise_agns_*
