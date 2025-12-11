@@ -9,4 +9,7 @@ config = CatwiseConfig(
 sim = Catwise(config)
 
 sim.load_catalogue()
-sim.create_coverage_maps(use_mask=False)
+# sim.create_coverage_maps(use_mask=False)
+sim.determine_masked_pixels()
+sim.make_masked_catalogue()
+sim.create_magnitude_coverage_cell_dist()
