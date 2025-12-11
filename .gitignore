@@ -221,3 +221,4 @@ __marimo__/
 # data
 src/catsim/data/catwise2020_corr_*
 src/catsim/data/catwise_agns_*
+src/catsim/data/0p5_17p0/mag_coverage/archive/*
