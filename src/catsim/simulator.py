@@ -1,7 +1,17 @@
 from typing import Optional, Literal
 from astropy.table import Table
+from catsim.utils.plotting import plot_adaptive_bins
 from .configs import CatwiseConfig
-from .utils.hists import MultinomialSample2DHistogram
+from .utils.hists import (
+    MultinomialSample2DHistogram,
+    build_bin_lookup_grid, 
+    kdtree_binned_distribution_2d, 
+    load_sigma_bins,
+    sample_sigma_from_bins_vectorized_fast, 
+    save_sigma_bins, 
+    sample_sigma_from_bins_vectorized,
+    sample_sigma_w1w2_from_bins_vectorized_fast
+)
 from .utils.physics import (
     generate_clusters, sample_spherical_points, aberrate_points, boost_magnitudes,
     rotation_matrices_for_dipole, spherical_to_cart_deg
@@ -140,7 +150,7 @@ class Catwise:
             dipole_latitude: float = CMB_B,
             w1_extra_error: Optional[float] = 1.,
             w2_extra_error: Optional[float] = 1.,
-            w12_extra_error: Optional[float] = 0.1,
+            w12_extra_error: Optional[float] = None,
             log10_magnitude_error_shape_param: float = 0.,
             cluster_rate_param: Optional[float] = 10.,
             log10_cluster_scale_param: Optional[float] = 3.,
@@ -202,12 +212,16 @@ class Catwise:
         final_w1_list: list[NDArray[np.float32]] = []
         final_w2_list: list[NDArray[np.float32]] = []
         final_w12_list: list[NDArray[np.float32]] = []
+        final_w1e_list: list[NDArray[np.float32]] = []
+        final_w2e_list: list[NDArray[np.float32]] = []
         final_indices_list: list[NDArray[np.int32]] = []
         final_alpha_list: list[NDArray[np.float32]] = []
         final_measured_alpha_list: list[NDArray[np.float32]] = []
 
         self.final_w1_samples = None
         self.final_w2_samples = None
+        self.final_w1e_samples = None
+        self.final_w2e_samples = None
         self.final_w12_samples = None
         self.final_pixel_indices = None
 
@@ -278,25 +292,47 @@ class Catwise:
             source_logw1_cov = self.log_w1cov_map[source_pixel_indices]
             source_logw2_cov = self.log_w2cov_map[source_pixel_indices]
 
-            coverage_query = coverage_query_buffer[:boosted_w1_samples.size]
-            coverage_query[:, 0] = boosted_w1_samples
-            coverage_query[:, 1] = source_logw1_cov
-            w1_error = self.w1mag_coverage_rgi(
-                coverage_query
-            ).astype(np.float32)
+            # coverage_query = coverage_query_buffer[:boosted_w1_samples.size]
+            # coverage_query[:, 0] = boosted_w1_samples
+            # coverage_query[:, 1] = source_logw1_cov
 
-            coverage_query[:, 0] = boosted_w2_samples
-            coverage_query[:, 1] = source_logw2_cov
-            w2_error = self.w2mag_coverage_rgi(
-                coverage_query
-            ).astype(np.float32)
+            w1_error, w2_error = sample_sigma_w1w2_from_bins_vectorized_fast(
+                x_vals=boosted_w1_samples,
+                y_vals=source_logw1_cov,
+                x_grid=self.w1_maggrid,
+                y_grid=self.w1_covgrid,
+                bin_index_grid=self.w1_bin_idx_grid,
+                bin_bounds=self.w1_magcov_bin_bounds,
+                bin_values=self.w1_magcov_bin_values,
+                rng=rng
+            )
+            # w2_error = sample_sigma_from_bins_vectorized_fast(
+            #     x_vals=boosted_w2_samples,
+            #     y_vals=source_logw2_cov,
+            #     x_grid=self.w2_maggrid,
+            #     y_grid=self.w2_covgrid,
+            #     bin_index_grid=self.w2_bin_idx_grid,
+            #     bin_bounds=self.w2_magcov_bin_bounds,
+            #     bin_values=self.w2_magcov_bin_values,
+            #     rng=rng
+            # )
 
+            # w1_error = self.w1mag_coverage_rgi(
+            #     coverage_query
+            # ).astype(np.float32)
+            #
+            # coverage_query[:, 0] = boosted_w2_samples
+            # coverage_query[:, 1] = source_logw2_cov
+            # w2_error = self.w2mag_coverage_rgi(
+            #     coverage_query
+            # ).astype(np.float32)
+            #
             current_noise_buffers = (
                 noise_buffer_w1[:boosted_w1_samples.size],
                 noise_buffer_w2[:boosted_w2_samples.size]
             )
 
-            boosted_w1_samples, boosted_w2_samples = self.add_error(
+            boosted_w1_samples, boosted_w2_samples, w1e, w2e = self.add_error(
                 w1=(boosted_w1_samples, w1_error),
                 w2=(boosted_w2_samples, w2_error),
                 w1_extra_error=w1_extra_error,
@@ -310,6 +346,7 @@ class Catwise:
 
             # after adding error
             boosted_w12_samples = boosted_w1_samples - boosted_w2_samples
+            cur_buffer_w12 = noise_buffer_w12[:boosted_w12_samples.size]
             w12_formal_error = np.hypot(w1_error, w2_error)
 
             # if w12_extra_error is None, no colour error is added
@@ -317,6 +354,7 @@ class Catwise:
                 w12_magnitudes=boosted_w12_samples,
                 w12_formal_error=w12_formal_error,
                 w12_extra_error=w12_extra_error,
+                noise_buffer=cur_buffer_w12,
                 rng=rng
             )
 
@@ -333,6 +371,8 @@ class Catwise:
 
             cut_boosted_w1_samples = boosted_w1_samples[cut]
             cut_boosted_w2_samples = boosted_w2_samples[cut]
+            cut_w1e_samples = w1e[cut]
+            cut_w2e_samples = w2e[cut]
             cut_boosted_w12_samples = boosted_w12_samples[cut]
             cut_source_pixel_indices = source_pixel_indices[cut].astype(np.int32, copy=False)
 
@@ -353,6 +393,8 @@ class Catwise:
                 final_w1_list.append(cut_boosted_w1_samples.astype(np.float32)) 
                 final_w2_list.append(cut_boosted_w2_samples.astype(np.float32))
                 final_w12_list.append(cut_boosted_w12_samples.astype(np.float32))
+                final_w1e_list.append(cut_w1e_samples.astype(np.float32)) 
+                final_w2e_list.append(cut_w2e_samples.astype(np.float32))
                 final_indices_list.append(cut_source_pixel_indices)
                 final_alpha_list.append(true_cut_spectral_indices)
                 final_measured_alpha_list.append(measured_cut_spectral_indices)
@@ -363,6 +405,8 @@ class Catwise:
             if final_w1_list:
                 self.final_w1_samples = np.concatenate(final_w1_list)
                 self.final_w2_samples = np.concatenate(final_w2_list)
+                self.final_w1e_samples = np.concatenate(final_w1e_list)
+                self.final_w2e_samples = np.concatenate(final_w2e_list)
                 self.final_w12_samples = np.concatenate(final_w12_list)
                 self.final_pixel_indices = np.concatenate(final_indices_list)
                 self.final_alpha_samples = np.concatenate(final_alpha_list)
@@ -372,6 +416,8 @@ class Catwise:
             else:
                 self.final_w1_samples = np.empty(0, dtype=np.float32)
                 self.final_w2_samples = np.empty(0, dtype=np.float32)
+                self.final_w1e_samples = np.empty(0, dtype=np.float32)
+                self.final_w2e_samples = np.empty(0, dtype=np.float32)
                 self.final_w12_samples = np.empty(0, dtype=np.float32)
                 self.final_pixel_indices = np.empty(0, dtype=np.int32)
                 self.final_alpha_samples = np.empty(0, dtype=np.float32)
@@ -386,7 +432,10 @@ class Catwise:
             self._coarse_mask = None
         return output_map, output_mask
     
-    def make_real_sample(self) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
+    def make_real_sample(
+            self, 
+            mask_catalogue: bool = False
+    ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         print(f'Reading in CatWISE2020 from {self.s21_catalogue_path}...')
 
         self.real_catalogue = Table.read(self.s21_catalogue_path)
@@ -411,6 +460,25 @@ class Catwise:
         if self.downscale_nside is None:
             self._coarse_real_density_map = None
             self._coarse_real_mask = None
+
+        if mask_catalogue:
+            assert hasattr(self, 'masked_pixel_indices_set'), 'Load mask first.'
+            
+            print('Generating masked catalogue...')
+            all_pixel_indices = hp.ang2pix(
+                self.nside,
+                self.real_catalogue['l'],
+                self.real_catalogue['b'],
+                lonlat=True,
+                nest=True
+            )
+            self.real_catalogue_mask = [
+                idx not in self.masked_pixel_indices_set
+                for idx in all_pixel_indices
+            ]
+            self.real_catalogue = self.real_catalogue[self.real_catalogue_mask]
+            print('Done.')
+
         return output_map, output_mask
 
     def make_density_map(self,
@@ -554,7 +622,7 @@ class Catwise:
             log10_shape_param: float = 0.,
             rng: Optional[np.random.Generator] = None,
             noise_buffers: Optional[tuple[NDArray[np.float64], NDArray[np.float64]]] = None
-    ) -> tuple[NDArray, NDArray]:
+    ) -> tuple[NDArray, NDArray, NDArray, NDArray]:
         """
         Adds random photometric errors to W1 and W2 magnitudes.
 
@@ -641,7 +709,7 @@ class Catwise:
           * np.asarray(w2_sigma, dtype=calc_dtype_w2)
         ).astype(w2_dtype, copy=False)
 
-        return noisy_w1, noisy_w2
+        return noisy_w1, noisy_w2, w1_sigma, w2_sigma
 
     def maybe_add_colour_error(
         self,
@@ -685,11 +753,11 @@ class Catwise:
                 size=w12_magnitudes.shape
             )
         else:
-            rng.normal( # pyright: ignore[reportCallIssue]
-                scale=w12_extra_error * w12_formal_error,
+            rng.standard_normal( # pyright: ignore[reportCallIssue]
                 size=w12_magnitudes.shape,
                 out=noise_w12
             )
+            noise_w12 *= (w12_extra_error * w12_formal_error)
         
         w12_with_added_error = w12_magnitudes + noise_w12
 
@@ -722,7 +790,8 @@ class Catwise:
         # self.create_spectral_index_distribution(no_check=no_check)
         # self.create_error_map()
         self.create_coverage_maps()
-        self.create_magnitude_coverage_function()
+        # self.create_magnitude_coverage_function()
+        self.create_magnitude_coverage_cell_dist()
     
     def make_masked_catalogue(self):
         assert self.catalogue_is_loaded, 'Load catalogue first.'
@@ -789,7 +858,38 @@ class Catwise:
 
             print(f'Saved coverage map figures at {coverage_dir}.')
 
-    def create_magnitude_coverage_function(self):
+    def create_magnitude_coverage_cell_dist(self):
+        cat = self.masked_catalogue
+        x = cat['w1']
+        y = np.log10(cat['w1cov'])
+        z = np.concatenate([cat['w1e'][:, None], cat['w2e'][:, None]], axis=1)
+
+        bin_bounds, bin_values = kdtree_binned_distribution_2d(
+            x, y, z, target_count=10000, max_factor=2, min_count=5000
+        )
+
+        plot_adaptive_bins(
+            bin_bounds,
+            x=x,
+            y=y,
+            show_counts=False,
+            bin_values=bin_values,
+        )
+
+        with data_path(self.cut_path, 'mag_coverage') as file_dir:
+            save_sigma_bins(
+                filename=file_dir / f'error_bins_w1_and_w2.npz',
+                bin_bounds=bin_bounds,
+                bin_values=bin_values
+            )
+            plt.savefig(file_dir / f'adaptive_bins_w1_and_w2.png')
+            plt.close()
+
+    def load_magnitude_coverage_cell_dist(self, file_path: str | Path):
+        bin_bounds, bin_values = load_sigma_bins(file_path)
+        return bin_bounds, bin_values
+
+    def create_magnitude_coverage_function(self, statistic: str = 'median'):
         N_1D_BINS = 200
 
         # define magnitude-coverage grid bins, same for w1 and w2 for simplicity
@@ -810,7 +910,7 @@ class Catwise:
                 self.masked_catalogue[f'{band}'],
                 np.log10(self.masked_catalogue[f'{band}cov']),
                 self.masked_catalogue[f'{band}e'],
-                statistic='median',
+                statistic=statistic,
                 bins=[magnitude_bins, coverage_bins] # type: ignore
             )
             n_sources, *_ = binned_statistic_2d(
@@ -870,24 +970,26 @@ class Catwise:
                 bounds_error=False,
                 fill_value=None # extrapolation for 16.95 -> 17 mag # type: ignore
             )
-            file_path = f'dipolesbi/catwise/{self.cut_path}/data/mag_coverage'
-            self.save_interpolator(
-                band=band,
-                interpolator=rgi,
-                mag_bins=magnitude_bins,
-                cov_bins=coverage_bins,
-                filled_grid=filled_median_error_grid,
-                file_path=file_path
-            )
-            plt.figure()
-            plt.pcolormesh(
-                magnitude_bins,
-                coverage_bins,
-                filled_median_error_grid.T,
-                shading='auto'
-            )
-            plt.colorbar()
-            plt.savefig(f'{file_path}/{band}_matrix_plot.png', dpi=300)
+            with data_path(self.cut_path, 'mag_coverage') as file_path:
+                self.save_interpolator(
+                    band=band,
+                    interpolator=rgi,
+                    mag_bins=magnitude_bins,
+                    cov_bins=coverage_bins,
+                    filled_grid=filled_median_error_grid,
+                    statistic=statistic,
+                    file_path=file_path
+                )
+                plt.figure()
+                plt.pcolormesh(
+                    magnitude_bins,
+                    coverage_bins,
+                    filled_median_error_grid.T,
+                    shading='auto'
+                )
+                plt.colorbar()
+                plt.savefig(f'{file_path}/{band}_matrix_plot.png', dpi=300)
+                plt.close()
 
     def save_interpolator(self,
             band: str,
@@ -895,7 +997,8 @@ class Catwise:
             mag_bins: NDArray[np.float64],
             cov_bins: NDArray[np.float64],
             filled_grid: NDArray[np.float64],
-            file_path: str
+            statistic: str,
+            file_path: str | Path
     ) -> bool:
         '''
         Save RegularGridInterpolator and metadata for use in batch simulations.
@@ -906,6 +1009,7 @@ class Catwise:
             'mag_bins': mag_bins,
             'cov_bins': cov_bins,
             'filled_grid': filled_grid,
+            'statistic': statistic,
             'metadata': {
                 'creation_date': datetime.now().isoformat(),
                 'mag_range': (mag_bins.min(), mag_bins.max()),
@@ -952,18 +1056,36 @@ class Catwise:
         self.colour_mag_sampler = MultinomialSample2DHistogram()
         with data_path(self.cut_path, 'colour_mag') as colour_mag_dir:
             self.colour_mag_sampler.load_data(colour_mag_dir)
-        with data_path(
-            self.cut_path,
-            'mag_coverage',
-            'w1_median_error_interpolator.pkl'
-        ) as w1_mag_interpolator:
-            self.w1mag_coverage_rgi = self.load_interpolator(w1_mag_interpolator)
-        with data_path(
-            self.cut_path,
-            'mag_coverage',
-            'w2_median_error_interpolator.pkl'
-        ) as w2_mag_interpolator:
-            self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
+
+        # with data_path(
+        #     self.cut_path,
+        #     'mag_coverage',
+        #     'w1_median_error_interpolator.pkl'
+        # ) as w1_mag_interpolator:
+        #     self.w1mag_coverage_rgi = self.load_interpolator(w1_mag_interpolator)
+        # with data_path(
+        #     self.cut_path,
+        #     'mag_coverage',
+        #     'w2_median_error_interpolator.pkl'
+        # ) as w2_mag_interpolator:
+        #     self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
+        with data_path(self.cut_path, 'mag_coverage', 'error_bins_w1_and_w2.npz') as filepath:
+            self.w1_magcov_bin_bounds, self.w1_magcov_bin_values = (
+                self.load_magnitude_coverage_cell_dist(filepath)
+            )
+            print('Building mag-cov grid lookup...')
+            self.w1_maggrid, self.w1_covgrid, self.w1_bin_idx_grid = (
+                    build_bin_lookup_grid(self.w1_magcov_bin_bounds)
+            )
+            print('Done.')
+
+        # with data_path(self.cut_path, 'mag_coverage', 'error_bins_w2.npz') as filepath:
+        #     self.w2_magcov_bin_bounds, self.w2_magcov_bin_values = (
+        #         self.load_magnitude_coverage_cell_dist(filepath)
+        #     )
+        #     self.w2_maggrid, self.w2_covgrid, self.w2_bin_idx_grid = (
+        #             build_bin_lookup_grid(self.w2_magcov_bin_bounds)
+        #     )
 
         # loads things back into numpy
         # for now we just hardcode the use of the unmasked covmaps;
