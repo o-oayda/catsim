@@ -7,9 +7,7 @@ from .utils.hists import (
     build_bin_lookup_grid, 
     kdtree_binned_distribution_2d, 
     load_sigma_bins,
-    sample_sigma_from_bins_vectorized_fast, 
     save_sigma_bins, 
-    sample_sigma_from_bins_vectorized,
     sample_sigma_w1w2_from_bins_vectorized_fast
 )
 from .utils.physics import (
