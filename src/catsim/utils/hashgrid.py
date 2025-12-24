@@ -10,13 +10,15 @@ class HashGrid:
             grid_values: dict[str, NDArray],
             grid_step: list[float]
     ) -> None:
-        self.positional_data = np.column_stack(list(grid_coords.values()))
-        self.grid_dim_labels = list(grid_coords.keys())
+        self.grid_dim_labels, coord_arrays = self._prepare_coord_arrays(grid_coords)
+        self.positional_data = np.column_stack(coord_arrays)
         self.ndim = self.positional_data.shape[-1]
         self.n_points = self.positional_data.shape[0]
 
-        self.grid_values = np.column_stack(list(grid_values.values()))
-        self.grid_value_labels = list(grid_values.keys())
+        self.grid_value_labels, value_arrays = self._prepare_value_arrays(
+            grid_values, expected_length=self.n_points
+        )
+        self.grid_values = np.column_stack(value_arrays)
         self.grid_values_ndim = self.grid_values.shape[-1]
         self.n_grid_values = self.grid_values.shape[0]
 
@@ -35,6 +37,43 @@ class HashGrid:
         if np.any(grid_step <= 0):
             raise ValueError("All grid_step values must be > 0.")
 
+    def _prepare_coord_arrays(
+        self, grid_coords: dict[str, NDArray]
+    ) -> tuple[list[str], list[NDArray]]:
+        labels = list(grid_coords.keys())
+        if not labels:
+            raise ValueError("grid_coords must contain at least one dimension.")
+
+        coord_arrays = [np.asarray(grid_coords[label]) for label in labels]
+        coord_lengths = [arr.shape[0] for arr in coord_arrays]
+        if len(set(coord_lengths)) != 1:
+            raise ValueError(
+                "All coordinate arrays must share the same length; "
+                f"got lengths {coord_lengths}."
+            )
+            
+        return labels, coord_arrays
+
+    def _prepare_value_arrays(
+        self,
+        grid_values: dict[str, NDArray],
+        *,
+        expected_length: int,
+    ) -> tuple[list[str], list[NDArray]]:
+        labels = list(grid_values.keys())
+        if not labels:
+            raise ValueError("grid_values must contain at least one value column.")
+            
+        value_arrays = [np.asarray(grid_values[label]) for label in labels]
+        value_lengths = [arr.shape[0] for arr in value_arrays]
+        if len(set(value_lengths)) != 1 or value_lengths[0] != expected_length:
+            raise ValueError(
+                "Each value array must match the length of the coordinate arrays; "
+                f"coords length={expected_length}, value lengths={value_lengths}."
+            )
+
+        return labels, value_arrays
+
     def _build_grid(self):
         self.grid_span, self.grid_nbins = self._determine_grid_nbins()
         grid_ids = self._point_to_grid_id(self.positional_data)
@@ -44,7 +83,7 @@ class HashGrid:
 
     def _determine_grid_nbins(self) -> tuple[NDArray, NDArray]:
         grid_span = self.maxs - self.mins
-        grid_nbins = np.floor(grid_span / self.grid_step) + 1
+        grid_nbins = np.floor(grid_span / self.grid_step).astype(np.int64) + 1
         return grid_span, grid_nbins
 
     def _point_to_grid_id(self, positional_data: NDArray) -> NDArray:
@@ -94,9 +133,30 @@ class HashGrid:
         if rng is None:
             rng = np.random.default_rng()
 
-        grid_query = np.column_stack(
-            list(grid_coords.values())
-        ).astype(np.float32, copy=False)
+        missing = [label for label in self.grid_dim_labels if label not in grid_coords]
+        if missing:
+            raise ValueError(
+                f"Missing required query dimensions: {missing}."
+            )
+
+        extra = [label for label in grid_coords.keys() if label not in self.grid_dim_labels]
+        if extra:
+            raise ValueError(
+                f"Query provided unexpected dimensions: {extra}."
+            )
+
+        query_arrays = [
+            np.asarray(grid_coords[label], dtype=np.float32)
+            for label in self.grid_dim_labels
+        ]
+        query_lengths = [arr.shape[0] for arr in query_arrays]
+        if len(set(query_lengths)) != 1:
+            raise ValueError(
+                "All query coordinate arrays must share the same length; "
+                f"got lengths {query_lengths}."
+            )
+
+        grid_query = np.column_stack(query_arrays).astype(np.float32, copy=False)
         n_query = grid_query.shape[0]
         out = np.empty((n_query, self.grid_values_ndim), dtype=np.float32)
 
