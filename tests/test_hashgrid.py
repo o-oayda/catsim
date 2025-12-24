@@ -1,5 +1,7 @@
 import unittest
 import numpy as np
+import tempfile
+from pathlib import Path
 
 from catsim.utils.hashgrid import HashGrid
 
@@ -95,6 +97,35 @@ class HashGridLinearizationTests(unittest.TestCase):
 
         np.testing.assert_array_equal(scalars, expected)
         self.assertEqual(len(np.unique(scalars)), int_coords.shape[0])
+
+
+class HashGridSerializationTests(unittest.TestCase):
+    def setUp(self):
+        self.grid_coords = {"x": np.array([0.0, 1.0, 2.0]), "y": np.array([3.0, 4.0, 5.0])}
+        self.grid_values = {
+            "sigma": np.array([1.1, 2.2, 3.3]),
+            "tau": np.array([4.4, 5.5, 6.6]),
+        }
+        self.hashgrid = HashGrid(self.grid_coords, self.grid_values, grid_step=[0.5, 0.5])
+
+    def test_save_and_load_preserves_sampling(self):
+        rng = np.random.default_rng(123)
+        query = {"x": np.array([0.0, 2.0]), "y": np.array([3.0, 5.0])}
+        expected = self.hashgrid.sample(query, rng=rng)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "hashgrid.npz"
+            self.hashgrid.save(path)
+            loaded = HashGrid.load(path)
+
+        rng_loaded = np.random.default_rng(123)
+        actual = loaded.sample(query, rng=rng_loaded)
+
+        np.testing.assert_allclose(actual, expected)
+        self.assertEqual(loaded.grid_dim_labels, self.hashgrid.grid_dim_labels)
+        self.assertEqual(loaded.grid_value_labels, self.hashgrid.grid_value_labels)
+        np.testing.assert_array_equal(loaded.grid_values, self.hashgrid.grid_values)
+        np.testing.assert_array_equal(loaded.grid_step, self.hashgrid.grid_step)
 
 
 if __name__ == "__main__":

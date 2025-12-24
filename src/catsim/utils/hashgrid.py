@@ -1,4 +1,5 @@
 from typing import Optional
+from os import PathLike
 from numpy.typing import NDArray
 import numpy as np
 
@@ -211,6 +212,45 @@ class HashGrid:
             out[start:end, :] = out_block
             
         return out
+
+    def save(self, path: str | PathLike[str]) -> None:
+        state = {
+            "grid_dim_labels": np.array(self.grid_dim_labels, dtype="U"),
+            "grid_value_labels": np.array(self.grid_value_labels, dtype="U"),
+            "grid_step": self.grid_step,
+            "positional_data": self.positional_data,
+            "grid_values": self.grid_values,
+            "mins": self.mins,
+            "maxs": self.maxs,
+            "grid_span": self.grid_span,
+            "grid_nbins": self.grid_nbins,
+            "unique_grid_ids": self.unique_grid_ids,
+            "offsets": self.offsets,
+            "members": self.members,
+        }
+        np.savez_compressed(path, **state)
+
+    @classmethod
+    def load(cls, path: str | PathLike[str]) -> "HashGrid":
+        with np.load(path) as data:
+            obj = cls.__new__(cls)
+            obj.grid_dim_labels = data["grid_dim_labels"].astype(str).tolist()
+            obj.grid_value_labels = data["grid_value_labels"].astype(str).tolist()
+            obj.grid_step = data["grid_step"]
+            obj.positional_data = data["positional_data"]
+            obj.grid_values = data["grid_values"]
+            obj.grid_values_ndim = obj.grid_values.shape[-1]
+            obj.n_grid_values = obj.grid_values.shape[0]
+            obj.mins = data["mins"]
+            obj.maxs = data["maxs"]
+            obj.grid_span = data["grid_span"]
+            obj.grid_nbins = data["grid_nbins"]
+            obj.unique_grid_ids = data["unique_grid_ids"]
+            obj.offsets = data["offsets"]
+            obj.members = data["members"]
+            obj.ndim = obj.positional_data.shape[-1]
+            obj.n_points = obj.positional_data.shape[0]
+        return obj
 
 
 if __name__ == '__main__':
