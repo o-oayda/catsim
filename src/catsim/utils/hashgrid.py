@@ -130,6 +130,8 @@ class HashGrid:
             grid_coords: dict[str, NDArray],
             rng: Optional[np.random.Generator] = None,
             batch_size: int = 2_000_000,
+            *,
+            report_success: bool = False,
     ) -> NDArray:
         if rng is None:
             rng = np.random.default_rng()
@@ -160,6 +162,8 @@ class HashGrid:
         grid_query = np.column_stack(query_arrays).astype(np.float32, copy=False)
         n_query = grid_query.shape[0]
         out = np.empty((n_query, self.grid_values_ndim), dtype=np.float32)
+        total_hits = 0
+        total_queries = n_query
 
         for start in range(0, n_query, batch_size):
             end = min(n_query, start + batch_size)
@@ -200,6 +204,7 @@ class HashGrid:
                 out_block[idx_hit, :] = self.grid_values[point_idx, :]
 
             unresolved[idx_hit] = False
+            total_hits += idx_hit.size
 
             # final fallback (global) for anything still unresolved
             if np.any(unresolved):
@@ -211,6 +216,10 @@ class HashGrid:
 
             out[start:end, :] = out_block
             
+        if report_success and total_queries > 0:
+            success_pct = 100.0 * total_hits / total_queries
+            print(f"HashGrid sampling success rate: {success_pct:.2f}%")
+
         return out
 
     def save(self, path: str | PathLike[str]) -> None:

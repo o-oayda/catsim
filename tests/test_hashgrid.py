@@ -71,7 +71,7 @@ class HashGridSampleTests(unittest.TestCase):
         rng = np.random.default_rng(123)
         query = {"x": np.array([100.0, 200.0]), "y": np.array([100.0, 200.0])}
 
-        samples = self.hashgrid.sample(query, rng=rng)
+        samples = self.hashgrid.sample(query, rng=rng, report_success=True)
 
         for value in samples[:, 0]:
             self.assertIn(value, self.grid_values["sigma"])
