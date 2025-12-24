@@ -1,5 +1,6 @@
 from typing import Optional, Literal
 from astropy.table import Table
+from catsim.utils.hashgrid import HashGrid
 from catsim.utils.plotting import plot_adaptive_bins
 from .configs import CatwiseConfig
 from .utils.hists import (
@@ -294,16 +295,27 @@ class Catwise:
             # coverage_query[:, 0] = boosted_w1_samples
             # coverage_query[:, 1] = source_logw1_cov
 
-            w1_error, w2_error = sample_sigma_w1w2_from_bins_vectorized_fast(
-                x_vals=boosted_w1_samples,
-                y_vals=source_logw1_cov,
-                x_grid=self.w1_maggrid,
-                y_grid=self.w1_covgrid,
-                bin_index_grid=self.w1_bin_idx_grid,
-                bin_bounds=self.w1_magcov_bin_bounds,
-                bin_values=self.w1_magcov_bin_values,
+            hashgrid_out = self.hashgrid.sample(
+                grid_coords={
+                    'w1': boosted_w1_samples,
+                    'w1cov': source_logw1_cov,
+                    'w2': boosted_w2_samples,
+                    'w2cov': source_logw2_cov
+                },
                 rng=rng
             )
+            w1_error = hashgrid_out[:, 0]; w2_error = hashgrid_out[:, 1]
+
+            # w1_error, w2_error = sample_sigma_w1w2_from_bins_vectorized_fast(
+            #     x_vals=boosted_w1_samples,
+            #     y_vals=source_logw1_cov,
+            #     x_grid=self.w1_maggrid,
+            #     y_grid=self.w1_covgrid,
+            #     bin_index_grid=self.w1_bin_idx_grid,
+            #     bin_bounds=self.w1_magcov_bin_bounds,
+            #     bin_values=self.w1_magcov_bin_values,
+            #     rng=rng
+            # )
             # w2_error = sample_sigma_from_bins_vectorized_fast(
             #     x_vals=boosted_w2_samples,
             #     y_vals=source_logw2_cov,
@@ -789,7 +801,8 @@ class Catwise:
         # self.create_error_map()
         self.create_coverage_maps()
         # self.create_magnitude_coverage_function()
-        self.create_magnitude_coverage_cell_dist()
+        # self.create_magnitude_coverage_cell_dist()
+        self.create_mag_cov_hashgrid()
     
     def make_masked_catalogue(self):
         assert self.catalogue_is_loaded, 'Load catalogue first.'
@@ -855,6 +868,27 @@ class Catwise:
             plt.savefig(coverage_dir / f'w2_{file_descriptor}.png', dpi=300)
 
             print(f'Saved coverage map figures at {coverage_dir}.')
+
+    def create_mag_cov_hashgrid(self):
+        cat = self.masked_catalogue
+        grid_coords = {
+            'w1': cat['w1'],
+            'w1cov': np.log10(cat['w1cov']),
+            'w2': cat['w2'],
+            'w2cov': np.log10(cat['w2cov'])
+        }
+        grid_values = {
+            'w1e': cat['w1e'],
+            'w2e': cat['w2e']
+        }
+        hashgrid = HashGrid(
+            grid_coords=grid_coords,
+            grid_values=grid_values,
+            grid_step=[0.1, 0.1, 0.1, 0.1]
+        )
+
+        with data_path(self.cut_path, 'mag_coverage') as file_dir:
+            hashgrid.save(file_dir / f'w1w2_magcov_hashgrid.npz')
 
     def create_magnitude_coverage_cell_dist(self):
         cat = self.masked_catalogue
@@ -1067,15 +1101,20 @@ class Catwise:
         #     'w2_median_error_interpolator.pkl'
         # ) as w2_mag_interpolator:
         #     self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
-        with data_path(self.cut_path, 'mag_coverage', 'error_bins_w1_and_w2.npz') as filepath:
-            self.w1_magcov_bin_bounds, self.w1_magcov_bin_values = (
-                self.load_magnitude_coverage_cell_dist(filepath)
-            )
-            print('Building mag-cov grid lookup...')
-            self.w1_maggrid, self.w1_covgrid, self.w1_bin_idx_grid = (
-                    build_bin_lookup_grid(self.w1_magcov_bin_bounds)
-            )
-            print('Done.')
+        with data_path(
+            self.cut_path, 
+            'mag_coverage', 
+            'w1w2_magcov_hashgrid.npz'
+        ) as filepath:
+            self.hashgrid = HashGrid.load(filepath)
+            # self.w1_magcov_bin_bounds, self.w1_magcov_bin_values = (
+            #     self.load_magnitude_coverage_cell_dist(filepath)
+            # )
+            # print('Building mag-cov grid lookup...')
+            # self.w1_maggrid, self.w1_covgrid, self.w1_bin_idx_grid = (
+            #         build_bin_lookup_grid(self.w1_magcov_bin_bounds)
+            # )
+            # print('Done.')
 
         # with data_path(self.cut_path, 'mag_coverage', 'error_bins_w2.npz') as filepath:
         #     self.w2_magcov_bin_bounds, self.w2_magcov_bin_values = (
