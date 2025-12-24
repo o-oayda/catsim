@@ -3,7 +3,7 @@ from catsim import CatwiseConfig, Catwise
 import numpy as np
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import matplotlib.pyplot as plt
 
 
@@ -40,6 +40,8 @@ def _compute_shape(mins: np.ndarray, maxs: np.ndarray, step: np.ndarray) -> np.n
 
 def _coords_to_cell_id(coords: np.ndarray, shape: np.ndarray) -> np.ndarray:
     """
+    Map a 4d integer coordinate (i_0, i_1, i_2, i_3) -> a single scalar index.
+
     coords: (M, 4) int64, clipped to [0, shape[d]-1]
     shape: (4,) int64
     returns: (M,) int64 linear cell id
@@ -152,9 +154,11 @@ def build_sigma_hashgrid_4d(
 
     levels: List[HashGridLevel] = []
     for l in range(n_levels):
-        step_l = base_step_arr * (coarsen_factor ** l)
-        shape_l = _compute_shape(mins_arr, maxs_arr, step_l)
+        step_l = base_step_arr * (coarsen_factor ** l) # coarsen cell size at each level
+        shape_l = _compute_shape(mins_arr, maxs_arr, step_l) # input: min and max along each data dim, step size
+        # we get out the number of grids along each dimension
 
+        # convert data X to integer coordinates, return single cell id for each point
         cell_ids = _points_to_cell_id(X, mins_arr, step_l, shape_l)
         unique_ids, offsets, members = _build_level(X, shape_l, cell_ids)
 
@@ -376,8 +380,6 @@ def print_hashgrid_diagnostics(diag: Dict[str, object]) -> None:
     print(f"Unresolved after all levels (global fallback): {100.0*diag['unresolved_after_levels']:.2f}%")
     print(f"Found within some level:                    {100.0*diag['overall_found_in_levels']:.2f}%")
 
-import numpy as np
-from typing import Dict, Optional
 
 
 def _summarise_sizes(sizes: np.ndarray) -> Dict[str, float]:
@@ -519,6 +521,113 @@ def print_hashgrid_occupancy_stats(stats: Dict[str, object], *, title: str) -> N
 
     print("-" * 88)
 
+# --- Decode linear cell_id to 4D integer coords (i0,i1,i2,i3) ---
+def decode_cell_ids(cell_ids: np.ndarray, shape: np.ndarray) -> np.ndarray:
+    """
+    cell_ids: (U,) int64
+    shape: (4,) int64
+    returns coords: (U,4) int64
+    """
+    cell_ids = np.asarray(cell_ids, dtype=np.int64)
+    shape = np.asarray(shape, dtype=np.int64)
+    n1, n2, n3 = shape[1], shape[2], shape[3]
+    coords = np.empty((cell_ids.size, 4), dtype=np.int64)
+
+    # Reverse of: (((i0*n1 + i1)*n2 + i2)*n3 + i3)
+    coords[:, 3] = cell_ids % n3
+    tmp = cell_ids // n3
+    coords[:, 2] = tmp % n2
+    tmp = tmp // n2
+    coords[:, 1] = tmp % n1
+    coords[:, 0] = tmp // n1
+    return coords
+
+def cell_centers_from_coords(coords: np.ndarray, mins: np.ndarray, step: np.ndarray) -> np.ndarray:
+    """
+    coords: (U,4) int64, mins/step: (4,)
+    returns centers: (U,4) float
+    """
+    return mins + (coords + 0.5) * step
+
+def level_bucket_sizes(level) -> np.ndarray:
+    """Return bucket sizes per occupied cell at this level."""
+    return (level.offsets[1:] - level.offsets[:-1]).astype(np.int64)
+
+def plot_hashgrid_projection(
+    model,
+    level_index: int,
+    dims=(0, 2),
+    *,
+    slice_dims=None,
+    slice_ranges=None,
+    min_occupancy: int = 1,
+    max_cells: int = 200_000,
+    log_color: bool = True,
+    ax=None,
+    s=6,
+    alpha=0.6,
+):
+    """
+    Plot occupied cells of a given level projected to a 2D plane.
+
+    Parameters
+    ----------
+    dims: tuple of two ints in [0..3]
+        Which axes to plot, e.g. (0,2) for (W1mag, W2mag).
+        Axis meaning depends on how you built the model.
+        In your original 4D: 0=W1mag,1=W1cov,2=W2mag,3=W2cov.
+        If you reparameterize, update labels accordingly.
+    slice_dims: tuple of remaining dims to slice on (optional)
+        e.g. slice_dims=(1,3) and slice_ranges=[(1.5,2.0),(1.5,2.0)]
+    slice_ranges: list of (low, high) for each slice dim (same length as slice_dims)
+    min_occupancy: filter out cells with fewer than this many occupants
+    max_cells: cap number of plotted cells (randomly subsample) for performance
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    lvl = model.levels[level_index]
+    sizes = level_bucket_sizes(lvl)
+    keep = sizes >= min_occupancy
+
+    cell_ids = lvl.unique_cell_ids[keep]
+    sizes = sizes[keep]
+
+    coords = decode_cell_ids(cell_ids, lvl.shape)
+    centers = cell_centers_from_coords(coords, model.mins, lvl.step)
+
+    # Optional slicing on other dimensions
+    if slice_dims is not None and slice_ranges is not None:
+        slice_dims = tuple(slice_dims)
+        if len(slice_dims) != len(slice_ranges):
+            raise ValueError("slice_dims and slice_ranges must have the same length.")
+        mask = np.ones(centers.shape[0], dtype=bool)
+        for d, (lo, hi) in zip(slice_dims, slice_ranges):
+            mask &= (centers[:, d] >= lo) & (centers[:, d] <= hi)
+        centers = centers[mask]
+        sizes = sizes[mask]
+
+    # Subsample if needed
+    if centers.shape[0] > max_cells:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(centers.shape[0], size=max_cells, replace=False)
+        centers = centers[idx]
+        sizes = sizes[idx]
+
+    x = centers[:, dims[0]]
+    y = centers[:, dims[1]]
+
+    c = np.log10(sizes) if log_color else sizes
+    sc = ax.scatter(x, y, c=c, s=s, alpha=alpha)
+
+    cb = plt.colorbar(sc, ax=ax)
+    cb.set_label("log10(occupants)" if log_color else "occupants")
+
+    ax.set_xlabel(f"dim {dims[0]}")
+    ax.set_ylabel(f"dim {dims[1]}")
+    ax.set_title(f"Level {level_index} occupied cells (projection {dims})")
+
+    return ax
 
 
 if __name__ == '__main__':
@@ -543,13 +652,22 @@ if __name__ == '__main__':
     w1mag = cat['w1']; w2mag = cat['w2']
     w1cov = np.log10(cat['w1cov']); w2cov = np.log10(cat['w2cov'])
     w1sigma = cat['w1e']; w2sigma = cat['w2e']
+    covmean = w1cov; covdelta = w2cov
+    # covmean = 0.5 * (w1cov + w2cov)
+    # covdelta = w1cov - w2cov
     
+    # plt.figure()
+    # plt.hist2d(w1cov, w2cov, bins=100, norm='log')
+    # plt.figure()
+    # plt.hist2d(covmean, covdelta, bins=100, norm='log')
+    # plt.show()
+    # sys.exit()
     print('Building data structure...')
     model = build_sigma_hashgrid_4d(
-        w1mag, w1cov,
-        w2mag, w2cov,
+        w1mag, covmean,
+        w2mag, covdelta,
         w1sigma, w2sigma,
-        base_step=(0.05, 0.05, 0.01, 0.01),
+        base_step=(0.1, 0.1, 0.1, 0.1),
         n_levels=3,
         coarsen_factor=2.0,
         rng_seed=123,
@@ -557,10 +675,16 @@ if __name__ == '__main__':
     print('Finished building data structure.')
 
     N_SOURCES = len(w1mag)
-    w1mag_sim = w1mag + np.random.normal(scale=0.001, size=(N_SOURCES,))
-    w2mag_sim = w2mag + np.random.normal(scale=0.001, size=(N_SOURCES,))
-    w1cov_sim = w1cov
-    w2cov_sim = w2cov
+    w1mag_sim = np.random.choice(w1mag) + np.random.normal(scale=0.001, size=(N_SOURCES,))
+    w2mag_sim = np.random.choice(w2mag) + np.random.normal(scale=0.001, size=(N_SOURCES,))
+    # w1cov_sim = w1cov
+    # w2cov_sim = w2cov
+    # w1mag_sim = 16.5 * np.ones(shape=(10_000,))
+    # w2mag_sim = 16.3 * np.ones(shape=(10_000,))
+    w1cov_sim = np.random.choice(covmean, size=(N_SOURCES,))
+    w2cov_sim = np.random.choice(covdelta, size=(N_SOURCES,))
+    # w1cov_sim = 1.9  * np.ones(shape=(10_000,))
+    # w2cov_sim = 1.9  * np.ones(shape=(10_000,))
 
     t0 = time.time()
     sig_w1_sim, sig_w2_sim = sample_sigmas_from_hashgrid_4d(
@@ -572,13 +696,18 @@ if __name__ == '__main__':
     t1 = time.time()
     print(t1-t0)
 
-    sig_w1_sim = sig_w1_sim + np.random.normal(scale=0.001, size=(N_SOURCES,))
-    sig_w2_sim = sig_w2_sim + np.random.normal(scale=0.001, size=(N_SOURCES,))
+    sig_w1_sim = sig_w1_sim # + np.random.normal(scale=0.001, size=(N_SOURCES,))
+    sig_w2_sim = sig_w2_sim # + np.random.normal(scale=0.001, size=(N_SOURCES,))
 
-    plt.scatter(sig_w1_sim, sig_w2_sim, s=0.1, alpha=0.3)
     plt.scatter(w1sigma, w2sigma, s=0.1, alpha=0.3)
+    plt.scatter(sig_w1_sim, sig_w2_sim)
+    # plt.scatter(sig_w1_sim, sig_w2_sim, s=0.1, alpha=0.3)
+    # plt.scatter(w1sigma, w2sigma, s=0.1, alpha=0.3)
     plt.show()
     
+    plot_hashgrid_projection(model, level_index=0, dims=(0,2))  # W1mag vs W2mag
+    plt.show()
+
     diagnostics = hashgrid_diagnostics(
         model,
         w1mag_sim, w1cov_sim,
