@@ -31,6 +31,27 @@ class HashGrid:
 
         self._build_grid()
 
+    def __repr__(self) -> str:
+        state = {
+            "grid_dim_labels": np.array(self.grid_dim_labels, dtype="U"),
+            "grid_value_labels": np.array(self.grid_value_labels, dtype="U"),
+            "grid_step": self.grid_step,
+            "positional_data": self.positional_data,
+            "grid_values": self.grid_values,
+            "mins": self.mins,
+            "maxs": self.maxs,
+            "grid_span": self.grid_span,
+            "grid_nbins": self.grid_nbins,
+            "unique_grid_ids": self.unique_grid_ids,
+            "offsets": self.offsets,
+            "members": self.members,
+        }
+        strrepr = 'HashGrid('
+        for key, val in state.items():
+            strrepr += f'\n\t{key}: {val}'
+        strrepr += '\n)'
+        return strrepr
+
     def _check_gridstep_isok(self, grid_step):
         assert len(grid_step) == self.ndim, (
             "Specify a grid step for each dimension of the grid."
