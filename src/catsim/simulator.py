@@ -291,10 +291,6 @@ class Catwise:
             source_logw1_cov = self.log_w1cov_map[source_pixel_indices]
             source_logw2_cov = self.log_w2cov_map[source_pixel_indices]
 
-            # coverage_query = coverage_query_buffer[:boosted_w1_samples.size]
-            # coverage_query[:, 0] = boosted_w1_samples
-            # coverage_query[:, 1] = source_logw1_cov
-
             cov_delta = source_logw1_cov - source_logw2_cov
             cov_mean = 0.5 * (source_logw1_cov + source_logw2_cov)
 
@@ -308,43 +304,12 @@ class Catwise:
                     # 'w2cov': source_logw2_cov
                 },
                 rng=rng,
-                report_success=True
+                report_success=False
             )
             w1_error = hashgrid_out[:, 0]; w2_error = hashgrid_out[:, 1]
             w1_error += rng.normal(loc=0, scale=0.001, size=len(w1_error))
             w2_error += rng.normal(loc=0, scale=0.001, size=len(w2_error))
 
-            # w1_error, w2_error = sample_sigma_w1w2_from_bins_vectorized_fast(
-            #     x_vals=boosted_w1_samples,
-            #     y_vals=source_logw1_cov,
-            #     x_grid=self.w1_maggrid,
-            #     y_grid=self.w1_covgrid,
-            #     bin_index_grid=self.w1_bin_idx_grid,
-            #     bin_bounds=self.w1_magcov_bin_bounds,
-            #     bin_values=self.w1_magcov_bin_values,
-            #     rng=rng
-            # )
-            # w2_error = sample_sigma_from_bins_vectorized_fast(
-            #     x_vals=boosted_w2_samples,
-            #     y_vals=source_logw2_cov,
-            #     x_grid=self.w2_maggrid,
-            #     y_grid=self.w2_covgrid,
-            #     bin_index_grid=self.w2_bin_idx_grid,
-            #     bin_bounds=self.w2_magcov_bin_bounds,
-            #     bin_values=self.w2_magcov_bin_values,
-            #     rng=rng
-            # )
-
-            # w1_error = self.w1mag_coverage_rgi(
-            #     coverage_query
-            # ).astype(np.float32)
-            #
-            # coverage_query[:, 0] = boosted_w2_samples
-            # coverage_query[:, 1] = source_logw2_cov
-            # w2_error = self.w2mag_coverage_rgi(
-            #     coverage_query
-            # ).astype(np.float32)
-            #
             current_noise_buffers = (
                 noise_buffer_w1[:boosted_w1_samples.size],
                 noise_buffer_w2[:boosted_w2_samples.size]
