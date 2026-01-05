@@ -295,16 +295,24 @@ class Catwise:
             # coverage_query[:, 0] = boosted_w1_samples
             # coverage_query[:, 1] = source_logw1_cov
 
+            cov_delta = source_logw1_cov - source_logw2_cov
+            cov_mean = 0.5 * (source_logw1_cov + source_logw2_cov)
+
             hashgrid_out = self.hashgrid.sample(
                 grid_coords={
                     'w1': boosted_w1_samples,
-                    'w1cov': source_logw1_cov,
+                    'delta_cov': cov_delta,
+                    # 'w1cov': source_logw1_cov,
                     'w2': boosted_w2_samples,
-                    'w2cov': source_logw2_cov
+                    'mean_cov': cov_mean
+                    # 'w2cov': source_logw2_cov
                 },
-                rng=rng
+                rng=rng,
+                report_success=True
             )
             w1_error = hashgrid_out[:, 0]; w2_error = hashgrid_out[:, 1]
+            w1_error += rng.normal(loc=0, scale=0.001, size=len(w1_error))
+            w2_error += rng.normal(loc=0, scale=0.001, size=len(w2_error))
 
             # w1_error, w2_error = sample_sigma_w1w2_from_bins_vectorized_fast(
             #     x_vals=boosted_w1_samples,
@@ -793,16 +801,15 @@ class Catwise:
         # load catalogue and mask
         if not self.catalogue_is_loaded:
             self.load_catalogue()
-        self.determine_masked_pixels()
+        self.determine_masked_pixels(mask_north_ecliptic=True)
         self.make_masked_catalogue()
 
         self.create_w1_w2_distribution()
-        # self.create_spectral_index_distribution(no_check=no_check)
-        # self.create_error_map()
         self.create_coverage_maps()
-        # self.create_magnitude_coverage_function()
-        # self.create_magnitude_coverage_cell_dist()
-        self.create_mag_cov_hashgrid()
+        self.create_mag_cov_hashgrid(
+            grid_step=[0.1, 0.01, 0.1, 0.02], 
+            project_coverage=True
+        )
     
     def make_masked_catalogue(self):
         assert self.catalogue_is_loaded, 'Load catalogue first.'
@@ -869,14 +876,32 @@ class Catwise:
 
             print(f'Saved coverage map figures at {coverage_dir}.')
 
-    def create_mag_cov_hashgrid(self):
+    def create_mag_cov_hashgrid(
+            self, 
+            grid_step: list[float], 
+            project_coverage: bool = False
+    ) -> None:
         cat = self.masked_catalogue
-        grid_coords = {
-            'w1': cat['w1'],
-            'w1cov': np.log10(cat['w1cov']),
-            'w2': cat['w2'],
-            'w2cov': np.log10(cat['w2cov'])
-        }
+        logw1cov = np.log10(cat['w1cov'])
+        logw2cov = np.log10(cat['w2cov'])
+
+        if project_coverage:
+            delta_cov = logw1cov - logw2cov
+            mean_cov = 0.5 * ( logw1cov + logw2cov )
+            grid_coords = {
+                'w1': cat['w1'],
+                'delta_cov': delta_cov,
+                'w2': cat['w2'],
+                'mean_cov': mean_cov
+            }
+        else:
+            grid_coords = {
+                'w1': cat['w1'],
+                'w1cov': logw1cov,
+                'w2': cat['w2'],
+                'w2cov': logw2cov
+            }
+
         grid_values = {
             'w1e': cat['w1e'],
             'w2e': cat['w2e']
@@ -884,7 +909,7 @@ class Catwise:
         hashgrid = HashGrid(
             grid_coords=grid_coords,
             grid_values=grid_values,
-            grid_step=[0.1, 0.1, 0.1, 0.1]
+            grid_step=grid_step
         )
 
         with data_path(self.cut_path, 'mag_coverage') as file_dir:
@@ -1154,7 +1179,7 @@ class Catwise:
         self.spectral_lookup = AlphaLookup()
         
         # mask now instead of during each loop
-        self.determine_masked_pixels()
+        self.determine_masked_pixels(mask_north_ecliptic=True)
 
         self.lookups_are_initialised = True
         
@@ -1238,14 +1263,15 @@ class Catwise:
                 **hist_kwargs
             }
         )
-        path = f'dipolesbi/catwise/{self.cut_path}/data/colour_mag/'
-        sampler.save_data(path)
-        print(f'Saved W1-W2 distribution to {path}.')
 
-        print(f'Generating W1-W2 distribution plot...')
-        w1_samples, w2_samples = sampler.sample(n_samples=30_000_000)
-        plt.hist2d(w1_samples, w2_samples, bins=400, norm='log')
-        plt.savefig(f'{path}w1_w2_dist.png', dpi=300)
+        with data_path(self.cut_path, 'colour_mag') as colour_mag_dir:
+            sampler.save_data(colour_mag_dir)
+            print(f'Saved W1-W2 distribution to {colour_mag_dir}.')
+
+            w1_samples, w2_samples = sampler.sample(n_samples=30_000_000)
+            plt.hist2d(w1_samples, w2_samples, bins=400, norm='log')
+            plt.savefig(colour_mag_dir / 'w1_w2_dist.png', dpi=300)
+            print(f'Generated W1-W2 distribution plot...')
     
     def resample_catwise_magnitudes(
             self,
