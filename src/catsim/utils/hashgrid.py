@@ -262,7 +262,7 @@ class HashGrid:
 
     @classmethod
     def load(cls, path: str | PathLike[str]) -> "HashGrid":
-        with np.load(path) as data:
+        with np.load(path, allow_pickle=True) as data:
             obj = cls.__new__(cls)
             obj.grid_dim_labels = data["grid_dim_labels"].astype(str).tolist()
             obj.grid_value_labels = data["grid_value_labels"].astype(str).tolist()
