@@ -83,7 +83,11 @@ class MultinomialSample2DHistogram:
         
         print(f"MultinomialSample2DHistogram built with {len(self.probs_flat)} active bins")
 
-    def save_data(self, save_dir: os.PathLike[str] | str) -> None:
+    def save_data(
+            self, 
+            save_dir: os.PathLike[str] | str, 
+            fname_append: Optional[str] = None
+    ) -> None:
         """Save the multinomial sampler data."""
         save_dir_path = Path(save_dir)
         save_dir_path.mkdir(parents=True, exist_ok=True)
@@ -98,14 +102,28 @@ class MultinomialSample2DHistogram:
             'y_edges': self.y_edges,
             'original_shape': self.original_shape
         }
-        
-        sampler_file = save_dir_path / 'multinomial_sampler_data.pkl'
+
+        if fname_append:
+            sampler_file = save_dir_path / f'multinomial_sampler_data{fname_append}.pkl'
+        else:
+            sampler_file = save_dir_path / 'multinomial_sampler_data.pkl'
+
         with sampler_file.open('wb') as handle:
             pickle.dump(sampler_data, handle)
 
-    def load_data(self, save_dir: os.PathLike[str] | str) -> None:
+    def load_data(
+            self, 
+            save_dir: os.PathLike[str] | str,
+            fname_append: Optional[str] = None
+    ) -> None:
         """Load the multinomial sampler data."""
-        sampler_file = Path(save_dir) / 'multinomial_sampler_data.pkl'
+        if fname_append:
+            sampler_file = (
+                Path(save_dir) / f'multinomial_sampler_data{fname_append}.pkl'
+            )
+        else:
+            sampler_file = Path(save_dir) / 'multinomial_sampler_data.pkl'
+
         with sampler_file.open('rb') as handle:
             sampler_data = pickle.load(handle)
         

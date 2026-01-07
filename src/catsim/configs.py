@@ -15,6 +15,7 @@ class CatwiseConfig:
     downscale_nside: Optional[int] = None
     generate_correlated_points: bool = False
     s21_catalogue_path: Optional[str] = None
+    use_noecl_mask: bool = False
 
     def __post_init__(self) -> None:
         if self.magnitude_error_dist not in ('gaussian', 'students-t'):

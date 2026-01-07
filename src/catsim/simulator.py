@@ -65,6 +65,7 @@ class Catwise:
         self.store_final_samples = self.cfg.store_final_samples
         self.chunk_size = self.cfg.chunk_size
         self.use_common_extra_error = self.cfg.use_common_extra_error
+        self.use_noecl_mask = self.cfg.use_noecl_mask
 
         self.generate_correlated_points = self.cfg.generate_correlated_points
 
@@ -762,11 +763,13 @@ class Catwise:
         )
         return condition
 
-    def precompute_data(self): 
+    def precompute_data(self, mask_north_ecliptic: bool = True) -> None: 
         # load catalogue and mask
+        self.northecl_is_masked = mask_north_ecliptic
         if not self.catalogue_is_loaded:
             self.load_catalogue()
-        self.determine_masked_pixels(mask_north_ecliptic=True)
+
+        self.determine_masked_pixels(mask_north_ecliptic=mask_north_ecliptic)
         self.make_masked_catalogue()
 
         self.create_w1_w2_distribution()
@@ -878,7 +881,10 @@ class Catwise:
         )
 
         with data_path(self.cut_path, 'mag_coverage') as file_dir:
-            hashgrid.save(file_dir / f'w1w2_magcov_hashgrid.npz')
+            if self.northecl_is_masked:
+                hashgrid.save(file_dir / f'w1w2_magcov_hashgrid.npz')
+            else:
+                hashgrid.save(file_dir / f'w1w2_magcov_hashgrid_no_eclmask.npz')
 
     def create_magnitude_coverage_cell_dist(self):
         cat = self.masked_catalogue
@@ -1075,44 +1081,24 @@ class Catwise:
             raise Exception(e)
 
     def initialise_data(self):
+        if self.use_noecl_mask:
+            fname_append = '_no_eclmask'
+        else:
+            fname_append = ''
+
         self.colour_mag_sampler = MultinomialSample2DHistogram()
         with data_path(self.cut_path, 'colour_mag') as colour_mag_dir:
-            self.colour_mag_sampler.load_data(colour_mag_dir)
+            self.colour_mag_sampler.load_data(
+                colour_mag_dir,
+                fname_append=fname_append if self.use_noecl_mask else None
+            )
 
-        # with data_path(
-        #     self.cut_path,
-        #     'mag_coverage',
-        #     'w1_median_error_interpolator.pkl'
-        # ) as w1_mag_interpolator:
-        #     self.w1mag_coverage_rgi = self.load_interpolator(w1_mag_interpolator)
-        # with data_path(
-        #     self.cut_path,
-        #     'mag_coverage',
-        #     'w2_median_error_interpolator.pkl'
-        # ) as w2_mag_interpolator:
-        #     self.w2mag_coverage_rgi = self.load_interpolator(w2_mag_interpolator)
         with data_path(
             self.cut_path, 
             'mag_coverage', 
-            'w1w2_magcov_hashgrid.npz'
+            f'w1w2_magcov_hashgrid{fname_append}.npz'
         ) as filepath:
             self.hashgrid = HashGrid.load(filepath)
-            # self.w1_magcov_bin_bounds, self.w1_magcov_bin_values = (
-            #     self.load_magnitude_coverage_cell_dist(filepath)
-            # )
-            # print('Building mag-cov grid lookup...')
-            # self.w1_maggrid, self.w1_covgrid, self.w1_bin_idx_grid = (
-            #         build_bin_lookup_grid(self.w1_magcov_bin_bounds)
-            # )
-            # print('Done.')
-
-        # with data_path(self.cut_path, 'mag_coverage', 'error_bins_w2.npz') as filepath:
-        #     self.w2_magcov_bin_bounds, self.w2_magcov_bin_values = (
-        #         self.load_magnitude_coverage_cell_dist(filepath)
-        #     )
-        #     self.w2_maggrid, self.w2_covgrid, self.w2_bin_idx_grid = (
-        #             build_bin_lookup_grid(self.w2_magcov_bin_bounds)
-        #     )
 
         # loads things back into numpy
         # for now we just hardcode the use of the unmasked covmaps;
@@ -1144,7 +1130,7 @@ class Catwise:
         self.spectral_lookup = AlphaLookup()
         
         # mask now instead of during each loop
-        self.determine_masked_pixels(mask_north_ecliptic=True)
+        self.determine_masked_pixels(mask_north_ecliptic=not self.use_noecl_mask)
 
         self.lookups_are_initialised = True
         
@@ -1229,13 +1215,23 @@ class Catwise:
             }
         )
 
+        if not self.northecl_is_masked:
+            fname_append = '_no_eclmask'
+        else:
+            fname_append = None
+
         with data_path(self.cut_path, 'colour_mag') as colour_mag_dir:
-            sampler.save_data(colour_mag_dir)
+            sampler.save_data(colour_mag_dir, fname_append=fname_append)
             print(f'Saved W1-W2 distribution to {colour_mag_dir}.')
 
             w1_samples, w2_samples = sampler.sample(n_samples=30_000_000)
             plt.hist2d(w1_samples, w2_samples, bins=400, norm='log')
-            plt.savefig(colour_mag_dir / 'w1_w2_dist.png', dpi=300)
+
+            if fname_append:
+                plt.savefig(colour_mag_dir / f'w1_w2_dist{fname_append}.png', dpi=300)
+            else:
+                plt.savefig(colour_mag_dir / 'w1_w2_dist.png', dpi=300)
+
             print(f'Generated W1-W2 distribution plot...')
     
     def resample_catwise_magnitudes(
