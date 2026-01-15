@@ -155,8 +155,8 @@ class Catwise:
             log10_magnitude_error_shape_param: float = 0.,
             cluster_rate_param: Optional[float] = 10.,
             log10_cluster_scale_param: Optional[float] = 3.,
-            w1conf_scale: Optional[float] = None,
-            w2conf_scale: Optional[float] = None,
+            log10_w1conf_scale: Optional[float] = None,
+            log10_w2conf_scale: Optional[float] = None,
             rng_key: Optional[NPKey] = None,
         ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         '''
@@ -315,7 +315,9 @@ class Catwise:
             formal_w2_error += rng.normal(loc=0, scale=0.001, size=len(formal_w2_error))
 
             if self.add_confusion_noise:
-                assert w1conf_scale is not None; assert w2conf_scale is not None
+                assert log10_w1conf_scale is not None; assert log10_w2conf_scale is not None
+                w1conf_scale = 10 ** log10_w1conf_scale
+                w2conf_scale = 10 ** log10_w2conf_scale
 
                 w1_confusion_proxy, w2_confusion_proxy = self.sample_confusion(
                     source_pixel_indices, rng
@@ -323,6 +325,8 @@ class Catwise:
             else:
                 w1_confusion_proxy = None
                 w2_confusion_proxy = None
+                w1conf_scale = None
+                w2conf_scale = None
 
             total_w1_error, total_w2_error = self.compute_total_error(
                 formal_error=(formal_w1_error, formal_w2_error),
