@@ -1,5 +1,5 @@
 from typing import Optional, Literal
-from astropy.table import Table
+from astropy.table import Table, join
 from catsim.utils.hashgrid import HashGrid
 from catsim.utils.plotting import plot_adaptive_bins
 from .configs import CatwiseConfig
@@ -68,6 +68,7 @@ class Catwise:
         self.use_noecl_mask = self.cfg.use_noecl_mask
 
         self.generate_correlated_points = self.cfg.generate_correlated_points
+        self.add_confusion_noise = self.cfg.add_confusion_noise
 
         self.dipole_longitude = CMB_L
         self.dipole_latitude = CMB_B
@@ -154,6 +155,8 @@ class Catwise:
             log10_magnitude_error_shape_param: float = 0.,
             cluster_rate_param: Optional[float] = 10.,
             log10_cluster_scale_param: Optional[float] = 3.,
+            w1conf_scale: Optional[float] = None,
+            w2conf_scale: Optional[float] = None,
             rng_key: Optional[NPKey] = None,
         ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         '''
@@ -307,9 +310,27 @@ class Catwise:
                 rng=rng,
                 report_success=False
             )
-            w1_error = hashgrid_out[:, 0]; w2_error = hashgrid_out[:, 1]
-            w1_error += rng.normal(loc=0, scale=0.001, size=len(w1_error))
-            w2_error += rng.normal(loc=0, scale=0.001, size=len(w2_error))
+            formal_w1_error = hashgrid_out[:, 0]; formal_w2_error = hashgrid_out[:, 1]
+            formal_w1_error += rng.normal(loc=0, scale=0.001, size=len(formal_w1_error))
+            formal_w2_error += rng.normal(loc=0, scale=0.001, size=len(formal_w2_error))
+
+            if self.add_confusion_noise:
+                assert w1conf_scale is not None; assert w2conf_scale is not None
+
+                w1_confusion_proxy, w2_confusion_proxy = self.sample_confusion(
+                    source_pixel_indices, rng
+                )
+            else:
+                w1_confusion_proxy = None
+                w2_confusion_proxy = None
+
+            total_w1_error, total_w2_error = self.compute_total_error(
+                formal_error=(formal_w1_error, formal_w2_error),
+                extra_formal_error=(w1_extra_error, w2_extra_error),
+                common_extra_formal_error=common_extra_error,
+                confusion_error=(w1_confusion_proxy, w2_confusion_proxy),
+                confusion_scale=(w1conf_scale, w2conf_scale)
+            )
 
             current_noise_buffers = (
                 noise_buffer_w1[:boosted_w1_samples.size],
@@ -317,11 +338,8 @@ class Catwise:
             )
 
             boosted_w1_samples, boosted_w2_samples, w1e, w2e = self.add_error(
-                w1=(boosted_w1_samples, w1_error),
-                w2=(boosted_w2_samples, w2_error),
-                w1_extra_error=w1_extra_error,
-                w2_extra_error=w2_extra_error,
-                common_extra_error=common_extra_error,
+                w1=(boosted_w1_samples, total_w1_error),
+                w2=(boosted_w2_samples, total_w2_error),
                 error_dist=magnitude_error_dist,
                 log10_shape_param=log10_magnitude_error_shape_param,
                 rng=rng,
@@ -331,16 +349,16 @@ class Catwise:
             # after adding error
             boosted_w12_samples = boosted_w1_samples - boosted_w2_samples
             cur_buffer_w12 = noise_buffer_w12[:boosted_w12_samples.size]
-            w12_formal_error = np.hypot(w1_error, w2_error)
-
-            # if w12_extra_error is None, no colour error is added
-            boosted_w12_samples = self.maybe_add_colour_error(
-                w12_magnitudes=boosted_w12_samples,
-                w12_formal_error=w12_formal_error,
-                w12_extra_error=w12_extra_error,
-                noise_buffer=cur_buffer_w12,
-                rng=rng
-            )
+            # w12_formal_error = np.hypot(formal_w1_error, formal_w2_error)
+            #
+            # # if w12_extra_error is None, no colour error is added
+            # boosted_w12_samples = self.maybe_add_colour_error(
+            #     w12_magnitudes=boosted_w12_samples,
+            #     w12_formal_error=w12_formal_error,
+            #     w12_extra_error=w12_extra_error,
+            #     noise_buffer=cur_buffer_w12,
+            #     rng=rng
+            # )
 
             cut = self.magnitude_cut_boolean(
                 w1_magnitudes=boosted_w1_samples,
@@ -596,12 +614,58 @@ class Catwise:
         mask_slice = self.mask_map[source_pixel_indices] == 0
         return mask_slice, source_pixel_indices
 
+    def compute_total_error(
+        self,
+        formal_error: tuple[NDArray, NDArray],
+        extra_formal_error: tuple[float | None, float | None],
+        common_extra_formal_error: bool | None,
+        confusion_error: tuple[NDArray | None, NDArray | None],
+        confusion_scale: tuple[float | None, float | None],
+    ) -> tuple[NDArray, NDArray]:
+        '''
+        Should follow relationship sigm_tot^2 = sigm_totformal^2 + sigm_totconf^2
+        where sigm_totformal^2 = sigm_formal^2 + eta_extra * sigm_formal^2
+        and sigm_totconf^2 = (k sigm_conf)^2
+        '''
+        w1_formal, w2_formal = formal_error
+        w1_extra_err, w2_extra_err = extra_formal_error
+
+        if common_extra_formal_error and w1_extra_err is not None:
+            w2_extra_err = w1_extra_err
+
+        # sigma^2 = sigma_b^2 + extra * sigma_b^2 => sigma = sigma_b sqrt( 1 + extra )
+        if w1_extra_err is not None:
+            w1_formal = np.multiply(
+                w1_formal,
+                np.sqrt(np.array(1.0 + w1_extra_err))
+            )
+        if w2_extra_err is not None:
+            w2_formal = np.multiply(
+                w2_formal,
+                np.sqrt(np.array(1.0 + w2_extra_err))
+            )
+
+        if self.add_confusion_noise:
+            w1_confusion, w2_confusion = confusion_error
+            w1conf_scale, w2conf_scale = confusion_scale
+
+            assert (w1_confusion is not None) and (w2_confusion is not None)
+            assert (w1conf_scale is not None) and (w2conf_scale is not None)
+
+            w1_confusion *= w1conf_scale
+            w2_confusion *= w2conf_scale
+
+            total_w1_error = np.hypot(w1_formal, w1_confusion)
+            total_w2_error = np.hypot(w2_formal, w2_confusion)
+        else:
+            total_w1_error = w1_formal
+            total_w2_error = w2_formal
+
+        return total_w1_error, total_w2_error
+
     def add_error(self,
             w1: tuple[NDArray, NDArray],
             w2: tuple[NDArray, NDArray],
-            w1_extra_error: Optional[float] = None,
-            w2_extra_error: Optional[float] = None,
-            common_extra_error: Optional[bool] = False,
             error_dist: Literal['gaussian', 'students-t'] = 'gaussian',
             log10_shape_param: float = 0.,
             rng: Optional[np.random.Generator] = None,
@@ -626,36 +690,13 @@ class Catwise:
         w1_dtype = w1_magnitudes.dtype
         w2_dtype = w2_magnitudes.dtype
 
-        if common_extra_error and w1_extra_error is not None:
-            w2_extra_error = w1_extra_error
-
-        w1_sigma = np.array(w1_error, dtype=w1_dtype, copy=True)
-        w2_sigma = np.array(w2_error, dtype=w2_dtype, copy=True)
-
-        # sigma^2 = sigma_b^2 + extra * sigma_b^2 => sigma = sigma_b sqrt( 1 + extra )
-        if w1_extra_error is not None:
-            np.multiply(
-                w1_sigma,
-                np.sqrt(np.array(1.0 + w1_extra_error, dtype=w1_dtype)),
-                out=w1_sigma,
-                casting='unsafe'
-            )
-
-        if w2_extra_error is not None:
-            np.multiply(
-                w2_sigma,
-                np.sqrt(np.array(1.0 + w2_extra_error, dtype=w2_dtype)),
-                out=w2_sigma,
-                casting='unsafe'
-            )
-
         if rng is None:
             rng = np.random.default_rng()
 
         if noise_buffers is not None:
             noise_w1_buf, noise_w2_buf = noise_buffers
-            noise_w1 = noise_w1_buf[:w1_sigma.size]
-            noise_w2 = noise_w2_buf[:w2_sigma.size]
+            noise_w1 = noise_w1_buf[:w1_error.size]
+            noise_w2 = noise_w2_buf[:w2_error.size]
         else:
             noise_w1 = None
             noise_w2 = None
@@ -665,18 +706,18 @@ class Catwise:
                 rng.standard_normal(out=noise_w1)
                 rng.standard_normal(out=noise_w2)
             else:
-                noise_w1 = rng.standard_normal(size=w1_sigma.shape)
-                noise_w2 = rng.standard_normal(size=w2_sigma.shape)
+                noise_w1 = rng.standard_normal(size=w1_error.shape)
+                noise_w2 = rng.standard_normal(size=w2_error.shape)
         else:
             shape_param = float(10 ** log10_shape_param)
             if shape_param <= 0:
                 raise ValueError("Student's t shape parameter must be positive.")
             if noise_w1 is not None and noise_w2 is not None:
-                noise_w1[:] = rng.standard_t(df=shape_param, size=w1_sigma.shape)
-                noise_w2[:] = rng.standard_t(df=shape_param, size=w2_sigma.shape)
+                noise_w1[:] = rng.standard_t(df=shape_param, size=w1_error.shape)
+                noise_w2[:] = rng.standard_t(df=shape_param, size=w2_error.shape)
             else:
-                noise_w1 = rng.standard_t(df=shape_param, size=w1_sigma.shape)
-                noise_w2 = rng.standard_t(df=shape_param, size=w2_sigma.shape)
+                noise_w1 = rng.standard_t(df=shape_param, size=w1_error.shape)
+                noise_w2 = rng.standard_t(df=shape_param, size=w2_error.shape)
 
         calc_dtype_w1 = np.float64 if w1_dtype == np.float64 else np.float32
         calc_dtype_w2 = np.float64 if w2_dtype == np.float64 else np.float32
@@ -684,16 +725,16 @@ class Catwise:
         noisy_w1 = (
             np.asarray(w1_magnitudes, dtype=calc_dtype_w1)
           + noise_w1.astype(calc_dtype_w1, copy=False)
-          * np.asarray(w1_sigma, dtype=calc_dtype_w1)
+          * np.asarray(w1_error, dtype=calc_dtype_w1)
         ).astype(w1_dtype, copy=False)
 
         noisy_w2 = (
             np.asarray(w2_magnitudes, dtype=calc_dtype_w2)
           + noise_w2.astype(calc_dtype_w2, copy=False)
-          * np.asarray(w2_sigma, dtype=calc_dtype_w2)
+          * np.asarray(w2_error, dtype=calc_dtype_w2)
         ).astype(w2_dtype, copy=False)
 
-        return noisy_w1, noisy_w2, w1_sigma, w2_sigma
+        return noisy_w1, noisy_w2, w1_error, w2_error
 
     def maybe_add_colour_error(
         self,
@@ -772,6 +813,7 @@ class Catwise:
         self.determine_masked_pixels(mask_north_ecliptic=mask_north_ecliptic)
         self.make_masked_catalogue()
 
+        self.create_confusion_skylookup()
         self.create_w1_w2_distribution()
         self.create_coverage_maps()
         self.create_mag_cov_hashgrid(
@@ -797,6 +839,118 @@ class Catwise:
         ]
         self.masked_catalogue = self.catalogue[self.catalogue_mask]
         print('Done.')
+
+    def create_confusion_skylookup(self):
+        assert self.catalogue_is_loaded
+        assert hasattr(self, 'masked_catalogue')
+
+        print('Joining supplementary confusion data...')
+        masked_len = len(self.masked_catalogue)
+        with data_path() as data_dir:
+            conf_table = Table.read(data_dir / 'catwise_w120p5_confdata.fits')
+
+        # strict intersection operation at source_id
+        out = join(self.masked_catalogue, conf_table, keys="source_id")
+        consolidated_len = len(out)
+        del conf_table
+
+        assert consolidated_len == masked_len
+
+        # make vectorized lookup arrays (sorted by pixel index)
+        pixel_indices = hp.ang2pix(self.nside, out['l'], out['b'], lonlat=True, nest=True)
+        n_pix = hp.nside2npix(self.nside)
+        order = np.argsort(pixel_indices)
+        pix_sorted = np.asarray(pixel_indices, dtype=np.int64)[order]
+        w1conf_sorted = np.asarray(out['w1conf'] / out['w1flux'], dtype=np.float32)[order]
+        w2conf_sorted = np.asarray(out['w2conf'] / out['w2flux'], dtype=np.float32)[order]
+
+        counts = np.bincount(pix_sorted, minlength=n_pix).astype(np.int64)
+        starts = np.cumsum(counts) - counts
+
+        self.confusion_pixel_counts = counts
+        self.confusion_pixel_starts = starts
+        self.confusion_w1_values = w1conf_sorted
+        self.confusion_w2_values = w2conf_sorted
+
+        with data_path(self.cut_path, 'confusion') as conf_dir:
+            conf_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                conf_dir / 'confusion_skylookup.npz',
+                nside=np.array(self.nside, dtype=np.int64),
+                pix_ordered=pix_sorted,
+                counts=counts,
+                starts=starts,
+                w1conf=w1conf_sorted,
+                w2conf=w2conf_sorted,
+            )
+            mean_w1conf = np.full(n_pix, np.nan, dtype=np.float32)
+            mean_w2conf = np.full(n_pix, np.nan, dtype=np.float32)
+            nonzero_pix = np.where(counts > 0)[0]
+            for pix in nonzero_pix:
+                start = starts[pix]
+                length = counts[pix]
+                mean_w1conf[pix] = np.mean(w1conf_sorted[start:start + length])
+                mean_w2conf[pix] = np.mean(w2conf_sorted[start:start + length])
+
+            plt.figure()
+            hp.projview(mean_w1conf, nest=True)
+            plt.savefig(conf_dir / 'mean_w1conf_map.png', dpi=300)
+            plt.close()
+
+            plt.figure()
+            hp.projview(mean_w2conf, nest=True)
+            plt.savefig(conf_dir / 'mean_w2conf_map.png', dpi=300)
+            plt.close()
+
+            print(f'Saved confusion lookup at {conf_dir}.')
+
+    def load_confusion_skylookup(self) -> None:
+        with data_path(self.cut_path, 'confusion') as conf_dir:
+            lookup_path = conf_dir / 'confusion_skylookup.npz'
+            with np.load(lookup_path) as data:
+                lookup_nside = int(data['nside'])
+                if lookup_nside != self.nside:
+                    raise ValueError(
+                        'Confusion lookup nside does not match Catwise nside: '
+                        f'{lookup_nside} != {self.nside}'
+                    )
+                self.confusion_pixel_counts = data['counts'].astype(np.int64)
+                self.confusion_pixel_starts = data['starts'].astype(np.int64)
+                self.confusion_w1_values = data['w1conf'].astype(np.float32)
+                self.confusion_w2_values = data['w2conf'].astype(np.float32)
+
+    def sample_confusion(
+            self,
+            pixel_indices: NDArray[np.int_],
+            rng: Optional[np.random.Generator] = None
+        ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        assert hasattr(self, 'confusion_pixel_counts'), 'Load confusion lookup first.'
+        if rng is None:
+            rng = np.random.default_rng()
+
+        pix = np.asarray(pixel_indices, dtype=np.int64)
+        counts = self.confusion_pixel_counts[pix]
+        starts = self.confusion_pixel_starts[pix]
+
+        out_w1 = np.empty(pix.shape[0], dtype=np.float32)
+        out_w2 = np.empty(pix.shape[0], dtype=np.float32)
+
+        valid = counts > 0
+        if np.any(valid):
+            rand_offsets = rng.integers(0, counts[valid], dtype=np.int64)
+            pick = starts[valid] + rand_offsets
+            out_w1[valid] = self.confusion_w1_values[pick]
+            out_w2[valid] = self.confusion_w2_values[pick]
+
+        if np.any(~valid):
+            # fallback: global sampling for empty pixels
+            pick = rng.integers(
+                0, self.confusion_w1_values.size, size=np.count_nonzero(~valid)
+            )
+            out_w1[~valid] = self.confusion_w1_values[pick]
+            out_w2[~valid] = self.confusion_w2_values[pick]
+
+        return out_w1, out_w2
 
     def create_coverage_maps(self, use_mask: bool = False):
         if use_mask:
@@ -1125,6 +1279,8 @@ class Catwise:
 
         self.log_w1cov_map = np.log10(self.w1cov_map).astype(self.dtype)
         self.log_w2cov_map = np.log10(self.w2cov_map).astype(self.dtype)
+
+        self.load_confusion_skylookup()
 
         # initialise AlphaLookup so table is not read in at each simulation
         self.spectral_lookup = AlphaLookup()
