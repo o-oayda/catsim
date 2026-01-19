@@ -8,7 +8,15 @@ config = CatwiseConfig(
 )
 sim = Catwise(config)
 
-sim.precompute_data()
+
+sim.load_catalogue()
+
+sim.determine_masked_pixels()
+sim.make_masked_catalogue()
+
+sim.create_confusion_skylookup()
+
+# sim.precompute_data(mask_north_ecliptic=False)
 
 # if False:
 # sim.load_catalogue()

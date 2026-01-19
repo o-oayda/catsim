@@ -5,6 +5,7 @@ from scipy.stats import poisson
 
 
 VERSION = 'S21'
+CORRELATED = False
 
 if VERSION == 'S22': # median free gauss extra err S22
     params = {
@@ -18,12 +19,15 @@ if VERSION == 'S22': # median free gauss extra err S22
     real_dmap = np.load('catwise_S22.npy')
 elif VERSION == 'S21':
     params = {
-        'log10_n_initial_samples': 7.5497,
-        'w1_extra_error': 3.57,
-        'observer_speed': 2.07,
+        'log10_n_initial_samples': 7.5402,
+        'w1_extra_error': 0.,
+        # 'w12_extra_error': 1.2,
+        'observer_speed': 2.0,
         'dipole_longitude': 221,
         'dipole_latitude': 44.,
-        'w1_max': 16.4
+        'w1_max': 16.4,
+        'w1conf_scale': 50.,
+        'w2conf_scale': 50.
     }
     real_dmap = np.load('catwise_S21_probably.npy')
 else:
@@ -34,12 +38,18 @@ config = CatwiseConfig(
     cat_w1_max=17.0, 
     magnitude_error_dist='gaussian',
     use_common_extra_error=True,
-    base_mask_version=VERSION
+    base_mask_version=VERSION,
+    generate_correlated_points=CORRELATED,
+    add_confusion_noise=True
 )
 sim = Catwise(config)
 
 sim.initialise_data()
-dmap, mask = sim.generate_dipole(**params)
+dmap, mask = sim.generate_dipole(
+    **params, 
+    cluster_rate_param=12.5, 
+    log10_cluster_scale_param=4.
+)
 
 MIN = np.nanmin(dmap)
 MAX = np.nanmax(dmap)
@@ -48,8 +58,6 @@ binary_mask = ~np.isnan(dmap)
 dmap_seen = dmap[binary_mask]
 bin_ints = np.arange(MIN, MAX)
 bin_edges = np.arange(MIN - 0.5, MAX + 1.5, 1)
-print(bin_ints)
-print(bin_edges)
 plt.hist(
     dmap_seen, bins=bin_edges, alpha=0.4, density=True, align='mid',
     label=f'CatSIM cell counts ({VERSION})'
