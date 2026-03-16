@@ -22,6 +22,25 @@ pip install -e .
 If you prefer Poetry, the configuration is already present—you can just run
 `poetry install`.
 
+### CatWISE S21 catalogue
+
+The CatWISE S21 FITS catalogue (`catwise_agns_masked_final_w1lt16p5_alpha.fits`)
+is too large to ship with this repository. Download it separately and point
+CatSIM to the local path via either the `CATSIM_S21_PATH` environment variable
+or the `CatwiseConfig.s21_catalogue_path` option, for example:
+
+```python
+config = CatwiseConfig(
+    cat_w12_min=0.5,
+    cat_w1_max=17.0,
+    magnitude_error_dist='gaussian',
+    s21_catalogue_path='/path/to/catwise_agns_masked_final_w1lt16p5_alpha.fits'
+)
+```
+
+If neither is supplied and the file is not bundled, CatSIM will raise a clear
+`FileNotFoundError` describing how to provide it.
+
 ## Example Scripts
 
 The scripts below show to generate CatSIMS. We need to instantiate the CatWISE

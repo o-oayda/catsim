@@ -1,7 +1,9 @@
+from matplotlib.patches import Rectangle
 import numpy as np
 from numpy.typing import NDArray
 from .physics import omega_to_theta
 import healpy as hp
+import matplotlib.pyplot as plt
 
 
 def average_smooth_map(
@@ -51,3 +53,73 @@ def smooth_map(
         **kwargs
     )
     return None
+
+def plot_adaptive_bins(
+    bin_bounds,
+    x=None,
+    y=None,
+    ax=None,
+    show_counts=False,
+    bin_values=None,
+    **rect_kwargs,
+):
+    """
+    Overlay adaptive square-ish bins as rectangles in (x, y) space.
+
+    Parameters
+    ----------
+    bin_bounds : ndarray, shape (n_bins, 4)
+        [xmin, xmax, ymin, ymax] for each bin.
+    x, y : array_like, optional
+        Optional scatter of underlying data points for context.
+    ax : matplotlib Axes, optional
+        Axes to draw on; if None, a new figure+axes is created.
+    show_counts : bool
+        If True, annotate each bin with the number of points
+        (requires bin_values).
+    bin_values : list of ndarrays, optional
+        Same length as bin_bounds; if show_counts is True, used to
+        get counts.
+    rect_kwargs :
+        Extra keyword args forwarded to matplotlib.patches.Rectangle.
+
+    Returns
+    -------
+    ax : matplotlib Axes
+        The axes with the overlay.
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    # Optional scatter
+    if x is not None and y is not None:
+        ax.scatter(x, y, s=2, alpha=0.3)
+
+    rect_defaults = dict(fill=False, linewidth=0.7, alpha=0.9)
+    rect_defaults.update(rect_kwargs)
+
+    for i, (xmin, xmax, ymin, ymax) in enumerate(bin_bounds):
+        rect = Rectangle(
+            (xmin, ymin),
+            xmax - xmin,
+            ymax - ymin,
+            **rect_defaults,
+        )
+        ax.add_patch(rect)
+
+        if show_counts and bin_values is not None:
+            count = len(bin_values[i]) if i < len(bin_values) else 0
+            cx = 0.5 * (xmin + xmax)
+            cy = 0.5 * (ymin + ymax)
+            ax.text(
+                cx,
+                cy,
+                str(count),
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    return ax

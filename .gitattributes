@@ -1,0 +1,2 @@
+src/catsim/data/0p5_17p0/mag_coverage/w1w2_magcov_hashgrid.npz filter=lfs diff=lfs merge=lfs -text
+src/catsim/data/0p5_17p0/mag_coverage/w1w2_magcov_hashgrid_no_eclmask.npz filter=lfs diff=lfs merge=lfs -text
