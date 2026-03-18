@@ -37,6 +37,7 @@ class RacsLow3Config:
     flux_hist_bins: int = 200
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
+    fractional_error_flux_min_mjy: float = 10.0
 
     def __post_init__(self) -> None:
         if self.flux_min <= 0:
@@ -49,6 +50,8 @@ class RacsLow3Config:
             raise ValueError("flux_hist_bins must be at least 2.")
         if self.alpha_sigma <= 0:
             raise ValueError("alpha_sigma must be positive.")
+        if self.fractional_error_flux_min_mjy <= 0:
+            raise ValueError("fractional_error_flux_min_mjy must be positive.")
         if self.downscale_nside is not None:
             if self.downscale_nside > self.nside:
                 raise ValueError("downscale_nside must be <= nside.")
@@ -89,10 +92,15 @@ class RacsLow3:
         self._coarse_density_map: Optional[NDArray[np.float32]] = None
         self._coarse_mask: Optional[NDArray[np.bool_]] = None
         self.temperature_map: Optional[NDArray[np.float32]] = None
+        self.fractional_error_map: Optional[NDArray[np.float32]] = None
+        self.sampled_fractional_error_map: Optional[NDArray[np.float32]] = None
 
         self.final_intrinsic_flux_samples: Optional[NDArray[np.float32]] = None
         self.final_observed_flux_samples: Optional[NDArray[np.float32]] = None
         self.final_alpha_samples: Optional[NDArray[np.float32]] = None
+        self.final_flux_error_samples: Optional[NDArray[np.float32]] = None
+        self.final_fractional_error_samples: Optional[NDArray[np.float32]] = None
+        self.final_base_fractional_error_samples: Optional[NDArray[np.float32]] = None
         self.final_pixel_indices: Optional[NDArray[np.int32]] = None
         self.final_tile_indices: Optional[NDArray[np.int32]] = None
         self.final_longitudes: Optional[NDArray[np.float32]] = None
@@ -107,6 +115,12 @@ class RacsLow3:
 
     def _temperature_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"temperature_lookup_nside{self.nside}_openmeteo_askap.npz"
+
+    def _fractional_error_lookup_cache_path(self) -> Path:
+        flux_token = str(self.cfg.fractional_error_flux_min_mjy).replace(".", "p")
+        return self._cache_dir() / (
+            f"fractional_error_lookup_nside{self.nside}_fluxmin{flux_token}mjy.npz"
+        )
 
     def load_catalogue(self) -> None:
         """Load the real RACS-low3 catalogue from a configured path or dipole-utils."""
@@ -294,6 +308,164 @@ class RacsLow3:
         self.build_temperature_map()
         return True
 
+    def build_fractional_error_lookup(self) -> None:
+        """Build a per-pixel empirical lookup of fractional flux errors."""
+        assert self.catalogue_is_loaded, "Load the catalogue before building error lookups."
+
+        flux = np.asarray(self.catalogue["Total_flux"], dtype=np.float64)
+        flux_error = np.asarray(self.catalogue["E_Total_flux"], dtype=np.float64)
+        ra = np.asarray(self.catalogue["RA"], dtype=np.float64)
+        dec = np.asarray(self.catalogue["Dec"], dtype=np.float64)
+
+        valid = (
+            np.isfinite(flux)
+            & np.isfinite(flux_error)
+            & (flux > 0)
+            & (flux >= self.cfg.fractional_error_flux_min_mjy)
+        )
+        if not np.any(valid):
+            raise ValueError("No valid sources available to build fractional-error lookup.")
+
+        pixel_indices = hp.ang2pix(
+            self.nside,
+            ra[valid],
+            dec[valid],
+            lonlat=True,
+            nest=True,
+        ).astype(np.int64, copy=False)
+        fractional_error = (flux_error[valid] / flux[valid]).astype(np.float32, copy=False)
+
+        order = np.argsort(pixel_indices, kind="stable")
+        pix_sorted = pixel_indices[order]
+        frac_sorted = fractional_error[order]
+
+        n_pix = hp.nside2npix(self.nside)
+        counts = np.bincount(pix_sorted, minlength=n_pix).astype(np.int64)
+        starts = np.cumsum(counts, dtype=np.int64) - counts
+
+        self.error_lookup_pixel_counts = counts
+        self.error_lookup_pixel_starts = starts
+        self.error_lookup_fractional_values = frac_sorted
+
+        fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
+        populated = counts > 0
+        if np.any(populated):
+            populated_pixels = np.flatnonzero(populated)
+            for pix in populated_pixels:
+                start = starts[pix]
+                count = counts[pix]
+                fractional_error_map[pix] = np.median(frac_sorted[start:start + count])
+        self.fractional_error_map = fractional_error_map
+
+    def save_fractional_error_lookup(self) -> None:
+        """Persist the per-pixel fractional-error lookup."""
+        cache_path = self._fractional_error_lookup_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            nside=np.asarray(self.nside, dtype=np.int64),
+            flux_min_mjy=np.asarray(self.cfg.fractional_error_flux_min_mjy, dtype=np.float64),
+            counts=self.error_lookup_pixel_counts.astype(np.int64, copy=False),
+            starts=self.error_lookup_pixel_starts.astype(np.int64, copy=False),
+            fractional_error=self.error_lookup_fractional_values.astype(np.float32, copy=False),
+        )
+
+    def load_fractional_error_lookup(self) -> bool:
+        """Load the cached per-pixel fractional-error lookup if available."""
+        cache_path = self._fractional_error_lookup_cache_path()
+        if not cache_path.exists():
+            return False
+
+        with np.load(cache_path) as data:
+            cache_nside = int(data["nside"])
+            if cache_nside != self.nside:
+                return False
+            self.error_lookup_pixel_counts = data["counts"].astype(np.int64, copy=False)
+            self.error_lookup_pixel_starts = data["starts"].astype(np.int64, copy=False)
+            self.error_lookup_fractional_values = data["fractional_error"].astype(
+                np.float32,
+                copy=False,
+            )
+
+        n_pix = hp.nside2npix(self.nside)
+        fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
+        populated = self.error_lookup_pixel_counts > 0
+        if np.any(populated):
+            populated_pixels = np.flatnonzero(populated)
+            for pix in populated_pixels:
+                start = self.error_lookup_pixel_starts[pix]
+                count = self.error_lookup_pixel_counts[pix]
+                fractional_error_map[pix] = np.median(
+                    self.error_lookup_fractional_values[start:start + count]
+                )
+        self.fractional_error_map = fractional_error_map
+        return True
+
+    def sample_fractional_errors(
+        self,
+        pixel_indices: NDArray[np.int_],
+        rng: Optional[np.random.Generator] = None,
+    ) -> NDArray[np.float32]:
+        """Sample fractional flux errors from the empirical distribution of each pixel."""
+        assert hasattr(self, "error_lookup_pixel_counts"), "Run initialise_data() first."
+        if rng is None:
+            rng = np.random.default_rng()
+
+        pix = np.asarray(pixel_indices, dtype=np.int64)
+        counts = self.error_lookup_pixel_counts[pix]
+        starts = self.error_lookup_pixel_starts[pix]
+
+        out = np.empty(pix.shape[0], dtype=np.float32)
+        valid = counts > 0
+        if np.any(valid):
+            rand_offsets = rng.integers(0, counts[valid], dtype=np.int64)
+            pick = starts[valid] + rand_offsets
+            out[valid] = self.error_lookup_fractional_values[pick]
+
+        if np.any(~valid):
+            pick = rng.integers(
+                0,
+                self.error_lookup_fractional_values.size,
+                size=np.count_nonzero(~valid),
+                dtype=np.int64,
+            )
+            out[~valid] = self.error_lookup_fractional_values[pick]
+
+        return out
+
+    def compute_total_flux_error(
+        self,
+        flux_density: NDArray[np.floating],
+        fractional_error: NDArray[np.floating],
+        fractional_error_eta: float = 0.0,
+        dtype: type = np.float64,
+    ) -> NDArray[np.floating]:
+        """Convert sampled fractional errors into raw flux-error sigmas."""
+        if fractional_error_eta < 0:
+            raise ValueError("fractional_error_eta must be non-negative.")
+
+        flux = np.asarray(flux_density, dtype=np.float64)
+        frac = np.asarray(fractional_error, dtype=np.float64)
+        sigma = frac * flux
+        sigma *= np.sqrt(1.0 + fractional_error_eta)
+        return sigma.astype(dtype, copy=False)
+
+    def add_flux_error(
+        self,
+        flux_density: NDArray[np.floating],
+        flux_error: NDArray[np.floating],
+        rng: Optional[np.random.Generator] = None,
+        dtype: type = np.float64,
+    ) -> NDArray[np.floating]:
+        """Apply Gaussian flux noise with a precomputed raw flux-error sigma."""
+        if rng is None:
+            rng = np.random.default_rng()
+
+        flux = np.asarray(flux_density, dtype=np.float64)
+        sigma = np.asarray(flux_error, dtype=np.float64)
+        noisy_flux = flux + rng.normal(loc=0.0, scale=sigma, size=flux.shape)
+        return noisy_flux.astype(dtype, copy=False)
+
     def load_temperature_table(self) -> None:
         """Load or derive per-SBID temperatures and project them onto the sky."""
         self.tile_temperature_by_index = None
@@ -333,6 +505,9 @@ class RacsLow3:
             self.build_tile_lookup()
             self.save_tile_lookup()
         self.load_temperature_table()
+        if not self.load_fractional_error_lookup():
+            self.build_fractional_error_lookup()
+            self.save_fractional_error_lookup()
         self.lookups_are_initialised = True
 
     def sample_fluxes(
@@ -538,6 +713,7 @@ class RacsLow3:
         temp_slope: float = 0.0,
         temp_intercept: float = 1.0,
         temp_pivot_c: float = 30.0,
+        fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         """Coordinate the CatSIM-like simulation pipeline for RACS-low3."""
@@ -567,10 +743,15 @@ class RacsLow3:
 
         n_pix = hp.nside2npix(self.nside)
         density_accumulator = np.zeros(n_pix, dtype=np.float64)
+        fractional_error_sum = np.zeros(n_pix, dtype=np.float64)
+        fractional_error_count = np.zeros(n_pix, dtype=np.int64)
 
         final_intrinsic_flux: list[NDArray[np.float32]] = []
         final_observed_flux: list[NDArray[np.float32]] = []
         final_alpha: list[NDArray[np.float32]] = []
+        final_flux_error: list[NDArray[np.float32]] = []
+        final_base_fractional_error: list[NDArray[np.float32]] = []
+        final_fractional_error: list[NDArray[np.float32]] = []
         final_pixels: list[NDArray[np.int32]] = []
         final_tiles: list[NDArray[np.int32]] = []
         final_ra: list[NDArray[np.float32]] = []
@@ -606,9 +787,30 @@ class RacsLow3:
                 temp_intercept=temp_intercept,
                 temp_pivot_c=temp_pivot_c,
             )
-            observed_flux = self.apply_temperature_enhancement(
+            systematics_flux = self.apply_temperature_enhancement(
                 dipole_flux,
                 enhancement,
+                dtype=self.dtype,
+            )
+            base_fractional_error = self.sample_fractional_errors(pixel_indices, rng=rng)
+            flux_error = self.compute_total_flux_error(
+                systematics_flux,
+                base_fractional_error,
+                fractional_error_eta=fractional_error_eta,
+                dtype=self.dtype,
+            )
+            safe_flux = np.clip(
+                np.asarray(systematics_flux, dtype=np.float64),
+                np.finfo(np.float64).tiny,
+                None,
+            )
+            fractional_error = (
+                np.asarray(flux_error, dtype=np.float64) / safe_flux
+            ).astype(np.float32, copy=False)
+            observed_flux = self.add_flux_error(
+                systematics_flux,
+                flux_error,
+                rng=rng,
                 dtype=self.dtype,
             )
 
@@ -619,6 +821,8 @@ class RacsLow3:
 
             kept_pixels = pixel_indices[keep]
             np.add.at(density_accumulator, kept_pixels, 1)
+            np.add.at(fractional_error_sum, kept_pixels, fractional_error[keep].astype(np.float64))
+            np.add.at(fractional_error_count, kept_pixels, 1)
 
             if self.store_final_samples:
                 final_intrinsic_flux.append(
@@ -628,6 +832,15 @@ class RacsLow3:
                     observed_flux[keep].astype(np.float32, copy=False)
                 )
                 final_alpha.append(alpha[keep].astype(np.float32, copy=False))
+                final_flux_error.append(
+                    flux_error[keep].astype(np.float32, copy=False)
+                )
+                final_base_fractional_error.append(
+                    base_fractional_error[keep].astype(np.float32, copy=False)
+                )
+                final_fractional_error.append(
+                    fractional_error[keep].astype(np.float32, copy=False)
+                )
                 final_pixels.append(kept_pixels.astype(np.int32, copy=False))
                 final_tiles.append(tile_indices[keep].astype(np.int32, copy=False))
                 final_ra.append(boosted_ra_deg[keep].astype(np.float32, copy=False))
@@ -635,6 +848,15 @@ class RacsLow3:
                 final_temperature.append(temperatures[keep].astype(np.float32, copy=False))
 
         self._density_map = density_accumulator.astype(np.float32, copy=False)
+        sampled_fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
+        valid_error_pixels = fractional_error_count > 0
+        if np.any(valid_error_pixels):
+            sampled_fractional_error_map[valid_error_pixels] = (
+                fractional_error_sum[valid_error_pixels]
+                / fractional_error_count[valid_error_pixels]
+            ).astype(np.float32, copy=False)
+        sampled_fractional_error_map[~self.mask_map.astype(bool)] = np.nan
+        self.sampled_fractional_error_map = sampled_fractional_error_map
         output_map, output_mask = self._prepare_map_output(self._density_map)
 
         if self.store_final_samples:
@@ -646,6 +868,18 @@ class RacsLow3:
             )
             self.final_alpha_samples = (
                 np.concatenate(final_alpha) if final_alpha else np.empty(0, dtype=np.float32)
+            )
+            self.final_flux_error_samples = (
+                np.concatenate(final_flux_error)
+                if final_flux_error else np.empty(0, dtype=np.float32)
+            )
+            self.final_base_fractional_error_samples = (
+                np.concatenate(final_base_fractional_error)
+                if final_base_fractional_error else np.empty(0, dtype=np.float32)
+            )
+            self.final_fractional_error_samples = (
+                np.concatenate(final_fractional_error)
+                if final_fractional_error else np.empty(0, dtype=np.float32)
             )
             self.final_pixel_indices = (
                 np.concatenate(final_pixels) if final_pixels else np.empty(0, dtype=np.int32)
@@ -666,6 +900,9 @@ class RacsLow3:
             self.final_intrinsic_flux_samples = None
             self.final_observed_flux_samples = None
             self.final_alpha_samples = None
+            self.final_flux_error_samples = None
+            self.final_base_fractional_error_samples = None
+            self.final_fractional_error_samples = None
             self.final_pixel_indices = None
             self.final_tile_indices = None
             self.final_longitudes = None

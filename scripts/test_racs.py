@@ -28,9 +28,10 @@ dmap, mask = sim.generate_dipole(
     observer_speed=1.,
     dipole_longitude=CMB_L,
     dipole_latitude=CMB_B,
-    temp_slope=A,
-    temp_intercept=B,
-    temp_pivot_c=30.
+    # temp_slope=A,
+    # temp_intercept=B,
+    temp_pivot_c=30.,
+    fractional_error_eta=20.
 )
 t1 = time()
 
@@ -52,12 +53,38 @@ if temperature_map is not None:
     print(f"Temperature-covered pixels: {finite_temperatures.sum()}")
     if np.any(finite_temperatures):
         print(f"Temperature range (C): {temperature_map[finite_temperatures].min():.2f} to {temperature_map[finite_temperatures].max():.2f}")
+fractional_error_map = sim.fractional_error_map
+sampled_fractional_error_map = sim.sampled_fractional_error_map
+if fractional_error_map is not None:
+    finite_fractional_errors = np.isfinite(fractional_error_map)
+    print(f"Fractional-error-covered pixels: {finite_fractional_errors.sum()}")
+    if np.any(finite_fractional_errors):
+        print(
+            "Fractional error range: "
+            f"{fractional_error_map[finite_fractional_errors].min():.4f} to "
+            f"{fractional_error_map[finite_fractional_errors].max():.4f}"
+        )
+if sampled_fractional_error_map is not None:
+    finite_sampled_fractional_errors = np.isfinite(sampled_fractional_error_map)
+    print(f"Sampled fractional-error-covered pixels: {finite_sampled_fractional_errors.sum()}")
+    if np.any(finite_sampled_fractional_errors):
+        print(
+            "Sampled fractional error range: "
+            f"{sampled_fractional_error_map[finite_sampled_fractional_errors].min():.4f} to "
+            f"{sampled_fractional_error_map[finite_sampled_fractional_errors].max():.4f}"
+        )
 
 print(f"n sources: {np.nansum(dmap)}")
 # hp.projview(dmap, nest=True, title="RACS-low3 Simulated Count Map")
 # hp.projview(sbid_map, nest=True, title="RACS-low3 SBID Map")
 # if temperature_map is not None:
 #     hp.projview(temperature_map, nest=True, title="RACS-low3 Temperature Map (C)")
+if sampled_fractional_error_map is not None:
+    hp.projview(
+        sampled_fractional_error_map,
+        nest=True,
+        title="RACS-low3 Sampled Fractional Error Map",
+    )
 smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True)
 plt.show()
 
