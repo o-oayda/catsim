@@ -1,5 +1,6 @@
 import unittest
 
+import healpy as hp
 import numpy as np
 
 from catsim import RacsLow3, RacsLow3Config
@@ -7,7 +8,7 @@ from catsim import RacsLow3, RacsLow3Config
 
 class RacsFluxErrorTests(unittest.TestCase):
     def setUp(self):
-        self.sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=1, chunk_size=16))
+        self.sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
 
     def test_sample_fractional_errors_draws_from_pixel_lookup(self):
         # Pixel 0 has one possible value; pixel 1 has two values; pixel 2 is empty.
@@ -79,8 +80,9 @@ class RacsFluxErrorTests(unittest.TestCase):
     def test_generate_dipole_stores_effective_fractional_errors_after_eta_scaling(self):
         sim = self.sim
         sim.lookups_are_initialised = True
-        sim.mask_map = np.ones(12, dtype=bool)
-        sim.tile_lookup_map = np.zeros(12, dtype=np.int32)
+        n_pix = hp.nside2npix(sim.nside)
+        sim.mask_map = np.ones(n_pix, dtype=bool)
+        sim.tile_lookup_map = np.zeros(n_pix, dtype=np.int32)
         sim.tile_temperature_by_index = np.array([30.0], dtype=np.float64)
 
         n_samples = 10
@@ -102,7 +104,7 @@ class RacsFluxErrorTests(unittest.TestCase):
         )
         sim._source_isin_mask = lambda ra, dec: (
             np.ones(ra.shape[0], dtype=bool),
-            np.arange(ra.shape[0], dtype=np.int64) % sim.mask_map.size,
+            np.arange(ra.shape[0], dtype=np.int64) % n_pix,
         )
         sim.assign_tiles = lambda ra, dec: np.zeros(ra.shape[0], dtype=np.int32)
         sim.evaluate_temperature_enhancement = lambda tile_indices, temp_slope, temp_intercept, temp_pivot_c: (

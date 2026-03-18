@@ -42,8 +42,8 @@ class RacsLow3Config:
     def __post_init__(self) -> None:
         if self.flux_min <= 0:
             raise ValueError("flux_min must be positive.")
-        if self.nside <= 0:
-            raise ValueError("nside must be a positive integer.")
+        if self.nside != 64:
+            raise ValueError("RacsLow3 currently requires nside=64 to use the packaged mask.")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer.")
         if self.flux_hist_bins < 2:
@@ -120,6 +120,14 @@ class RacsLow3:
         flux_token = str(self.cfg.fractional_error_flux_min_mjy).replace(".", "p")
         return self._cache_dir() / (
             f"fractional_error_lookup_nside{self.nside}_fluxmin{flux_token}mjy.npz"
+        )
+
+    def _mask_map_path(self) -> Path:
+        return (
+            Path(__file__).resolve().parent
+            / "data"
+            / "racs_low3"
+            / "racs-low3_mask_nside64_ring.npy"
         )
 
     def load_catalogue(self) -> None:
@@ -221,8 +229,23 @@ class RacsLow3:
                 return False
             self.tile_lookup_map = data["tile_lookup_map"].astype(np.int32, copy=False)
 
-        self.mask_map = self.tile_lookup_map >= 0
         return True
+
+    def load_mask_map(self) -> None:
+        """Load the packaged equatorial RACS-low3 mask and convert RING -> NEST."""
+        mask_path = self._mask_map_path()
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Packaged RACS-low3 mask not found: {mask_path}")
+
+        mask_map_ring = np.load(mask_path, allow_pickle=False)
+        mask_map = hp.reorder(mask_map_ring, r2n=True)
+        if mask_map.shape != (hp.nside2npix(self.nside),):
+            raise ValueError(
+                "Packaged RACS-low3 mask has unexpected shape: "
+                f"{mask_map.shape}, expected {(hp.nside2npix(self.nside),)}"
+            )
+
+        self.mask_map = np.asarray(mask_map == 1, dtype=np.bool_)
 
     def build_tile_metadata(self) -> None:
         """Collect one row of metadata per SBID for later tile-level systematics."""
@@ -504,6 +527,7 @@ class RacsLow3:
         if not self.load_tile_lookup():
             self.build_tile_lookup()
             self.save_tile_lookup()
+        self.load_mask_map()
         self.load_temperature_table()
         if not self.load_fractional_error_lookup():
             self.build_fractional_error_lookup()

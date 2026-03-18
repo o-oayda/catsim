@@ -13,7 +13,6 @@ config = RacsLow3Config(
     flux_min=15.0,
     chunk_size=100_000,
     store_final_samples=True,
-    nside=32
 )
 sim = RacsLow3(config)
 
