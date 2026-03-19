@@ -113,6 +113,12 @@ class RacsLow3:
     def _sbid_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"sbid_lookup_nside{self.nside}.npz"
 
+    def _flux_distribution_cache_path(self) -> Path:
+        return self._cache_dir() / f"flux_distribution_bins{self.cfg.flux_hist_bins}.npz"
+
+    def _tile_metadata_cache_path(self) -> Path:
+        return self._cache_dir() / "tile_metadata.npz"
+
     def _temperature_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"temperature_lookup_nside{self.nside}_openmeteo_askap.npz"
 
@@ -143,6 +149,19 @@ class RacsLow3:
             self.catalogue = DataLoader("racs", "low3").load()
 
         self.catalogue_is_loaded = True
+
+    def release_catalogue(self) -> None:
+        """Drop the in-memory catalogue once lookup tables have been derived."""
+        if hasattr(self, "catalogue"):
+            del self.catalogue
+        self.catalogue_is_loaded = False
+
+    def __getstate__(self) -> dict:
+        """Exclude the raw catalogue from pickle payloads."""
+        state = self.__dict__.copy()
+        state.pop("catalogue", None)
+        state["catalogue_is_loaded"] = False
+        return state
 
     def _galactic_to_equatorial(
         self,
@@ -178,6 +197,43 @@ class RacsLow3:
         self.log_flux_bin_edges = edges.astype(np.float64, copy=False)
         self.log_flux_bin_probabilities = probabilities
         self.log_flux_bin_cdf = np.cumsum(probabilities)
+
+    def save_flux_distribution(self) -> None:
+        """Persist the empirical log-flux histogram."""
+        cache_path = self._flux_distribution_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            flux_hist_bins=np.asarray(self.cfg.flux_hist_bins, dtype=np.int64),
+            log_flux_bin_edges=self.log_flux_bin_edges.astype(np.float64, copy=False),
+            log_flux_bin_probabilities=self.log_flux_bin_probabilities.astype(
+                np.float64,
+                copy=False,
+            ),
+            log_flux_bin_cdf=self.log_flux_bin_cdf.astype(np.float64, copy=False),
+        )
+
+    def load_flux_distribution(self) -> bool:
+        """Load the cached empirical log-flux histogram if available."""
+        cache_path = self._flux_distribution_cache_path()
+        if not cache_path.exists():
+            return False
+
+        with np.load(cache_path) as data:
+            cache_bins = int(data["flux_hist_bins"])
+            if cache_bins != self.cfg.flux_hist_bins:
+                return False
+            self.log_flux_bin_edges = data["log_flux_bin_edges"].astype(
+                np.float64,
+                copy=False,
+            )
+            self.log_flux_bin_probabilities = data["log_flux_bin_probabilities"].astype(
+                np.float64,
+                copy=False,
+            )
+            self.log_flux_bin_cdf = data["log_flux_bin_cdf"].astype(np.float64, copy=False)
+
+        return True
 
     def build_tile_lookup(self) -> None:
         """Build a simple HEALPix survey mask and per-pixel dominant SBID lookup."""
@@ -265,6 +321,39 @@ class RacsLow3:
             int(tile_sbid): int(tile_index)
             for tile_index, tile_sbid in enumerate(self.tile_sbids)
         }
+
+    def save_tile_metadata(self) -> None:
+        """Persist one-row-per-SBID tile metadata."""
+        cache_path = self._tile_metadata_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
+            tile_scan_start_mjd=self.tile_scan_start_mjd.astype(np.float64, copy=False),
+            tile_scan_length=self.tile_scan_length.astype(np.float64, copy=False),
+            tile_field_id=np.asarray(self.tile_field_id),
+        )
+
+    def load_tile_metadata(self) -> bool:
+        """Load cached one-row-per-SBID tile metadata if available."""
+        cache_path = self._tile_metadata_cache_path()
+        if not cache_path.exists():
+            return False
+
+        with np.load(cache_path, allow_pickle=False) as data:
+            self.tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
+            self.tile_scan_start_mjd = data["tile_scan_start_mjd"].astype(
+                np.float64,
+                copy=False,
+            )
+            self.tile_scan_length = data["tile_scan_length"].astype(np.float64, copy=False)
+            self.tile_field_id = data["tile_field_id"]
+
+        self._tile_index_from_sbid = {
+            int(tile_sbid): int(tile_index)
+            for tile_index, tile_sbid in enumerate(self.tile_sbids)
+        }
+        return True
 
     def build_temperature_map(self) -> None:
         """Project tile temperatures onto the HEALPix survey footprint."""
@@ -519,19 +608,38 @@ class RacsLow3:
 
     def initialise_data(self) -> None:
         """Initialise the catalogue-derived lookup tables used during simulation."""
-        if not self.catalogue_is_loaded:
-            self.load_catalogue()
+        need_flux_distribution = not self.load_flux_distribution()
+        need_tile_metadata = not self.load_tile_metadata()
+        need_tile_lookup = not self.load_tile_lookup()
+        need_fractional_error_lookup = not self.load_fractional_error_lookup()
 
-        self.build_flux_distribution()
-        self.build_tile_metadata()
-        if not self.load_tile_lookup():
-            self.build_tile_lookup()
-            self.save_tile_lookup()
+        if (
+            need_flux_distribution
+            or need_tile_metadata
+            or need_tile_lookup
+            or need_fractional_error_lookup
+        ):
+            if not self.catalogue_is_loaded:
+                self.load_catalogue()
+
+            try:
+                if need_flux_distribution:
+                    self.build_flux_distribution()
+                    self.save_flux_distribution()
+                if need_tile_metadata:
+                    self.build_tile_metadata()
+                    self.save_tile_metadata()
+                if need_tile_lookup:
+                    self.build_tile_lookup()
+                    self.save_tile_lookup()
+                if need_fractional_error_lookup:
+                    self.build_fractional_error_lookup()
+                    self.save_fractional_error_lookup()
+            finally:
+                self.release_catalogue()
+
         self.load_mask_map()
         self.load_temperature_table()
-        if not self.load_fractional_error_lookup():
-            self.build_fractional_error_lookup()
-            self.save_fractional_error_lookup()
         self.lookups_are_initialised = True
 
     def sample_fluxes(

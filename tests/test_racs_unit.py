@@ -1,7 +1,31 @@
 import unittest
+import pickle
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import sys
+import types
 
+from astropy.table import Table
 import healpy as hp
 import numpy as np
+
+if "dipoleutils.utils.data_loader" not in sys.modules:
+    dipoleutils_module = types.ModuleType("dipoleutils")
+    utils_module = types.ModuleType("dipoleutils.utils")
+    data_loader_module = types.ModuleType("dipoleutils.utils.data_loader")
+
+    class _TestDataLoader:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def load(self):
+            raise RuntimeError("Test stub DataLoader.load() should not be called.")
+
+    data_loader_module.DataLoader = _TestDataLoader
+    sys.modules["dipoleutils"] = dipoleutils_module
+    sys.modules["dipoleutils.utils"] = utils_module
+    sys.modules["dipoleutils.utils.data_loader"] = data_loader_module
 
 from catsim import RacsLow3, RacsLow3Config
 
@@ -135,6 +159,80 @@ class RacsFluxErrorTests(unittest.TestCase):
         self.assertTrue(np.any(finite))
         np.testing.assert_allclose(sampled_map[finite], np.full(np.count_nonzero(finite), 0.2))
         self.assertEqual(dmap.shape, mask.shape)
+
+
+class RacsInitialiseDataTests(unittest.TestCase):
+    def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):
+        with TemporaryDirectory() as tmpdir:
+            sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+            cache_dir = Path(tmpdir)
+            n_pix = hp.nside2npix(sim.nside)
+
+            sim._cache_dir = lambda: cache_dir
+            sim._mask_map_path = lambda: cache_dir / "mask.npy"
+            np.save(cache_dir / "mask.npy", np.ones(n_pix, dtype=np.uint8))
+
+            sim.log_flux_bin_edges = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+            sim.log_flux_bin_probabilities = np.array([0.25, 0.75], dtype=np.float64)
+            sim.log_flux_bin_cdf = np.array([0.25, 1.0], dtype=np.float64)
+            sim.save_flux_distribution()
+
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
+            sim.tile_scan_length = np.array([10.0, 11.0], dtype=np.float64)
+            sim.tile_field_id = np.array(["field-a", "field-b"])
+            sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.save_tile_metadata()
+
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
+            sim.save_tile_lookup()
+
+            sim.error_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.error_lookup_pixel_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.error_lookup_fractional_values = np.array([0.1], dtype=np.float32)
+            sim.save_fractional_error_lookup()
+
+            sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
+            sim.save_temperature_lookup()
+
+            sim.load_catalogue = lambda: (_ for _ in ()).throw(
+                AssertionError("initialise_data() unexpectedly loaded the catalogue")
+            )
+
+            sim.initialise_data()
+
+            self.assertTrue(sim.lookups_are_initialised)
+            self.assertFalse(sim.catalogue_is_loaded)
+            self.assertFalse(hasattr(sim, "catalogue"))
+            np.testing.assert_array_equal(sim.tile_sbids, np.array([101, 202], dtype=np.int32))
+            np.testing.assert_allclose(
+                sim.temperature_map[:2],
+                np.array([20.0, 21.0], dtype=np.float32),
+            )
+
+    def test_pickle_excludes_catalogue_payload(self):
+        sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+        large_catalogue = Table(
+            {
+                "RA": np.linspace(0.0, 359.0, 20_000, dtype=np.float64),
+                "Dec": np.linspace(-89.0, 89.0, 20_000, dtype=np.float64),
+                "Total_flux": np.linspace(1.0, 10.0, 20_000, dtype=np.float64),
+            }
+        )
+
+        sim.catalogue = large_catalogue
+        sim.catalogue_is_loaded = True
+        raw_state_payload = len(pickle.dumps(sim.__dict__, protocol=pickle.HIGHEST_PROTOCOL))
+        object_payload = len(pickle.dumps(sim, protocol=pickle.HIGHEST_PROTOCOL))
+
+        sim.release_catalogue()
+        payload_after_release = len(pickle.dumps(sim, protocol=pickle.HIGHEST_PROTOCOL))
+
+        self.assertFalse(hasattr(sim, "catalogue"))
+        self.assertEqual(payload_after_release, object_payload)
+        self.assertLess(object_payload, raw_state_payload)
+        self.assertLess(object_payload, raw_state_payload // 10)
 
 
 if __name__ == "__main__":
