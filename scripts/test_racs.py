@@ -20,17 +20,17 @@ init_t0 = time()
 sim.initialise_data()
 init_t1 = time()
 t0 = time()
-A = -0.25
+A = -0.159
 B = -A + 1
 dmap, mask = sim.generate_dipole(
-    log10_n_initial_samples=6.65,
-    observer_speed=1.,
-    dipole_longitude=CMB_L,
-    dipole_latitude=CMB_B,
-    # temp_slope=A,
-    # temp_intercept=B,
-    temp_pivot_c=30.,
-    fractional_error_eta=20.
+    log10_n_initial_samples=6.664,
+    observer_speed=2.72,
+    dipole_longitude=308,
+    dipole_latitude=-1,
+    temp_slope=A,
+    temp_intercept=B,
+    temp_pivot_c=27.1,
+    # fractional_error_eta=40.
 )
 t1 = time()
 
@@ -84,7 +84,7 @@ if sampled_fractional_error_map is not None:
         nest=True,
         title="RACS-low3 Sampled Fractional Error Map",
     )
-smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True)
+smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True, min=13.02, max=14.41)
 plt.show()
 
 # plot_log_log_histogram(sim.final_observed_flux_samples, bins=100)
