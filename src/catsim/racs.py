@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import warnings
 
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
 import astropy.units as u
 from dipoleutils.utils.data_loader import DataLoader
 import healpy as hp
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 
@@ -22,7 +22,9 @@ from .utils.physics import (
     sample_spherical_points,
 )
 from .utils.rng import NPKey
-from .utils.weather import get_temperatures_for_mjd
+from .utils.weather import get_mean_paf_temperatures_for_observations
+
+LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
 
 
 @dataclass
@@ -38,6 +40,8 @@ class RacsLow3Config:
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
     fractional_error_flux_min_mjy: float = 10.0
+    paf_temperature_data_dir: Optional[str] = None
+    paf_max_interpolation_gap_minutes: float = 20.0
 
     def __post_init__(self) -> None:
         if self.flux_min <= 0:
@@ -52,6 +56,8 @@ class RacsLow3Config:
             raise ValueError("alpha_sigma must be positive.")
         if self.fractional_error_flux_min_mjy <= 0:
             raise ValueError("fractional_error_flux_min_mjy must be positive.")
+        if self.paf_max_interpolation_gap_minutes <= 0:
+            raise ValueError("paf_max_interpolation_gap_minutes must be positive.")
         if self.downscale_nside is not None:
             if self.downscale_nside > self.nside:
                 raise ValueError("downscale_nside must be <= nside.")
@@ -120,13 +126,34 @@ class RacsLow3:
         return self._cache_dir() / "tile_metadata.npz"
 
     def _temperature_lookup_cache_path(self) -> Path:
-        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_openmeteo_askap.npz"
+        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_mean_paf.npz"
 
     def _fractional_error_lookup_cache_path(self) -> Path:
         flux_token = str(self.cfg.fractional_error_flux_min_mjy).replace(".", "p")
         return self._cache_dir() / (
             f"fractional_error_lookup_nside{self.nside}_fluxmin{flux_token}mjy.npz"
         )
+
+    def _save_lookup_map_png(
+        self,
+        map_values: NDArray[np.floating],
+        output_path: Path,
+        title: str,
+        unit: str = "",
+        cmap: str = "viridis",
+    ) -> None:
+        fig = plt.figure(figsize=(10, 6))
+        hp.mollview(
+            np.asarray(map_values, dtype=np.float64),
+            nest=True,
+            fig=fig.number,
+            title=title,
+            unit=unit,
+            cmap=cmap,
+            hold=True,
+        )
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
     def _mask_map_path(self) -> Path:
         return (
@@ -272,6 +299,15 @@ class RacsLow3:
             nside=np.asarray(self.nside, dtype=np.int64),
             tile_lookup_map=self.tile_lookup_map.astype(np.int32, copy=False),
         )
+        tile_lookup_map = self.tile_lookup_map.astype(np.float64, copy=False)
+        tile_lookup_map = np.where(tile_lookup_map >= 0, tile_lookup_map, np.nan)
+        self._save_lookup_map_png(
+            tile_lookup_map,
+            cache_path.with_suffix(".png"),
+            title=f"RACS LOW3 Dominant SBID Lookup (nside={self.nside})",
+            unit="SBID",
+            cmap="viridis",
+        )
 
     def load_tile_lookup(self) -> bool:
         """Load a cached HEALPix SBID lookup if one exists and matches this config."""
@@ -394,6 +430,14 @@ class RacsLow3:
                 np.float64, copy=False
             ),
         )
+        if self.temperature_map is not None:
+            self._save_lookup_map_png(
+                self.temperature_map,
+                cache_path.with_suffix(".png"),
+                title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
+                unit="deg C",
+                cmap="coolwarm",
+            )
 
     def load_temperature_lookup(self) -> bool:
         """Load a cached per-tile temperature lookup if it matches the tile metadata."""
@@ -481,6 +525,17 @@ class RacsLow3:
             starts=self.error_lookup_pixel_starts.astype(np.int64, copy=False),
             fractional_error=self.error_lookup_fractional_values.astype(np.float32, copy=False),
         )
+        if self.fractional_error_map is not None:
+            self._save_lookup_map_png(
+                self.fractional_error_map,
+                cache_path.with_suffix(".png"),
+                title=(
+                    "RACS LOW3 Fractional Flux Error Lookup "
+                    f"(nside={self.nside}, flux>={self.cfg.fractional_error_flux_min_mjy:g} mJy)"
+                ),
+                unit="fractional error",
+                cmap="magma"
+            )
 
     def load_fractional_error_lookup(self) -> bool:
         """Load the cached per-pixel fractional-error lookup if available."""
@@ -585,26 +640,40 @@ class RacsLow3:
         if self.load_temperature_lookup():
             return
 
-        fetched_temperatures_ok = True
-        try:
-            self.tile_temperature_by_index = np.asarray(
-                get_temperatures_for_mjd(self.tile_scan_start_mjd),
-                dtype=np.float64,
-            )
-        except Exception as exc:
-            fetched_temperatures_ok = False
-            warnings.warn(
-                f"Unable to fetch ASKAP temperatures during initialise_data(): {exc}"
-            )
-            self.tile_temperature_by_index = np.full(
-                self.tile_sbids.shape,
-                np.nan,
-                dtype=np.float64,
-            )
+        paf_data_dir = self._resolve_paf_temperature_data_dir()
+        self.tile_temperature_by_index = np.asarray(
+            get_mean_paf_temperatures_for_observations(
+                self.tile_scan_start_mjd,
+                data_dir=paf_data_dir,
+                max_interpolation_gap_minutes=self.cfg.paf_max_interpolation_gap_minutes,
+            ),
+            dtype=np.float64,
+        )
 
         self.build_temperature_map()
-        if fetched_temperatures_ok and np.any(np.isfinite(self.tile_temperature_by_index)):
+        if np.any(np.isfinite(self.tile_temperature_by_index)):
             self.save_temperature_lookup()
+
+    def _resolve_paf_temperature_data_dir(self) -> Path:
+        if self.cfg.paf_temperature_data_dir is not None:
+            data_dir = Path(self.cfg.paf_temperature_data_dir).expanduser().resolve()
+            if not data_dir.exists():
+                raise FileNotFoundError(
+                    "RacsLow3Config.paf_temperature_data_dir points to missing directory: "
+                    f"{data_dir}"
+                )
+            return data_dir
+
+        repo_root = Path(__file__).resolve().parents[2]
+        default_dir = repo_root.parent / "dipole-utils" / "data" / "paf_temps"
+        if default_dir.exists():
+            return default_dir
+
+        raise FileNotFoundError(
+            "Could not find PAF temperature data. Set "
+            "RacsLow3Config.paf_temperature_data_dir or provide "
+            f"{default_dir}."
+        )
 
     def initialise_data(self) -> None:
         """Initialise the catalogue-derived lookup tables used during simulation."""
@@ -752,13 +821,14 @@ class RacsLow3:
         temp_pivot_c: float,
     ) -> tuple[NDArray[np.floating], NDArray[np.float32]]:
         """Evaluate ``epsilon(T) = a (T / T_0) + b`` at the tile level."""
-        if temp_pivot_c == 0:
-            raise ValueError("temp_pivot_c must be non-zero.")
+        if not np.isfinite(temp_pivot_c) or temp_pivot_c <= 0:
+            raise ValueError("temp_pivot_c must be positive and finite.")
 
         enhancement = np.full(tile_indices.shape, temp_intercept, dtype=np.float64)
         temperatures = np.full(tile_indices.shape, np.nan, dtype=np.float32)
 
         if self.tile_temperature_by_index is None:
+            enhancement = np.maximum(enhancement, LOW3_TEMPERATURE_EPSILON_FLOOR)
             return enhancement.astype(self.dtype, copy=False), temperatures
 
         valid = tile_indices >= 0
@@ -772,9 +842,14 @@ class RacsLow3:
                     * (tile_temperatures[valid_temperature] / temp_pivot_c)
                     + temp_intercept
                 )
+                enhancement_valid = np.maximum(
+                    enhancement_valid,
+                    LOW3_TEMPERATURE_EPSILON_FLOOR,
+                )
                 enhancement_indices = np.flatnonzero(valid)[valid_temperature]
                 enhancement[enhancement_indices] = enhancement_valid
 
+        enhancement = np.maximum(enhancement, LOW3_TEMPERATURE_EPSILON_FLOOR)
         return enhancement.astype(self.dtype, copy=False), temperatures
 
     def apply_temperature_enhancement(
