@@ -7,8 +7,10 @@ import sys
 import types
 from unittest.mock import patch
 
+from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from astropy.table import Table
+import astropy.units as u
 import healpy as hp
 import numpy as np
 
@@ -68,6 +70,51 @@ class RacsFluxErrorTests(unittest.TestCase):
     def setUp(self):
         self.sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
 
+    def _configure_minimal_generate_dipole_sim(self, n_samples: int) -> None:
+        sim = self.sim
+        sim.lookups_are_initialised = True
+        n_pix = hp.nside2npix(sim.nside)
+        sim.mask_map = np.ones(n_pix, dtype=bool)
+        sim.tile_lookup_map = np.zeros(n_pix, dtype=np.int32)
+        sim.tile_temperature_by_index = np.array([30.0], dtype=np.float64)
+        sim.sample_points = lambda n, dtype=np.float64, rng=None: (
+            np.linspace(0.0, 90.0, n, dtype=dtype),
+            np.zeros(n, dtype=dtype),
+        )
+        sim.sample_spectral_indices = lambda n, rng=None: np.full(n, 0.8, dtype=np.float32)
+        sim.aberrate_points = lambda ra, dec, dtype=np.float64: (
+            np.asarray(ra, dtype=dtype),
+            np.asarray(dec, dtype=dtype),
+            np.zeros_like(ra, dtype=dtype),
+        )
+        sim.boost_fluxes = lambda flux, angle_to_dipole_deg, spectral_index, dtype=np.float64: (
+            np.asarray(flux, dtype=dtype)
+        )
+        sim._source_isin_mask = lambda ra, dec: (
+            np.ones(ra.shape[0], dtype=bool),
+            np.arange(ra.shape[0], dtype=np.int64) % n_pix,
+        )
+        sim.sample_tiles_for_pixels = lambda pixel_indices, rng=None: np.zeros(
+            pixel_indices.shape[0],
+            dtype=np.int32,
+        )
+        sim.evaluate_temperature_enhancement = lambda tile_indices, temp_slope, temp_intercept, temp_pivot_c: (
+            np.ones(tile_indices.shape[0], dtype=np.float64),
+            np.full(tile_indices.shape[0], 30.0, dtype=np.float32),
+        )
+        sim.apply_temperature_enhancement = lambda flux, enhancement, dtype=np.float64: (
+            np.asarray(flux, dtype=dtype)
+        )
+        sim.add_flux_error = lambda flux, flux_error, rng=None, dtype=np.float64: (
+            np.asarray(flux, dtype=dtype)
+        )
+        sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.full(
+            pixel_indices.shape[0],
+            0.1,
+            dtype=np.float32,
+        )
+        sim.sample_fluxes = lambda n, rng=None: np.full(n, 100.0, dtype=np.float64)
+
     def test_sample_fractional_errors_draws_from_pixel_lookup(self):
         # Pixel 0 has one possible value; pixel 1 has two values; pixel 2 is empty.
         self.sim.error_lookup_pixel_counts = np.array([1, 2, 0], dtype=np.int64)
@@ -116,6 +163,15 @@ class RacsFluxErrorTests(unittest.TestCase):
                 fractional_error_eta=-0.1,
             )
 
+    def test_generate_dipole_rejects_negative_lambda_clus(self):
+        self._configure_minimal_generate_dipole_sim(n_samples=8)
+
+        with self.assertRaisesRegex(ValueError, "lambda_clus must be non-negative"):
+            self.sim.generate_dipole(
+                log10_n_initial_samples=np.log10(8.0),
+                lambda_clus=-0.1,
+            )
+
     def test_add_flux_error_uses_precomputed_raw_sigma(self):
         flux = np.full(8, 100.0, dtype=np.float64)
         sigma = np.full(8, 10.0, dtype=np.float64)
@@ -137,44 +193,11 @@ class RacsFluxErrorTests(unittest.TestCase):
 
     def test_generate_dipole_stores_effective_fractional_errors_after_eta_scaling(self):
         sim = self.sim
-        sim.lookups_are_initialised = True
-        n_pix = hp.nside2npix(sim.nside)
-        sim.mask_map = np.ones(n_pix, dtype=bool)
-        sim.tile_lookup_map = np.zeros(n_pix, dtype=np.int32)
-        sim.tile_temperature_by_index = np.array([30.0], dtype=np.float64)
+        self._configure_minimal_generate_dipole_sim(n_samples=10)
 
         n_samples = 10
         base_fractional_error = np.full(n_samples, 0.1, dtype=np.float32)
 
-        sim.sample_fluxes = lambda n, rng=None: np.full(n, 100.0, dtype=np.float64)
-        sim.sample_points = lambda n, dtype=np.float64, rng=None: (
-            np.linspace(0.0, 90.0, n, dtype=dtype),
-            np.zeros(n, dtype=dtype),
-        )
-        sim.sample_spectral_indices = lambda n, rng=None: np.full(n, 0.8, dtype=np.float32)
-        sim.aberrate_points = lambda ra, dec, dtype=np.float64: (
-            np.asarray(ra, dtype=dtype),
-            np.asarray(dec, dtype=dtype),
-            np.zeros_like(ra, dtype=dtype),
-        )
-        sim.boost_fluxes = lambda flux, angle_to_dipole_deg, spectral_index, dtype=np.float64: (
-            np.asarray(flux, dtype=dtype)
-        )
-        sim._source_isin_mask = lambda ra, dec: (
-            np.ones(ra.shape[0], dtype=bool),
-            np.arange(ra.shape[0], dtype=np.int64) % n_pix,
-        )
-        sim.sample_tiles_for_pixels = lambda pixel_indices, rng=None: np.zeros(
-            pixel_indices.shape[0],
-            dtype=np.int32,
-        )
-        sim.evaluate_temperature_enhancement = lambda tile_indices, temp_slope, temp_intercept, temp_pivot_c: (
-            np.ones(tile_indices.shape[0], dtype=np.float64),
-            np.full(tile_indices.shape[0], 30.0, dtype=np.float32),
-        )
-        sim.apply_temperature_enhancement = lambda flux, enhancement, dtype=np.float64: (
-            np.asarray(flux, dtype=dtype)
-        )
         sim.sample_fractional_errors = lambda pixel_indices, rng=None: base_fractional_error[
             : pixel_indices.shape[0]
         ]
@@ -221,35 +244,10 @@ class RacsFluxErrorTests(unittest.TestCase):
 
     def test_generate_dipole_remains_finite_when_linear_enhancement_hits_floor(self):
         sim = self.sim
-        sim.lookups_are_initialised = True
-        n_pix = hp.nside2npix(sim.nside)
-        sim.mask_map = np.ones(n_pix, dtype=bool)
-        sim.tile_lookup_map = np.zeros(n_pix, dtype=np.int32)
+        self._configure_minimal_generate_dipole_sim(n_samples=8)
         sim.tile_temperature_by_index = np.array([60.0], dtype=np.float64)
 
         n_samples = 8
-        sim.sample_fluxes = lambda n, rng=None: np.full(n, 100.0, dtype=np.float64)
-        sim.sample_points = lambda n, dtype=np.float64, rng=None: (
-            np.linspace(0.0, 90.0, n, dtype=dtype),
-            np.zeros(n, dtype=dtype),
-        )
-        sim.sample_spectral_indices = lambda n, rng=None: np.full(n, 0.8, dtype=np.float32)
-        sim.aberrate_points = lambda ra, dec, dtype=np.float64: (
-            np.asarray(ra, dtype=dtype),
-            np.asarray(dec, dtype=dtype),
-            np.zeros_like(ra, dtype=dtype),
-        )
-        sim.boost_fluxes = lambda flux, angle_to_dipole_deg, spectral_index, dtype=np.float64: (
-            np.asarray(flux, dtype=dtype)
-        )
-        sim._source_isin_mask = lambda ra, dec: (
-            np.ones(ra.shape[0], dtype=bool),
-            np.arange(ra.shape[0], dtype=np.int64) % n_pix,
-        )
-        sim.sample_tiles_for_pixels = lambda pixel_indices, rng=None: np.zeros(
-            pixel_indices.shape[0],
-            dtype=np.int32,
-        )
         sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.full(
             pixel_indices.shape[0],
             0.1,
@@ -268,6 +266,104 @@ class RacsFluxErrorTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(sim.final_observed_flux_samples)))
         self.assertTrue(np.all(np.isfinite(sim.final_flux_error_samples)))
         self.assertTrue(np.all(sim.final_flux_error_samples >= 0.0))
+
+    def test_generate_dipole_skips_clustering_when_lambda_clus_zero(self):
+        sim = self.sim
+        n_samples = 10
+        self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
+
+        def _unexpected_cluster_sample(*args, **kwargs):
+            raise AssertionError("sample_clustered_points() should not be called")
+
+        sim.sample_clustered_points = _unexpected_cluster_sample
+
+        sim.generate_dipole(
+            log10_n_initial_samples=np.log10(float(n_samples)),
+            lambda_clus=0.0,
+        )
+
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples)
+        self.assertEqual(sim.final_longitudes.shape[0], n_samples)
+
+    def test_generate_dipole_adds_cluster_components_on_top_of_parents(self):
+        sim = self.sim
+        n_samples = 5
+        self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
+
+        flux_call_sizes: list[int] = []
+
+        def _sample_fluxes(n, rng=None):
+            flux_call_sizes.append(int(n))
+            return np.full(n, 100.0 + len(flux_call_sizes), dtype=np.float64)
+
+        sim.sample_fluxes = _sample_fluxes
+        sim.sample_clustered_points = lambda parent_ra, parent_dec, counts, rng=None, dtype=np.float64: (
+            (np.repeat(np.asarray(parent_ra, dtype=np.float64), counts) + 0.01).astype(
+                dtype,
+                copy=False,
+            ),
+            np.repeat(np.asarray(parent_dec, dtype=np.float64), counts).astype(dtype, copy=False),
+        )
+
+        class _FixedPoissonRng:
+            def __init__(self):
+                self._delegate = np.random.default_rng(123)
+
+            def poisson(self, lam, size=None):
+                if size == n_samples and np.isscalar(lam):
+                    return np.array([2, 0, 1, 0, 0], dtype=np.int64)
+                return self._delegate.poisson(lam, size=size)
+
+            def __getattr__(self, name):
+                return getattr(self._delegate, name)
+
+        class _FixedPoissonKey:
+            def _generator(self):
+                return _FixedPoissonRng()
+
+        sim.generate_dipole(
+            log10_n_initial_samples=np.log10(float(n_samples)),
+            lambda_clus=1.2,
+            rng_key=_FixedPoissonKey(),
+        )
+
+        self.assertEqual(flux_call_sizes, [n_samples, 3])
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples + 3)
+        np.testing.assert_allclose(
+            sim.final_longitudes[:n_samples],
+            np.linspace(0.0, 90.0, n_samples, dtype=np.float32),
+        )
+        self.assertTrue(np.all(sim.final_longitudes[n_samples:] >= 0.01))
+
+    def test_sample_clustered_points_enforces_minimum_offset(self):
+        sim = RacsLow3(
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_r0_arcsec=0.01,
+                cluster_r_cut_arcsec=20.0,
+            )
+        )
+
+        parent_ra = np.array([120.0], dtype=np.float64)
+        parent_dec = np.array([-30.0], dtype=np.float64)
+        child_ra, child_dec = sim.sample_clustered_points(
+            parent_ra,
+            parent_dec,
+            np.array([256], dtype=np.int64),
+            rng=np.random.default_rng(123),
+            dtype=np.float64,
+        )
+
+        parent_coord = SkyCoord(ra=parent_ra[0] * u.deg, dec=parent_dec[0] * u.deg, frame="icrs")
+        child_coord = SkyCoord(ra=child_ra * u.deg, dec=child_dec * u.deg, frame="icrs")
+        separations_arcsec = child_coord.separation(parent_coord).arcsec
+
+        self.assertEqual(child_ra.shape[0], 256)
+        self.assertTrue(np.all(np.isfinite(child_ra)))
+        self.assertTrue(np.all(np.isfinite(child_dec)))
+        self.assertTrue(np.all(separations_arcsec >= 20.0 - 1e-6))
 
     def test_sample_tiles_for_pixels_draws_from_pixel_mixture(self):
         self.sim.sbid_mixture_counts = np.array([2], dtype=np.int64)
@@ -357,6 +453,23 @@ class PafWeatherLookupTests(unittest.TestCase):
 
 
 class RacsInitialiseDataTests(unittest.TestCase):
+    def test_config_rejects_invalid_clustering_parameters(self):
+        with self.assertRaisesRegex(ValueError, "cluster_r0_arcsec must be positive"):
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_r0_arcsec=0.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "cluster_r_cut_arcsec must be non-negative"):
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_r_cut_arcsec=-1.0,
+            )
+
     def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):
         with TemporaryDirectory() as tmpdir:
             sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))

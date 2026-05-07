@@ -39,6 +39,8 @@ class RacsLow3Config:
     flux_hist_bins: int = 200
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
+    cluster_r0_arcsec: float = 100.0
+    cluster_r_cut_arcsec: float = 20.0
     fractional_error_flux_min_mjy: float = 10.0
     paf_temperature_data_dir: Optional[str] = None
     paf_max_interpolation_gap_minutes: float = 20.0
@@ -54,6 +56,10 @@ class RacsLow3Config:
             raise ValueError("flux_hist_bins must be at least 2.")
         if self.alpha_sigma <= 0:
             raise ValueError("alpha_sigma must be positive.")
+        if self.cluster_r0_arcsec <= 0:
+            raise ValueError("cluster_r0_arcsec must be positive.")
+        if self.cluster_r_cut_arcsec < 0:
+            raise ValueError("cluster_r_cut_arcsec must be non-negative.")
         if self.fractional_error_flux_min_mjy <= 0:
             raise ValueError("fractional_error_flux_min_mjy must be positive.")
         if self.paf_max_interpolation_gap_minutes <= 0:
@@ -517,6 +523,13 @@ class RacsLow3:
             ),
         )
         if self.temperature_map is not None:
+            self._save_lookup_map_png(
+                self.temperature_map,
+                cache_path.with_suffix(".png"),
+                title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
+                unit="deg C",
+                cmap="coolwarm",
+            )
             for coord, coord_str in zip([['C'], ['C', 'G']], ['eq', 'gal']):
                 self._save_lookup_map_png(
                     self.temperature_map,
@@ -838,6 +851,53 @@ class RacsLow3:
         ra_deg, dec_deg = sample_spherical_points(n_points, rng=rng)
         return ra_deg.astype(dtype), dec_deg.astype(dtype)
 
+    def sample_clustered_points(
+        self,
+        parent_ra_deg: NDArray[np.floating],
+        parent_dec_deg: NDArray[np.floating],
+        per_parent_n_components: NDArray[np.integer],
+        rng: Optional[np.random.Generator] = None,
+        dtype: type = np.float64,
+    ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+        """Sample clustered component positions around parent sources."""
+        if rng is None:
+            rng = np.random.default_rng()
+
+        counts = np.asarray(per_parent_n_components, dtype=np.int64)
+        total_n_components = int(counts.sum())
+        if total_n_components == 0:
+            empty = np.empty(0, dtype=dtype)
+            return empty, empty
+
+        parent_indices = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+        parent_ra_rad = np.deg2rad(np.asarray(parent_ra_deg, dtype=np.float64)[parent_indices])
+        parent_dec_rad = np.deg2rad(np.asarray(parent_dec_deg, dtype=np.float64)[parent_indices])
+
+        phi = rng.uniform(0.0, 2.0 * np.pi, size=total_n_components)
+        radial_arcsec = self.cfg.cluster_r_cut_arcsec + rng.exponential(
+            scale=self.cfg.cluster_r0_arcsec,
+            size=total_n_components,
+        )
+        angular_distance_rad = np.deg2rad(radial_arcsec / 3600.0)
+
+        sin_parent_dec = np.sin(parent_dec_rad)
+        cos_parent_dec = np.cos(parent_dec_rad)
+        sin_distance = np.sin(angular_distance_rad)
+        cos_distance = np.cos(angular_distance_rad)
+
+        child_dec_rad = np.arcsin(
+            sin_parent_dec * cos_distance
+            + cos_parent_dec * sin_distance * np.cos(phi)
+        )
+        child_ra_rad = parent_ra_rad + np.arctan2(
+            np.sin(phi) * sin_distance * cos_parent_dec,
+            cos_distance - sin_parent_dec * np.sin(child_dec_rad),
+        )
+
+        child_ra_deg = np.mod(np.rad2deg(child_ra_rad), 360.0)
+        child_dec_deg = np.rad2deg(child_dec_rad)
+        return child_ra_deg.astype(dtype, copy=False), child_dec_deg.astype(dtype, copy=False)
+
     def sample_spectral_indices(
         self,
         n_samples: int,
@@ -1067,6 +1127,7 @@ class RacsLow3:
         self,
         log10_n_initial_samples: float,
         flux_min: Optional[float] = None,
+        lambda_clus: float = 0.0,
         observer_speed: float = 1.0,
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
@@ -1097,6 +1158,8 @@ class RacsLow3:
         n_samples = int(10 ** log10_n_initial_samples)
         if n_samples < 0:
             raise ValueError("n_initial_samples must be non-negative.")
+        if lambda_clus < 0:
+            raise ValueError("lambda_clus must be non-negative.")
 
         active_flux_min = self.cfg.flux_min if flux_min is None else flux_min
         rng = rng_key._generator() if rng_key is not None else np.random.default_rng()
@@ -1126,6 +1189,36 @@ class RacsLow3:
                 current_chunk, dtype=self.dtype, rng=rng
             )
             alpha = self.sample_spectral_indices(current_chunk, rng=rng)
+
+            if lambda_clus > 0:
+                per_parent_n_components = rng.poisson(lambda_clus, size=current_chunk)
+                total_n_components = int(per_parent_n_components.sum())
+                if total_n_components > 0:
+                    cluster_ra_deg, cluster_dec_deg = self.sample_clustered_points(
+                        rest_ra_deg,
+                        rest_dec_deg,
+                        per_parent_n_components,
+                        rng=rng,
+                        dtype=self.dtype,
+                    )
+                    cluster_flux = self.sample_fluxes(total_n_components, rng=rng)
+                    cluster_alpha = self.sample_spectral_indices(total_n_components, rng=rng)
+                    intrinsic_flux = np.concatenate((intrinsic_flux, cluster_flux)).astype(
+                        self.dtype,
+                        copy=False,
+                    )
+                    rest_ra_deg = np.concatenate((rest_ra_deg, cluster_ra_deg)).astype(
+                        self.dtype,
+                        copy=False,
+                    )
+                    rest_dec_deg = np.concatenate((rest_dec_deg, cluster_dec_deg)).astype(
+                        self.dtype,
+                        copy=False,
+                    )
+                    alpha = np.concatenate((alpha, cluster_alpha)).astype(
+                        np.float32,
+                        copy=False,
+                    )
 
             boosted_ra_deg, boosted_dec_deg, angle_to_dipole_deg = self.aberrate_points(
                 rest_ra_deg,
