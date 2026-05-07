@@ -119,6 +119,9 @@ class RacsLow3:
     def _sbid_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"sbid_lookup_nside{self.nside}.npz"
 
+    def _sbid_mixture_lookup_cache_path(self) -> Path:
+        return self._cache_dir() / f"sbid_mixture_lookup_nside{self.nside}.npz"
+
     def _flux_distribution_cache_path(self) -> Path:
         return self._cache_dir() / f"flux_distribution_bins{self.cfg.flux_hist_bins}.npz"
 
@@ -141,9 +144,10 @@ class RacsLow3:
         title: str,
         unit: str = "",
         cmap: str = "viridis",
+        **kwargs
     ) -> None:
         fig = plt.figure(figsize=(10, 6))
-        hp.mollview(
+        hp.projview(
             np.asarray(map_values, dtype=np.float64),
             nest=True,
             fig=fig.number,
@@ -151,6 +155,7 @@ class RacsLow3:
             unit=unit,
             cmap=cmap,
             hold=True,
+            **kwargs
         )
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
@@ -263,7 +268,7 @@ class RacsLow3:
         return True
 
     def build_tile_lookup(self) -> None:
-        """Build a simple HEALPix survey mask and per-pixel dominant SBID lookup."""
+        """Build per-pixel dominant-SBID and SBID-mixture lookup products."""
         assert self.catalogue_is_loaded, "Load the catalogue before building tile lookups."
 
         ra = np.asarray(self.catalogue["RA"], dtype=np.float64)
@@ -283,15 +288,51 @@ class RacsLow3:
             return_index=True,
             return_counts=True,
         )
+        mixture_counts = np.zeros(n_pix, dtype=np.int64)
+        mixture_starts = np.zeros(n_pix, dtype=np.int64)
+        mixture_tile_indices: list[NDArray[np.int32]] = []
+        mixture_sbid_probabilities: list[NDArray[np.float64]] = []
+        mixture_offset = 0
+
         for pix, start, count in zip(unique_pixels, starts, counts):
             sbid_values = sbid_sorted[start:start + count]
             sbid_unique, sbid_counts = np.unique(sbid_values, return_counts=True)
             self.tile_lookup_map[pix] = int(sbid_unique[np.argmax(sbid_counts)])
+            mixture_starts[pix] = mixture_offset
+            mixture_counts[pix] = sbid_unique.size
+            mixture_tile_indices.append(
+                np.asarray(
+                    [self._tile_index_from_sbid[int(tile_sbid)] for tile_sbid in sbid_unique],
+                    dtype=np.int32,
+                )
+            )
+            mixture_sbid_probabilities.append(
+                (sbid_counts.astype(np.float64) / sbid_counts.sum()).astype(
+                    np.float64,
+                    copy=False,
+                )
+            )
+            mixture_offset += sbid_unique.size
 
         self.mask_map = self.tile_lookup_map >= 0
+        if mixture_tile_indices:
+            self.sbid_mixture_counts = mixture_counts
+            self.sbid_mixture_starts = mixture_starts
+            self.sbid_mixture_tile_indices = np.concatenate(mixture_tile_indices).astype(
+                np.int32,
+                copy=False,
+            )
+            self.sbid_mixture_probabilities = np.concatenate(
+                mixture_sbid_probabilities
+            ).astype(np.float64, copy=False)
+        else:
+            self.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            self.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            self.sbid_mixture_tile_indices = np.empty(0, dtype=np.int32)
+            self.sbid_mixture_probabilities = np.empty(0, dtype=np.float64)
 
     def save_tile_lookup(self) -> None:
-        """Persist the HEALPix SBID lookup derived from the uncut catalogue."""
+        """Persist the HEALPix dominant-SBID lookup derived from the uncut catalogue."""
         cache_path = self._sbid_lookup_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -309,6 +350,20 @@ class RacsLow3:
             cmap="viridis",
         )
 
+    def save_sbid_mixture_lookup(self) -> None:
+        """Persist the per-pixel SBID mixture lookup used during simulation."""
+        cache_path = self._sbid_mixture_lookup_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            nside=np.asarray(self.nside, dtype=np.int64),
+            tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
+            counts=self.sbid_mixture_counts.astype(np.int64, copy=False),
+            starts=self.sbid_mixture_starts.astype(np.int64, copy=False),
+            tile_indices=self.sbid_mixture_tile_indices.astype(np.int32, copy=False),
+            probabilities=self.sbid_mixture_probabilities.astype(np.float64, copy=False),
+        )
+
     def load_tile_lookup(self) -> bool:
         """Load a cached HEALPix SBID lookup if one exists and matches this config."""
         cache_path = self._sbid_lookup_cache_path()
@@ -320,6 +375,33 @@ class RacsLow3:
             if cache_nside != self.nside:
                 return False
             self.tile_lookup_map = data["tile_lookup_map"].astype(np.int32, copy=False)
+
+        return True
+
+    def load_sbid_mixture_lookup(self) -> bool:
+        """Load the cached per-pixel SBID mixture lookup if it matches the tile metadata."""
+        cache_path = self._sbid_mixture_lookup_cache_path()
+        if not cache_path.exists():
+            return False
+
+        with np.load(cache_path) as data:
+            cache_nside = int(data["nside"])
+            if cache_nside != self.nside:
+                return False
+            cache_tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
+            if cache_tile_sbids.shape != self.tile_sbids.shape:
+                return False
+            if not np.array_equal(cache_tile_sbids, self.tile_sbids):
+                return False
+            if "tile_indices" not in data.files:
+                return False
+            self.sbid_mixture_counts = data["counts"].astype(np.int64, copy=False)
+            self.sbid_mixture_starts = data["starts"].astype(np.int64, copy=False)
+            self.sbid_mixture_tile_indices = data["tile_indices"].astype(np.int32, copy=False)
+            self.sbid_mixture_probabilities = data["probabilities"].astype(
+                np.float64,
+                copy=False,
+            )
 
         return True
 
@@ -392,7 +474,7 @@ class RacsLow3:
         return True
 
     def build_temperature_map(self) -> None:
-        """Project tile temperatures onto the HEALPix survey footprint."""
+        """Project the mixture-mean tile temperatures onto the HEALPix survey footprint."""
         n_pix = hp.nside2npix(self.nside)
         temperature_map = np.full(n_pix, np.nan, dtype=np.float32)
 
@@ -400,18 +482,22 @@ class RacsLow3:
             self.temperature_map = temperature_map
             return
 
-        valid_pixels = self.tile_lookup_map >= 0
+        assert hasattr(self, "sbid_mixture_counts"), "Run initialise_data() first."
+        valid_pixels = self.sbid_mixture_counts > 0
         if np.any(valid_pixels):
-            tile_indices = np.array(
-                [
-                    self._tile_index_from_sbid[int(tile_sbid)]
-                    for tile_sbid in self.tile_lookup_map[valid_pixels]
-                ],
-                dtype=np.int32,
-            )
-            temperature_map[valid_pixels] = self.tile_temperature_by_index[
-                tile_indices
-            ].astype(np.float32, copy=False)
+            for pix in np.flatnonzero(valid_pixels):
+                start = self.sbid_mixture_starts[pix]
+                count = self.sbid_mixture_counts[pix]
+                pixel_tile_indices = self.sbid_mixture_tile_indices[start:start + count]
+                pixel_probabilities = self.sbid_mixture_probabilities[start:start + count]
+                pixel_temperatures = self.tile_temperature_by_index[pixel_tile_indices]
+                finite = np.isfinite(pixel_temperatures)
+                if np.any(finite):
+                    probs = pixel_probabilities[finite]
+                    probs /= probs.sum()
+                    temperature_map[pix] = float(
+                        np.sum(pixel_temperatures[finite] * probs, dtype=np.float64)
+                    )
 
         self.temperature_map = temperature_map
 
@@ -431,13 +517,15 @@ class RacsLow3:
             ),
         )
         if self.temperature_map is not None:
-            self._save_lookup_map_png(
-                self.temperature_map,
-                cache_path.with_suffix(".png"),
-                title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
-                unit="deg C",
-                cmap="coolwarm",
-            )
+            for coord, coord_str in zip([['C'], ['C', 'G']], ['eq', 'gal']):
+                self._save_lookup_map_png(
+                    self.temperature_map,
+                    f'{str(self._cache_dir())}/temperature_lookup_paf_{coord_str}.png',
+                    title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
+                    unit="deg C",
+                    cmap="coolwarm",
+                    coord=coord
+                )
 
     def load_temperature_lookup(self) -> bool:
         """Load a cached per-tile temperature lookup if it matches the tile metadata."""
@@ -680,12 +768,17 @@ class RacsLow3:
         need_flux_distribution = not self.load_flux_distribution()
         need_tile_metadata = not self.load_tile_metadata()
         need_tile_lookup = not self.load_tile_lookup()
+        need_sbid_mixture_lookup = False
         need_fractional_error_lookup = not self.load_fractional_error_lookup()
+
+        if not need_tile_metadata:
+            need_sbid_mixture_lookup = not self.load_sbid_mixture_lookup()
 
         if (
             need_flux_distribution
             or need_tile_metadata
             or need_tile_lookup
+            or need_sbid_mixture_lookup
             or need_fractional_error_lookup
         ):
             if not self.catalogue_is_loaded:
@@ -701,6 +794,10 @@ class RacsLow3:
                 if need_tile_lookup:
                     self.build_tile_lookup()
                     self.save_tile_lookup()
+                    self.save_sbid_mixture_lookup()
+                elif need_sbid_mixture_lookup:
+                    self.build_tile_lookup()
+                    self.save_sbid_mixture_lookup()
                 if need_fractional_error_lookup:
                     self.build_fractional_error_lookup()
                     self.save_fractional_error_lookup()
@@ -812,6 +909,62 @@ class RacsLow3:
             )
 
         return tile_indices
+
+    def sample_tiles_for_pixels(
+        self,
+        pixel_indices: NDArray[np.int_],
+        rng: Optional[np.random.Generator] = None,
+    ) -> NDArray[np.int32]:
+        """Sample a tile assignment from each pixel's empirical SBID mixture."""
+        assert hasattr(self, "sbid_mixture_counts"), "Run initialise_data() first."
+        if rng is None:
+            rng = np.random.default_rng()
+
+        pix = np.asarray(pixel_indices, dtype=np.int64)
+        out = np.full(pix.shape[0], -1, dtype=np.int32)
+        valid_pixels = self.sbid_mixture_counts[pix] > 0
+        if not np.any(valid_pixels):
+            return out
+
+        valid_positions = np.flatnonzero(valid_pixels)
+        valid_pix = pix[valid_positions]
+        order = np.argsort(valid_pix, kind="stable")
+        valid_positions_sorted = valid_positions[order]
+        valid_pix_sorted = valid_pix[order]
+        unique_pix, starts, counts = np.unique(
+            valid_pix_sorted,
+            return_index=True,
+            return_counts=True,
+        )
+        for pixel, start_idx, count in zip(unique_pix, starts, counts):
+            pixel_output_positions = valid_positions_sorted[start_idx:start_idx + count]
+            start = self.sbid_mixture_starts[pixel]
+            mixture_count = self.sbid_mixture_counts[pixel]
+            pixel_tile_indices = self.sbid_mixture_tile_indices[start:start + mixture_count]
+            pixel_probabilities = self.sbid_mixture_probabilities[start:start + mixture_count]
+            if mixture_count == 1:
+                out[pixel_output_positions] = pixel_tile_indices[0]
+                continue
+            if mixture_count == 2:
+                draws = rng.random(count)
+                sampled_tile_indices = np.where(
+                    draws < pixel_probabilities[0],
+                    pixel_tile_indices[0],
+                    pixel_tile_indices[1],
+                )
+                out[pixel_output_positions] = sampled_tile_indices.astype(
+                    np.int32,
+                    copy=False,
+                )
+                continue
+            sampled_tile_indices = rng.choice(
+                pixel_tile_indices,
+                size=count,
+                p=pixel_probabilities,
+            )
+            out[pixel_output_positions] = sampled_tile_indices.astype(np.int32, copy=False)
+
+        return out
 
     def evaluate_temperature_enhancement(
         self,
@@ -987,7 +1140,7 @@ class RacsLow3:
             )
 
             mask_slice, pixel_indices = self._source_isin_mask(boosted_ra_deg, boosted_dec_deg)
-            tile_indices = self.assign_tiles(boosted_ra_deg, boosted_dec_deg)
+            tile_indices = self.sample_tiles_for_pixels(pixel_indices, rng=rng)
             enhancement, temperatures = self.evaluate_temperature_enhancement(
                 tile_indices=tile_indices,
                 temp_slope=temp_slope,

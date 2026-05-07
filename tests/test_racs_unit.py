@@ -164,7 +164,10 @@ class RacsFluxErrorTests(unittest.TestCase):
             np.ones(ra.shape[0], dtype=bool),
             np.arange(ra.shape[0], dtype=np.int64) % n_pix,
         )
-        sim.assign_tiles = lambda ra, dec: np.zeros(ra.shape[0], dtype=np.int32)
+        sim.sample_tiles_for_pixels = lambda pixel_indices, rng=None: np.zeros(
+            pixel_indices.shape[0],
+            dtype=np.int32,
+        )
         sim.evaluate_temperature_enhancement = lambda tile_indices, temp_slope, temp_intercept, temp_pivot_c: (
             np.ones(tile_indices.shape[0], dtype=np.float64),
             np.full(tile_indices.shape[0], 30.0, dtype=np.float32),
@@ -243,7 +246,10 @@ class RacsFluxErrorTests(unittest.TestCase):
             np.ones(ra.shape[0], dtype=bool),
             np.arange(ra.shape[0], dtype=np.int64) % n_pix,
         )
-        sim.assign_tiles = lambda ra, dec: np.zeros(ra.shape[0], dtype=np.int32)
+        sim.sample_tiles_for_pixels = lambda pixel_indices, rng=None: np.zeros(
+            pixel_indices.shape[0],
+            dtype=np.int32,
+        )
         sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.full(
             pixel_indices.shape[0],
             0.1,
@@ -262,6 +268,34 @@ class RacsFluxErrorTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(sim.final_observed_flux_samples)))
         self.assertTrue(np.all(np.isfinite(sim.final_flux_error_samples)))
         self.assertTrue(np.all(sim.final_flux_error_samples >= 0.0))
+
+    def test_sample_tiles_for_pixels_draws_from_pixel_mixture(self):
+        self.sim.sbid_mixture_counts = np.array([2], dtype=np.int64)
+        self.sim.sbid_mixture_starts = np.array([0], dtype=np.int64)
+        self.sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+        self.sim.sbid_mixture_probabilities = np.array([0.75, 0.25], dtype=np.float64)
+
+        sampled = self.sim.sample_tiles_for_pixels(
+            np.zeros(2000, dtype=np.int64),
+            rng=np.random.default_rng(123),
+        )
+        counts = np.bincount(sampled, minlength=2).astype(np.float64)
+        frequencies = counts / counts.sum()
+
+        self.assertTrue(np.all(sampled >= 0))
+        self.assertAlmostEqual(frequencies[0], 0.75, delta=0.05)
+        self.assertAlmostEqual(frequencies[1], 0.25, delta=0.05)
+
+    def test_build_temperature_map_uses_pixel_mixture_mean(self):
+        self.sim.tile_temperature_by_index = np.array([20.0, 30.0], dtype=np.float64)
+        self.sim.sbid_mixture_counts = np.array([2], dtype=np.int64)
+        self.sim.sbid_mixture_starts = np.array([0], dtype=np.int64)
+        self.sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+        self.sim.sbid_mixture_probabilities = np.array([0.75, 0.25], dtype=np.float64)
+
+        self.sim.build_temperature_map()
+
+        self.assertAlmostEqual(float(self.sim.temperature_map[0]), 22.5)
 
 
 class PafWeatherLookupTests(unittest.TestCase):
@@ -347,8 +381,16 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
             sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
             sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
             sim.save_tile_lookup()
+            sim.save_sbid_mixture_lookup()
             self.assertTrue((cache_dir / "sbid_lookup_nside64.png").exists())
+            self.assertTrue((cache_dir / "sbid_mixture_lookup_nside64.npz").exists())
 
             sim.error_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
             sim.error_lookup_pixel_starts = np.zeros(n_pix, dtype=np.int64)
@@ -382,6 +424,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 sim.temperature_map[:2],
                 np.array([20.0, 21.0], dtype=np.float32),
             )
+            np.testing.assert_array_equal(sim.sbid_mixture_tile_indices, np.array([0, 1], dtype=np.int32))
 
     def test_load_temperature_table_raises_when_paf_directory_missing(self):
         sim = RacsLow3(
@@ -396,6 +439,10 @@ class RacsInitialiseDataTests(unittest.TestCase):
         sim.tile_scan_start_mjd = np.array([60000.0], dtype=np.float64)
         sim.tile_lookup_map = np.array([101], dtype=np.int32)
         sim._tile_index_from_sbid = {101: 0}
+        sim.sbid_mixture_counts = np.array([1], dtype=np.int64)
+        sim.sbid_mixture_starts = np.array([0], dtype=np.int64)
+        sim.sbid_mixture_tile_indices = np.array([0], dtype=np.int32)
+        sim.sbid_mixture_probabilities = np.array([1.0], dtype=np.float64)
 
         with self.assertRaises(FileNotFoundError):
             sim.load_temperature_table()
@@ -430,6 +477,12 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
             sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
             sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
 
             sim.load_temperature_table()
 
@@ -456,6 +509,12 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
             sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
             sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
             sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
             sim.save_temperature_lookup()
 
