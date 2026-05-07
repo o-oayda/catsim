@@ -29,6 +29,12 @@ LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
 
 @dataclass
 class RacsLow3Config:
+    """Configuration for the RACS-low3 simulator.
+
+    Clustering offsets use
+    ``r = cluster_r_cut_arcsec + Exponential(scale=cluster_r0_arcsec)``
+    in arcseconds, with a random position angle ``phi ~ Uniform(0, 2pi)``.
+    """
     flux_min: float
     nside: int = 64
     chunk_size: int = 50_000
@@ -859,7 +865,12 @@ class RacsLow3:
         rng: Optional[np.random.Generator] = None,
         dtype: type = np.float64,
     ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
-        """Sample clustered component positions around parent sources."""
+        """Sample clustered component positions around parent sources.
+
+        For each added component, draw ``phi ~ Uniform(0, 2pi)`` and
+        ``r = cluster_r_cut_arcsec + Exponential(scale=cluster_r0_arcsec)``,
+        then offset the parent source by ``(r, phi)`` on the sphere.
+        """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -1127,7 +1138,8 @@ class RacsLow3:
         self,
         log10_n_initial_samples: float,
         flux_min: Optional[float] = None,
-        lambda_clus: float = 0.0,
+        p_clus: float = 0.0,
+        clus_stop_prob: float = 1.0,
         observer_speed: float = 1.0,
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
@@ -1137,7 +1149,16 @@ class RacsLow3:
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
-        """Coordinate the CatSIM-like simulation pipeline for RACS-low3."""
+        """Coordinate the CatSIM-like simulation pipeline for RACS-low3.
+
+        The clustering model is:
+        for each parent source, draw ``X ~ Bernoulli(p_clus)``. If ``X = 1``,
+        draw the number of added component sources from
+        ``K ~ Geometric(clus_stop_prob)`` on support ``1, 2, 3, ...``.
+        The parent source is retained, and the ``K`` added components are then
+        given clustered positions, independent fluxes, and independent spectral
+        indices before entering the ordinary downstream simulation pipeline.
+        """
         assert self.lookups_are_initialised, (
             "Lookup tables must be initialised before generating maps. "
             "Run initialise_data() first."
@@ -1158,8 +1179,10 @@ class RacsLow3:
         n_samples = int(10 ** log10_n_initial_samples)
         if n_samples < 0:
             raise ValueError("n_initial_samples must be non-negative.")
-        if lambda_clus < 0:
-            raise ValueError("lambda_clus must be non-negative.")
+        if p_clus < 0 or p_clus > 1:
+            raise ValueError("p_clus must lie in [0, 1].")
+        if clus_stop_prob <= 0 or clus_stop_prob > 1:
+            raise ValueError("clus_stop_prob must lie in (0, 1].")
 
         active_flux_min = self.cfg.flux_min if flux_min is None else flux_min
         rng = rng_key._generator() if rng_key is not None else np.random.default_rng()
@@ -1190,8 +1213,15 @@ class RacsLow3:
             )
             alpha = self.sample_spectral_indices(current_chunk, rng=rng)
 
-            if lambda_clus > 0:
-                per_parent_n_components = rng.poisson(lambda_clus, size=current_chunk)
+            if p_clus > 0:
+                clustered_mask = rng.random(current_chunk) < p_clus
+                per_parent_n_components = np.zeros(current_chunk, dtype=np.int64)
+                n_clustered = int(np.count_nonzero(clustered_mask))
+                if n_clustered > 0:
+                    per_parent_n_components[clustered_mask] = rng.geometric(
+                        clus_stop_prob,
+                        size=n_clustered,
+                    ).astype(np.int64, copy=False)
                 total_n_components = int(per_parent_n_components.sum())
                 if total_n_components > 0:
                     cluster_ra_deg, cluster_dec_deg = self.sample_clustered_points(
