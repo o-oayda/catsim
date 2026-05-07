@@ -18,7 +18,7 @@ dependencies = [
     "ipython (>=9.7.0,<10.0.0)",
     "matplotlib (>=3.10.7,<4.0.0)",
     "pytest (>=9.0.2,<10.0.0)",
-    "dipole-utils @ git+https://github.com/o-oayda/dipole-utils.git",
+    "dipole-utils @ git+https://github.com/o-oayda/dipole-utils.git@racs-paf",
 ]
 packages = [
   { "include" = "catsim", "from" = "src" }
