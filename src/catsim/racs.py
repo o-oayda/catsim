@@ -34,6 +34,10 @@ class RacsLow3Config:
     Clustering offsets use
     ``r = cluster_r_cut_arcsec + Exponential(scale=cluster_r0_arcsec)``
     in arcseconds, with a random position angle ``phi ~ Uniform(0, 2pi)``.
+
+    If ``mask_map`` is provided, it must be a 1D HEALPix mask matching
+    ``nside`` in NEST ordering, with ``1`` for kept pixels and ``0`` for
+    masked pixels.
     """
     flux_min: float
     nside: int = 64
@@ -42,6 +46,7 @@ class RacsLow3Config:
     downscale_nside: Optional[int] = None
     store_final_samples: bool = True
     catalogue_path: Optional[str] = None
+    mask_map: Optional[NDArray[np.generic]] = None
     flux_hist_bins: int = 200
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
@@ -54,8 +59,19 @@ class RacsLow3Config:
     def __post_init__(self) -> None:
         if self.flux_min <= 0:
             raise ValueError("flux_min must be positive.")
-        if self.nside != 64:
-            raise ValueError("RacsLow3 currently requires nside=64 to use the packaged mask.")
+        if self.mask_map is None and self.nside != 64:
+            raise ValueError(
+                "RacsLow3 currently requires nside=64 when using the packaged mask."
+            )
+        if self.mask_map is not None:
+            if self.mask_map.ndim != 1:
+                raise ValueError("mask_map must be a 1D HEALPix array.")
+            expected_shape = (hp.nside2npix(self.nside),)
+            if self.mask_map.shape != expected_shape:
+                raise ValueError(
+                    "mask_map has unexpected shape: "
+                    f"{self.mask_map.shape}, expected {expected_shape}"
+                )
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer.")
         if self.flux_hist_bins < 2:
@@ -418,18 +434,28 @@ class RacsLow3:
         return True
 
     def load_mask_map(self) -> None:
-        """Load the packaged equatorial RACS-low3 mask and convert RING -> NEST."""
-        mask_path = self._mask_map_path()
-        if not mask_path.exists():
-            raise FileNotFoundError(f"Packaged RACS-low3 mask not found: {mask_path}")
+        """Load a custom mask if configured, otherwise use the packaged RACS-low3 mask."""
+        expected_shape = (hp.nside2npix(self.nside),)
 
-        mask_map_ring = np.load(mask_path, allow_pickle=False)
-        mask_map = hp.reorder(mask_map_ring, r2n=True)
-        if mask_map.shape != (hp.nside2npix(self.nside),):
-            raise ValueError(
-                "Packaged RACS-low3 mask has unexpected shape: "
-                f"{mask_map.shape}, expected {(hp.nside2npix(self.nside),)}"
-            )
+        if self.cfg.mask_map is not None:
+            mask_map = np.asarray(self.cfg.mask_map)
+            if mask_map.shape != expected_shape:
+                raise ValueError(
+                    "Custom RACS-low3 mask has unexpected shape: "
+                    f"{mask_map.shape}, expected {expected_shape}"
+                )
+        else:
+            mask_path = self._mask_map_path()
+            if not mask_path.exists():
+                raise FileNotFoundError(f"Packaged RACS-low3 mask not found: {mask_path}")
+
+            mask_map_ring = np.load(mask_path, allow_pickle=False)
+            mask_map = hp.reorder(mask_map_ring, r2n=True)
+            if mask_map.shape != expected_shape:
+                raise ValueError(
+                    "Packaged RACS-low3 mask has unexpected shape: "
+                    f"{mask_map.shape}, expected {expected_shape}"
+                )
 
         self.mask_map = np.asarray(mask_map == 1, dtype=np.bool_)
 
