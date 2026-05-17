@@ -3,6 +3,7 @@ import pickle
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Optional
 import sys
 import types
 from unittest.mock import patch
@@ -70,8 +71,13 @@ class RacsFluxErrorTests(unittest.TestCase):
     def setUp(self):
         self.sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
 
-    def _configure_minimal_generate_dipole_sim(self, n_samples: int) -> None:
-        sim = self.sim
+    def _configure_minimal_generate_dipole_sim(
+        self,
+        n_samples: int,
+        sim: Optional[RacsLow3] = None,
+    ) -> RacsLow3:
+        if sim is None:
+            sim = self.sim
         sim.lookups_are_initialised = True
         n_pix = hp.nside2npix(sim.nside)
         sim.mask_map = np.ones(n_pix, dtype=bool)
@@ -114,6 +120,7 @@ class RacsFluxErrorTests(unittest.TestCase):
             dtype=np.float32,
         )
         sim.sample_fluxes = lambda n, rng=None: np.full(n, 100.0, dtype=np.float64)
+        return sim
 
     def test_sample_fractional_errors_draws_from_pixel_lookup(self):
         # Pixel 0 has one possible value; pixel 1 has two values; pixel 2 is empty.
@@ -166,30 +173,79 @@ class RacsFluxErrorTests(unittest.TestCase):
     def test_generate_dipole_rejects_invalid_clustering_parameters(self):
         self._configure_minimal_generate_dipole_sim(n_samples=8)
 
-        with self.assertRaisesRegex(ValueError, "p_clus must lie in \\[0, 1\\]"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "cluster_count_model='geometric'.*p_clus must lie in \\[0, 1\\]",
+        ):
             self.sim.generate_dipole(
                 log10_n_initial_samples=np.log10(8.0),
                 p_clus=-0.1,
             )
 
-        with self.assertRaisesRegex(ValueError, "p_clus must lie in \\[0, 1\\]"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "cluster_count_model='geometric'.*p_clus must lie in \\[0, 1\\]",
+        ):
             self.sim.generate_dipole(
                 log10_n_initial_samples=np.log10(8.0),
                 p_clus=1.1,
             )
 
-        with self.assertRaisesRegex(ValueError, "clus_stop_prob must lie in \\(0, 1\\]"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "cluster_count_model='geometric'.*clus_stop_prob must lie in \\(0, 1\\]",
+        ):
             self.sim.generate_dipole(
                 log10_n_initial_samples=np.log10(8.0),
                 p_clus=0.5,
                 clus_stop_prob=0.0,
             )
 
-        with self.assertRaisesRegex(ValueError, "clus_stop_prob must lie in \\(0, 1\\]"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "cluster_count_model='geometric'.*clus_stop_prob must lie in \\(0, 1\\]",
+        ):
             self.sim.generate_dipole(
                 log10_n_initial_samples=np.log10(8.0),
                 p_clus=0.5,
                 clus_stop_prob=1.1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "lambda_clus is only valid"):
+            self.sim.generate_dipole(
+                log10_n_initial_samples=np.log10(8.0),
+                lambda_clus=0.1,
+            )
+
+    def test_generate_dipole_rejects_invalid_poisson_clustering_parameters(self):
+        sim = RacsLow3(
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_count_model="poisson",
+            )
+        )
+        self._configure_minimal_generate_dipole_sim(n_samples=8, sim=sim)
+
+        with self.assertRaisesRegex(ValueError, "lambda_clus must be non-negative"):
+            sim.generate_dipole(
+                log10_n_initial_samples=np.log10(8.0),
+                lambda_clus=-0.1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "p_clus is only valid"):
+            sim.generate_dipole(
+                log10_n_initial_samples=np.log10(8.0),
+                p_clus=0.1,
+                lambda_clus=0.1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "clus_stop_prob is only valid"):
+            sim.generate_dipole(
+                log10_n_initial_samples=np.log10(8.0),
+                lambda_clus=0.1,
+                clus_stop_prob=0.5,
             )
 
     def test_add_flux_error_uses_precomputed_raw_sigma(self):
@@ -351,6 +407,63 @@ class RacsFluxErrorTests(unittest.TestCase):
             p_clus=0.5,
             clus_stop_prob=0.4,
             rng_key=_FixedClusterKey(),
+        )
+
+        self.assertEqual(flux_call_sizes, [n_samples, 3])
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples + 3)
+        np.testing.assert_allclose(
+            sim.final_longitudes[:n_samples],
+            np.linspace(0.0, 90.0, n_samples, dtype=np.float32),
+        )
+        self.assertTrue(np.all(sim.final_longitudes[n_samples:] >= 0.01))
+
+    def test_generate_dipole_poisson_model_adds_cluster_components_on_top_of_parents(self):
+        sim = RacsLow3(
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_count_model="poisson",
+            )
+        )
+        n_samples = 5
+        self._configure_minimal_generate_dipole_sim(n_samples=n_samples, sim=sim)
+
+        flux_call_sizes: list[int] = []
+
+        def _sample_fluxes(n, rng=None):
+            flux_call_sizes.append(int(n))
+            return np.full(n, 100.0 + len(flux_call_sizes), dtype=np.float64)
+
+        sim.sample_fluxes = _sample_fluxes
+        sim.sample_clustered_points = lambda parent_ra, parent_dec, counts, rng=None, dtype=np.float64: (
+            (np.repeat(np.asarray(parent_ra, dtype=np.float64), counts) + 0.01).astype(
+                dtype,
+                copy=False,
+            ),
+            np.repeat(np.asarray(parent_dec, dtype=np.float64), counts).astype(dtype, copy=False),
+        )
+
+        class _FixedPoissonRng:
+            def __init__(self):
+                self._delegate = np.random.default_rng(123)
+
+            def poisson(self, lam, size=None):
+                if size == n_samples and np.isscalar(lam):
+                    return np.array([2, 0, 1, 0, 0], dtype=np.int64)
+                return self._delegate.poisson(lam, size=size)
+
+            def __getattr__(self, name):
+                return getattr(self._delegate, name)
+
+        class _FixedPoissonKey:
+            def _generator(self):
+                return _FixedPoissonRng()
+
+        sim.generate_dipole(
+            log10_n_initial_samples=np.log10(float(n_samples)),
+            lambda_clus=1.2,
+            rng_key=_FixedPoissonKey(),
         )
 
         self.assertEqual(flux_call_sizes, [n_samples, 3])
@@ -537,6 +650,14 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 nside=64,
                 chunk_size=16,
                 cluster_r_cut_arcsec=-1.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "cluster_count_model must be either"):
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_count_model="unknown",
             )
 
     def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):

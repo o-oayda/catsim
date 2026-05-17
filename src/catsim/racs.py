@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
@@ -31,6 +31,11 @@ LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
 class RacsLow3Config:
     """Configuration for the RACS-low3 simulator.
 
+    ``cluster_count_model`` selects how many component sources each parent can
+    add. ``"geometric"`` uses Bernoulli source selection plus geometric
+    component counts. ``"poisson"`` draws a Poisson component count for every
+    parent source.
+
     Clustering offsets use
     ``r = cluster_r_cut_arcsec + Exponential(scale=cluster_r0_arcsec)``
     in arcseconds, with a random position angle ``phi ~ Uniform(0, 2pi)``.
@@ -50,6 +55,7 @@ class RacsLow3Config:
     flux_hist_bins: int = 200
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
+    cluster_count_model: Literal['geometric', 'poisson'] = "geometric"
     cluster_r0_arcsec: float = 100.0
     cluster_r_cut_arcsec: float = 20.0
     fractional_error_flux_min_mjy: float = 10.0
@@ -78,6 +84,10 @@ class RacsLow3Config:
             raise ValueError("flux_hist_bins must be at least 2.")
         if self.alpha_sigma <= 0:
             raise ValueError("alpha_sigma must be positive.")
+        if self.cluster_count_model not in {"geometric", "poisson"}:
+            raise ValueError(
+                "cluster_count_model must be either 'geometric' or 'poisson'."
+            )
         if self.cluster_r0_arcsec <= 0:
             raise ValueError("cluster_r0_arcsec must be positive.")
         if self.cluster_r_cut_arcsec < 0:
@@ -1166,6 +1176,7 @@ class RacsLow3:
         flux_min: Optional[float] = None,
         p_clus: float = 0.0,
         clus_stop_prob: float = 1.0,
+        lambda_clus: float = 0.0,
         observer_speed: float = 1.0,
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
@@ -1177,13 +1188,15 @@ class RacsLow3:
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         """Coordinate the CatSIM-like simulation pipeline for RACS-low3.
 
-        The clustering model is:
-        for each parent source, draw ``X ~ Bernoulli(p_clus)``. If ``X = 1``,
-        draw the number of added component sources from
+        The clustering count model is selected by
+        ``RacsLow3Config.cluster_count_model``. ``"geometric"`` draws
+        ``X ~ Bernoulli(p_clus)`` for each parent and, if ``X = 1``, draws
         ``K ~ Geometric(clus_stop_prob)`` on support ``1, 2, 3, ...``.
-        The parent source is retained, and the ``K`` added components are then
-        given clustered positions, independent fluxes, and independent spectral
-        indices before entering the ordinary downstream simulation pipeline.
+        ``"poisson"`` draws ``K ~ Poisson(lambda_clus)`` for every parent.
+        The parent source is retained in both models, and the ``K`` added
+        components are given clustered positions, independent fluxes, and
+        independent spectral indices before entering the ordinary downstream
+        simulation pipeline.
         """
         assert self.lookups_are_initialised, (
             "Lookup tables must be initialised before generating maps. "
@@ -1205,10 +1218,33 @@ class RacsLow3:
         n_samples = int(10 ** log10_n_initial_samples)
         if n_samples < 0:
             raise ValueError("n_initial_samples must be non-negative.")
-        if p_clus < 0 or p_clus > 1:
-            raise ValueError("p_clus must lie in [0, 1].")
-        if clus_stop_prob <= 0 or clus_stop_prob > 1:
-            raise ValueError("clus_stop_prob must lie in (0, 1].")
+        if self.cfg.cluster_count_model == "geometric":
+            if p_clus < 0 or p_clus > 1:
+                raise ValueError(
+                    "For cluster_count_model='geometric', p_clus must lie in [0, 1]."
+                )
+            if clus_stop_prob <= 0 or clus_stop_prob > 1:
+                raise ValueError(
+                    "For cluster_count_model='geometric', "
+                    "clus_stop_prob must lie in (0, 1]."
+                )
+            if lambda_clus != 0:
+                raise ValueError(
+                    "lambda_clus is only valid for cluster_count_model='poisson'."
+                )
+        elif self.cfg.cluster_count_model == "poisson":
+            if lambda_clus < 0:
+                raise ValueError(
+                    "For cluster_count_model='poisson', lambda_clus must be non-negative."
+                )
+            if p_clus != 0:
+                raise ValueError(
+                    "p_clus is only valid for cluster_count_model='geometric'."
+                )
+            if clus_stop_prob != 1.0:
+                raise ValueError(
+                    "clus_stop_prob is only valid for cluster_count_model='geometric'."
+                )
 
         active_flux_min = self.cfg.flux_min if flux_min is None else flux_min
         rng = rng_key._generator() if rng_key is not None else np.random.default_rng()
@@ -1239,14 +1275,23 @@ class RacsLow3:
             )
             alpha = self.sample_spectral_indices(current_chunk, rng=rng)
 
-            if p_clus > 0:
-                clustered_mask = rng.random(current_chunk) < p_clus
-                per_parent_n_components = np.zeros(current_chunk, dtype=np.int64)
-                n_clustered = int(np.count_nonzero(clustered_mask))
-                if n_clustered > 0:
-                    per_parent_n_components[clustered_mask] = rng.geometric(
-                        clus_stop_prob,
-                        size=n_clustered,
+            if (
+                (self.cfg.cluster_count_model == "geometric" and p_clus > 0)
+                or (self.cfg.cluster_count_model == "poisson" and lambda_clus > 0)
+            ):
+                if self.cfg.cluster_count_model == "geometric":
+                    clustered_mask = rng.random(current_chunk) < p_clus
+                    per_parent_n_components = np.zeros(current_chunk, dtype=np.int64)
+                    n_clustered = int(np.count_nonzero(clustered_mask))
+                    if n_clustered > 0:
+                        per_parent_n_components[clustered_mask] = rng.geometric(
+                            clus_stop_prob,
+                            size=n_clustered,
+                        ).astype(np.int64, copy=False)
+                else:
+                    per_parent_n_components = rng.poisson(
+                        lambda_clus,
+                        size=current_chunk,
                     ).astype(np.int64, copy=False)
                 total_n_components = int(per_parent_n_components.sum())
                 if total_n_components > 0:
