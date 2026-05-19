@@ -104,7 +104,7 @@ class RacsFluxErrorTests(unittest.TestCase):
             pixel_indices.shape[0],
             dtype=np.int32,
         )
-        sim.evaluate_temperature_enhancement = lambda tile_indices, temp_slope, temp_intercept, temp_pivot_c: (
+        sim.evaluate_temperature_enhancement = lambda tile_indices, temp_beta: (
             np.ones(tile_indices.shape[0], dtype=np.float64),
             np.full(tile_indices.shape[0], 30.0, dtype=np.float32),
         )
@@ -281,8 +281,7 @@ class RacsFluxErrorTests(unittest.TestCase):
         dmap, mask = sim.generate_dipole(
             log10_n_initial_samples=1.0,
             fractional_error_eta=3.0,
-            temp_slope=0.0,
-            temp_intercept=1.0,
+            temp_beta=0.0,
         )
 
         expected_effective = np.full(n_samples, 0.2, dtype=np.float32)
@@ -296,26 +295,48 @@ class RacsFluxErrorTests(unittest.TestCase):
         np.testing.assert_allclose(sampled_map[finite], np.full(np.count_nonzero(finite), 0.2))
         self.assertEqual(dmap.shape, mask.shape)
 
+    def test_evaluate_temperature_enhancement_uses_hot_paf_suppression(self):
+        self.sim.tile_temperature_by_index = np.array([24.0, 25.0, 30.0], dtype=np.float64)
+
+        enhancement, temperatures = self.sim.evaluate_temperature_enhancement(
+            tile_indices=np.array([0, 1, 2], dtype=np.int32),
+            temp_beta=0.02,
+        )
+
+        np.testing.assert_array_equal(
+            temperatures,
+            np.array([24.0, 25.0, 30.0], dtype=np.float32),
+        )
+        np.testing.assert_allclose(
+            enhancement,
+            np.asarray([1.0, 1.0, 0.9], dtype=self.sim.dtype),
+        )
+
     def test_evaluate_temperature_enhancement_clips_to_positive_floor(self):
         self.sim.tile_temperature_by_index = np.array([60.0], dtype=np.float64)
 
         enhancement, temperatures = self.sim.evaluate_temperature_enhancement(
             tile_indices=np.array([0], dtype=np.int32),
-            temp_slope=-1.0,
-            temp_intercept=0.1,
-            temp_pivot_c=30.0,
+            temp_beta=1.0,
         )
 
         self.assertEqual(temperatures[0], np.float32(60.0))
-        self.assertEqual(enhancement[0], np.asarray(LOW3_TEMPERATURE_EPSILON_FLOOR, dtype=self.sim.dtype))
+        self.assertEqual(
+            enhancement[0],
+            np.asarray(LOW3_TEMPERATURE_EPSILON_FLOOR, dtype=self.sim.dtype),
+        )
 
-    def test_evaluate_temperature_enhancement_rejects_non_positive_pivot(self):
-        with self.assertRaisesRegex(ValueError, "positive and finite"):
+    def test_evaluate_temperature_enhancement_rejects_invalid_temp_beta(self):
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
             self.sim.evaluate_temperature_enhancement(
                 tile_indices=np.array([0], dtype=np.int32),
-                temp_slope=0.0,
-                temp_intercept=1.0,
-                temp_pivot_c=0.0,
+                temp_beta=-0.1,
+            )
+
+        with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+            self.sim.evaluate_temperature_enhancement(
+                tile_indices=np.array([0], dtype=np.int32),
+                temp_beta=np.nan,
             )
 
     def test_generate_dipole_remains_finite_when_linear_enhancement_hits_floor(self):
@@ -333,9 +354,7 @@ class RacsFluxErrorTests(unittest.TestCase):
         dmap, mask = sim.generate_dipole(
             log10_n_initial_samples=np.log10(float(n_samples)),
             fractional_error_eta=0.0,
-            temp_slope=-1.0,
-            temp_intercept=0.1,
-            temp_pivot_c=30.0,
+            temp_beta=1.0,
         )
 
         self.assertEqual(dmap.shape, mask.shape)
@@ -694,6 +713,14 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 nside=64,
                 chunk_size=16,
                 cluster_count_model="unknown",
+            )
+
+        with self.assertRaisesRegex(ValueError, "paf_reference_temp_c must be finite"):
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                paf_reference_temp_c=np.nan,
             )
 
     def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):

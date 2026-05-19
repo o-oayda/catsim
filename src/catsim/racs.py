@@ -60,6 +60,7 @@ class RacsLow3Config:
     cluster_r_cut_arcsec: float = 20.0
     fractional_error_flux_min_mjy: float = 10.0
     paf_temperature_data_dir: Optional[str] = None
+    paf_reference_temp_c: float = 25.0
     paf_max_interpolation_gap_minutes: float = 20.0
 
     def __post_init__(self) -> None:
@@ -94,6 +95,8 @@ class RacsLow3Config:
             raise ValueError("cluster_r_cut_arcsec must be non-negative.")
         if self.fractional_error_flux_min_mjy <= 0:
             raise ValueError("fractional_error_flux_min_mjy must be positive.")
+        if not np.isfinite(self.paf_reference_temp_c):
+            raise ValueError("paf_reference_temp_c must be finite.")
         if self.paf_max_interpolation_gap_minutes <= 0:
             raise ValueError("paf_max_interpolation_gap_minutes must be positive.")
         if self.downscale_nside is not None:
@@ -1076,15 +1079,18 @@ class RacsLow3:
     def evaluate_temperature_enhancement(
         self,
         tile_indices: NDArray[np.int32],
-        temp_slope: float,
-        temp_intercept: float,
-        temp_pivot_c: float,
+        temp_beta: float,
     ) -> tuple[NDArray[np.floating], NDArray[np.float32]]:
-        """Evaluate ``epsilon(T) = a (T / T_0) + b`` at the tile level."""
-        if not np.isfinite(temp_pivot_c) or temp_pivot_c <= 0:
-            raise ValueError("temp_pivot_c must be positive and finite.")
+        """Evaluate hot-PAF flux suppression at the tile level.
 
-        enhancement = np.full(tile_indices.shape, temp_intercept, dtype=np.float64)
+        Temperatures at or below ``cfg.paf_reference_temp_c`` have no flux
+        correction. Hotter observations suppress flux linearly as
+        ``epsilon(T) = 1 - temp_beta * max(T - T_ref, 0)``.
+        """
+        if not np.isfinite(temp_beta) or temp_beta < 0:
+            raise ValueError("temp_beta must be finite and non-negative.")
+
+        enhancement = np.ones(tile_indices.shape, dtype=np.float64)
         temperatures = np.full(tile_indices.shape, np.nan, dtype=np.float32)
 
         if self.tile_temperature_by_index is None:
@@ -1097,11 +1103,11 @@ class RacsLow3:
             temperatures[valid] = tile_temperatures.astype(np.float32, copy=False)
             valid_temperature = np.isfinite(tile_temperatures)
             if np.any(valid_temperature):
-                enhancement_valid = (
-                    temp_slope
-                    * (tile_temperatures[valid_temperature] / temp_pivot_c)
-                    + temp_intercept
+                hot_temperature = np.maximum(
+                    tile_temperatures[valid_temperature] - self.cfg.paf_reference_temp_c,
+                    0.0,
                 )
+                enhancement_valid = 1.0 - temp_beta * hot_temperature
                 enhancement_valid = np.maximum(
                     enhancement_valid,
                     LOW3_TEMPERATURE_EPSILON_FLOOR,
@@ -1180,9 +1186,7 @@ class RacsLow3:
         observer_speed: float = 1.0,
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
-        temp_slope: float = 0.0,
-        temp_intercept: float = 1.0,
-        temp_pivot_c: float = 30.0,
+        temp_beta: float = 0.0,
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
@@ -1346,9 +1350,7 @@ class RacsLow3:
             tile_indices = self.sample_tiles_for_pixels(pixel_indices, rng=rng)
             enhancement, temperatures = self.evaluate_temperature_enhancement(
                 tile_indices=tile_indices,
-                temp_slope=temp_slope,
-                temp_intercept=temp_intercept,
-                temp_pivot_c=temp_pivot_c,
+                temp_beta=temp_beta,
             )
             systematics_flux = self.apply_temperature_enhancement(
                 dipole_flux,
