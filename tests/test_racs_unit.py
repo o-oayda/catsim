@@ -363,8 +363,9 @@ class RacsFluxErrorTests(unittest.TestCase):
 
     def test_generate_dipole_adds_cluster_components_on_top_of_parents(self):
         sim = self.sim
-        n_samples = 5
-        self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
+        n_expected_sources = 8.5
+        n_parent_samples = 5
+        self._configure_minimal_generate_dipole_sim(n_samples=n_parent_samples)
 
         flux_call_sizes: list[int] = []
 
@@ -386,7 +387,7 @@ class RacsFluxErrorTests(unittest.TestCase):
                 self._delegate = np.random.default_rng(123)
 
             def random(self, size=None):
-                if size == n_samples:
+                if size == n_parent_samples:
                     return np.array([0.1, 0.9, 0.2, 0.95, 0.8], dtype=np.float64)
                 return self._delegate.random(size=size)
 
@@ -403,19 +404,19 @@ class RacsFluxErrorTests(unittest.TestCase):
                 return _FixedClusterRng()
 
         sim.generate_dipole(
-            log10_n_initial_samples=np.log10(float(n_samples)),
+            log10_n_initial_samples=np.log10(float(n_expected_sources)),
             p_clus=0.5,
-            clus_stop_prob=0.4,
+            clus_stop_prob=1.0,
             rng_key=_FixedClusterKey(),
         )
 
-        self.assertEqual(flux_call_sizes, [n_samples, 3])
-        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples + 3)
+        self.assertEqual(flux_call_sizes, [n_parent_samples, 3])
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_parent_samples + 3)
         np.testing.assert_allclose(
-            sim.final_longitudes[:n_samples],
-            np.linspace(0.0, 90.0, n_samples, dtype=np.float32),
+            sim.final_longitudes[:n_parent_samples],
+            np.linspace(0.0, 90.0, n_parent_samples, dtype=np.float32),
         )
-        self.assertTrue(np.all(sim.final_longitudes[n_samples:] >= 0.01))
+        self.assertTrue(np.all(sim.final_longitudes[n_parent_samples:] >= 0.01))
 
     def test_generate_dipole_poisson_model_adds_cluster_components_on_top_of_parents(self):
         sim = RacsLow3(
@@ -426,8 +427,9 @@ class RacsFluxErrorTests(unittest.TestCase):
                 cluster_count_model="poisson",
             )
         )
-        n_samples = 5
-        self._configure_minimal_generate_dipole_sim(n_samples=n_samples, sim=sim)
+        n_expected_sources = 10
+        n_parent_samples = 5
+        self._configure_minimal_generate_dipole_sim(n_samples=n_parent_samples, sim=sim)
 
         flux_call_sizes: list[int] = []
 
@@ -449,7 +451,7 @@ class RacsFluxErrorTests(unittest.TestCase):
                 self._delegate = np.random.default_rng(123)
 
             def poisson(self, lam, size=None):
-                if size == n_samples and np.isscalar(lam):
+                if size == n_parent_samples and np.isscalar(lam):
                     return np.array([2, 0, 1, 0, 0], dtype=np.int64)
                 return self._delegate.poisson(lam, size=size)
 
@@ -461,23 +463,57 @@ class RacsFluxErrorTests(unittest.TestCase):
                 return _FixedPoissonRng()
 
         sim.generate_dipole(
-            log10_n_initial_samples=np.log10(float(n_samples)),
-            lambda_clus=1.2,
+            log10_n_initial_samples=np.log10(float(n_expected_sources)),
+            lambda_clus=1.0,
             rng_key=_FixedPoissonKey(),
         )
 
-        self.assertEqual(flux_call_sizes, [n_samples, 3])
-        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples + 3)
+        self.assertEqual(flux_call_sizes, [n_parent_samples, 3])
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_parent_samples + 3)
         np.testing.assert_allclose(
-            sim.final_longitudes[:n_samples],
-            np.linspace(0.0, 90.0, n_samples, dtype=np.float32),
+            sim.final_longitudes[:n_parent_samples],
+            np.linspace(0.0, 90.0, n_parent_samples, dtype=np.float32),
         )
-        self.assertTrue(np.all(sim.final_longitudes[n_samples:] >= 0.01))
+        self.assertTrue(np.all(sim.final_longitudes[n_parent_samples:] >= 0.01))
+
+    def test_generate_dipole_normalizes_parent_count_by_expected_cluster_multiplicity(self):
+        geometric_sim = self._configure_minimal_generate_dipole_sim(n_samples=8)
+        geometric_flux_call_sizes: list[int] = []
+        geometric_sim.sample_fluxes = lambda n, rng=None: (
+            geometric_flux_call_sizes.append(int(n)) or np.full(n, 100.0, dtype=np.float64)
+        )
+        geometric_sim.generate_dipole(
+            log10_n_initial_samples=np.log10(12.0),
+            p_clus=0.5,
+            clus_stop_prob=1.0,
+        )
+
+        poisson_sim = RacsLow3(
+            RacsLow3Config(
+                flux_min=15.0,
+                nside=64,
+                chunk_size=16,
+                cluster_count_model="poisson",
+            )
+        )
+        self._configure_minimal_generate_dipole_sim(n_samples=6, sim=poisson_sim)
+        poisson_flux_call_sizes: list[int] = []
+        poisson_sim.sample_fluxes = lambda n, rng=None: (
+            poisson_flux_call_sizes.append(int(n)) or np.full(n, 100.0, dtype=np.float64)
+        )
+        poisson_sim.generate_dipole(
+            log10_n_initial_samples=np.log10(12.0),
+            lambda_clus=1.0,
+        )
+
+        self.assertEqual(geometric_flux_call_sizes[0], 8)
+        self.assertEqual(poisson_flux_call_sizes[0], 6)
 
     def test_generate_dipole_with_unit_stop_probability_adds_one_component_per_clustered_parent(self):
         sim = self.sim
-        n_samples = 4
-        self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
+        n_expected_sources = 8
+        n_parent_samples = 4
+        self._configure_minimal_generate_dipole_sim(n_samples=n_parent_samples)
 
         sim.sample_clustered_points = lambda parent_ra, parent_dec, counts, rng=None, dtype=np.float64: (
             (np.repeat(np.asarray(parent_ra, dtype=np.float64), counts) + 0.01).astype(
@@ -492,7 +528,7 @@ class RacsFluxErrorTests(unittest.TestCase):
                 self._delegate = np.random.default_rng(123)
 
             def random(self, size=None):
-                if size == n_samples:
+                if size == n_parent_samples:
                     return np.array([0.2, 0.8, 0.1, 0.7], dtype=np.float64)
                 return self._delegate.random(size=size)
 
@@ -509,13 +545,13 @@ class RacsFluxErrorTests(unittest.TestCase):
                 return _UnitStopRng()
 
         sim.generate_dipole(
-            log10_n_initial_samples=np.log10(float(n_samples)),
+            log10_n_initial_samples=np.log10(float(n_expected_sources)),
             p_clus=0.5,
             clus_stop_prob=1.0,
             rng_key=_UnitStopKey(),
         )
 
-        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_samples + 2)
+        self.assertEqual(sim.final_intrinsic_flux_samples.shape[0], n_parent_samples + 2)
 
     def test_sample_clustered_points_enforces_minimum_offset(self):
         sim = RacsLow3(

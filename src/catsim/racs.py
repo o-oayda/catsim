@@ -1188,6 +1188,11 @@ class RacsLow3:
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         """Coordinate the CatSIM-like simulation pipeline for RACS-low3.
 
+        ``log10_n_initial_samples`` sets the expected total number of
+        pre-selection sources after clustering. The simulator derives the
+        parent-anchor count by dividing by the selected model's expected
+        multiplicity.
+
         The clustering count model is selected by
         ``RacsLow3Config.cluster_count_model``. ``"geometric"`` draws
         ``X ~ Bernoulli(p_clus)`` for each parent and, if ``X = 1``, draws
@@ -1215,8 +1220,8 @@ class RacsLow3:
             dipole_latitude=self.dipole_dec,
         )
 
-        n_samples = int(10 ** log10_n_initial_samples)
-        if n_samples < 0:
+        n_expected_sources = int(10 ** log10_n_initial_samples)
+        if n_expected_sources < 0:
             raise ValueError("n_initial_samples must be non-negative.")
         if self.cfg.cluster_count_model == "geometric":
             if p_clus < 0 or p_clus > 1:
@@ -1232,6 +1237,7 @@ class RacsLow3:
                 raise ValueError(
                     "lambda_clus is only valid for cluster_count_model='poisson'."
                 )
+            expected_multiplicity = 1.0 + p_clus / clus_stop_prob
         elif self.cfg.cluster_count_model == "poisson":
             if lambda_clus < 0:
                 raise ValueError(
@@ -1245,6 +1251,9 @@ class RacsLow3:
                 raise ValueError(
                     "clus_stop_prob is only valid for cluster_count_model='geometric'."
                 )
+            expected_multiplicity = 1.0 + lambda_clus
+
+        n_samples = int(n_expected_sources / expected_multiplicity)
 
         active_flux_min = self.cfg.flux_min if flux_min is None else flux_min
         rng = rng_key._generator() if rng_key is not None else np.random.default_rng()
