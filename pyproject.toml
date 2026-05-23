@@ -24,6 +24,11 @@ packages = [
   { "include" = "catsim", "from" = "src" }
 ]
 
+[project.optional-dependencies]
+jax = [
+    "jax[cuda13]>=0.10.1,<0.11.0",
+]
+
 [tool.poetry]
 
 [tool.poetry.group.dev.dependencies]
