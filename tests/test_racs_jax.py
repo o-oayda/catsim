@@ -192,6 +192,32 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(maps.dtype, np.float32)
         self.assertEqual(masks.dtype, np.bool_)
 
+    def test_batch_generate_dipole_accepts_dynamic_source_counts(self):
+        low_maps, low_masks = self.sim.batch_generate_dipole(
+            {"log10_n_initial_samples": np.full(2, 1.0)},
+            jax.random.PRNGKey(701),
+            batch_size=2,
+        )
+        high_maps, high_masks = self.sim.batch_generate_dipole(
+            {"log10_n_initial_samples": np.full(2, 2.0)},
+            jax.random.PRNGKey(702),
+            batch_size=2,
+        )
+
+        self.assertEqual(low_maps.shape, high_maps.shape)
+        self.assertEqual(low_masks.shape, high_masks.shape)
+        np.testing.assert_array_equal(low_masks, high_masks)
+
+    def test_batch_generate_dipole_pads_final_host_batch(self):
+        maps, masks = self.sim.batch_generate_dipole(
+            {"log10_n_initial_samples": np.full(3, 1.0)},
+            jax.random.PRNGKey(703),
+            batch_size=2,
+        )
+
+        self.assertEqual(maps.shape, (3, hp.nside2npix(64)))
+        self.assertEqual(masks.shape, (3, hp.nside2npix(64)))
+
     def test_geometric_clustering_path_runs(self):
         density_map, mask = self.sim.generate_dipole(
             np.log10(8.0),

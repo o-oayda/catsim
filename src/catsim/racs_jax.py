@@ -305,7 +305,7 @@ def _simulate_one_jax(
     *,
     cluster_model_code: int,
     nside: int,
-    n_chunks: int,
+    n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
     alpha_mean: float,
@@ -459,10 +459,16 @@ def _simulate_one_jax(
         return accumulator, None
 
     density = jnp.zeros((n_pix,), dtype=jnp.float32)
-    density, _ = jax.lax.scan(
-        chunk_body,
+
+    def fori_body(chunk_index: jax.Array, current_density: jax.Array) -> jax.Array:
+        current_density, _ = chunk_body(current_density, chunk_index)
+        return current_density
+
+    density = jax.lax.fori_loop(
+        jnp.asarray(0, dtype=jnp.int32),
+        n_chunks,
+        fori_body,
         density,
-        jnp.arange(n_chunks, dtype=jnp.int32),
     )
     return jnp.where(mask_map, density, jnp.nan), mask_map
 
@@ -472,7 +478,6 @@ def _simulate_one_jax(
     static_argnames=(
         "cluster_model_code",
         "nside",
-        "n_chunks",
         "chunk_size",
         "max_children",
         "alpha_mean",
@@ -498,7 +503,7 @@ def _simulate_batch_jax(
     *,
     cluster_model_code: int,
     nside: int,
-    n_chunks: int,
+    n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
     alpha_mean: float,
@@ -650,6 +655,7 @@ class RacsLow3Jax:
         theta: dict[str, np.ndarray | jax.Array],
         key: jax.Array,
         batch_size: int,
+        show_progress: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         if not self.lookups_are_initialised or self._lookup_arrays is None:
             raise RuntimeError("Run initialise_data() before generating maps.")
@@ -670,15 +676,40 @@ class RacsLow3Jax:
         maps: list[np.ndarray] = []
         masks: list[np.ndarray] = []
 
-        for start in range(0, n_sims, batch_size):
+        batch_starts = range(0, n_sims, batch_size)
+        if show_progress:
+            from tqdm import tqdm
+
+            batch_starts = tqdm(
+                batch_starts,
+                total=(n_sims + batch_size - 1) // batch_size,
+                unit="batch",
+                desc="simulating",
+            )
+
+        for start in batch_starts:
             stop = min(start + batch_size, n_sims)
             chunk = {name: values[start:stop] for name, values in parameters.items()}
             parent_counts = self._parent_counts(chunk)
             n_chunks = max(1, int(math.ceil(int(parent_counts.max(initial=0)) / self.chunk_size)))
             forward, inverse = self._rotation_matrices_for_parameters(chunk)
+            actual_batch_size = stop - start
+
+            if actual_batch_size < batch_size:
+                pad_count = batch_size - actual_batch_size
+                chunk = {
+                    name: np.pad(values, (0, pad_count), mode="edge")
+                    for name, values in chunk.items()
+                }
+                parent_counts = np.pad(parent_counts, (0, pad_count), mode="constant")
+                forward = np.pad(forward, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
+                inverse = np.pad(inverse, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
+                batch_keys = jax.random.split(jax.random.fold_in(key, start), batch_size)
+            else:
+                batch_keys = root_keys[start:stop]
 
             batch_maps, batch_masks = _simulate_batch_jax(
-                keys=jnp.asarray(root_keys[start:stop]),
+                keys=jnp.asarray(batch_keys),
                 parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
                 flux_mins=jnp.asarray(chunk["flux_min"], dtype=jnp.float32),
                 p_clus=jnp.asarray(chunk["p_clus"], dtype=jnp.float32),
@@ -695,7 +726,7 @@ class RacsLow3Jax:
                 lookup_tuple=self._lookup_arrays.as_tuple(),
                 cluster_model_code=self._cluster_model_code(),
                 nside=self.nside,
-                n_chunks=n_chunks,
+                n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                 chunk_size=self.chunk_size,
                 max_children=self.max_cluster_children_per_parent,
                 alpha_mean=float(self.cfg.alpha_mean),
@@ -704,8 +735,10 @@ class RacsLow3Jax:
                 cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                 paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
             )
-            maps.append(np.asarray(batch_maps, dtype=np.float32))
-            masks.append(np.asarray(batch_masks, dtype=np.bool_))
+            maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
+            masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
+            if show_progress:
+                batch_starts.set_postfix(completed=stop, total=n_sims)
 
         out_maps = np.concatenate(maps, axis=0)
         out_masks = np.concatenate(masks, axis=0)

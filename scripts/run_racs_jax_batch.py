@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the one-simulation compile/warmup call.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the progress bar for timed batch generation.",
+    )
     return parser.parse_args()
 
 
@@ -94,16 +99,26 @@ def main() -> None:
     key = jax.random.PRNGKey(args.seed)
 
     if not args.skip_warmup:
-        warmup_theta = {name: values[:1] for name, values in theta.items()}
+        warmup_count = min(args.batch_size, args.n_sims)
+        warmup_theta = {name: values[:warmup_count] for name, values in theta.items()}
         t0 = perf_counter()
         with warnings.catch_warnings():
             warnings.simplefilter("always", RuntimeWarning)
-            warmup = sim.batch_generate_dipole(warmup_theta, key, batch_size=1)
+            warmup = sim.batch_generate_dipole(
+                warmup_theta,
+                key,
+                batch_size=warmup_count,
+            )
         _block_until_ready(warmup)
         print(f"warmup/compile: {perf_counter() - t0:.3f} s")
 
     t0 = perf_counter()
-    maps, masks = sim.batch_generate_dipole(theta, key, batch_size=args.batch_size)
+    maps, masks = sim.batch_generate_dipole(
+        theta,
+        key,
+        batch_size=args.batch_size,
+        show_progress=not args.no_progress,
+    )
     _block_until_ready((maps, masks))
     elapsed = perf_counter() - t0
 
