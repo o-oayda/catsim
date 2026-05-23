@@ -56,6 +56,7 @@ class RacsLow3Config:
     alpha_mean: float = 0.8
     alpha_sigma: float = 0.2
     cluster_count_model: Literal['geometric', 'poisson'] = "geometric"
+    max_cluster_children_per_parent: int = 16
     cluster_r0_arcsec: float = 100.0
     cluster_r_cut_arcsec: float = 20.0
     fractional_error_flux_min_mjy: float = 10.0
@@ -89,6 +90,8 @@ class RacsLow3Config:
             raise ValueError(
                 "cluster_count_model must be either 'geometric' or 'poisson'."
             )
+        if self.max_cluster_children_per_parent < 0:
+            raise ValueError("max_cluster_children_per_parent must be non-negative.")
         if self.cluster_r0_arcsec <= 0:
             raise ValueError("cluster_r0_arcsec must be positive.")
         if self.cluster_r_cut_arcsec < 0:
