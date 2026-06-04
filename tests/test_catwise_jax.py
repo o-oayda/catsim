@@ -62,6 +62,137 @@ def _numpy_split_null_residual_rms(
     return out
 
 
+class _FakeAlphaLookup:
+    def fit_alpha(self, w12_colour, out=None):
+        colour = np.asarray(w12_colour, dtype=np.float32)
+        if out is None:
+            return np.full(colour.shape, 0.8, dtype=np.float32)
+        out[:] = 0.8
+        return out
+
+
+class _FakeHashGrid:
+    def sample(self, grid_coords, rng=None, batch_size=2_000_000, report_success=False):
+        first = next(iter(grid_coords.values()))
+        return np.full((np.asarray(first).shape[0], 2), 0.01, dtype=np.float32)
+
+
+def _configure_minimal_catwise_sim(chunk_size: int = 16) -> tuple[Catwise, list[int]]:
+    cfg = CatwiseConfig(
+        cat_w1_max=17.0,
+        cat_w12_min=0.5,
+        magnitude_error_dist="gaussian",
+        chunk_size=chunk_size,
+        store_final_samples=False,
+    )
+    sim = Catwise(cfg)
+    sim.lookups_are_initialised = True
+    n_pix = hp.nside2npix(sim.nside)
+    sim.mask_map = np.zeros(n_pix, dtype=np.float64)
+    sim.fill_value = np.nan
+    sim.log_w1cov_map = np.zeros(n_pix, dtype=np.float64)
+    sim.log_w2cov_map = np.zeros(n_pix, dtype=np.float64)
+    sim.spectral_lookup = _FakeAlphaLookup()
+    sim.hashgrid = _FakeHashGrid()
+
+    magnitude_call_sizes: list[int] = []
+
+    def _sample_magnitudes(n, dtype=np.float64, rng=None):
+        magnitude_call_sizes.append(int(n))
+        return (
+            np.full(n, 10.0, dtype=dtype),
+            np.full(n, 9.0, dtype=dtype),
+        )
+
+    sim.sample_magnitudes = _sample_magnitudes
+    sim.sample_points = lambda n, dtype=np.float64, **kwargs: (
+        np.linspace(0.0, 90.0, n, dtype=dtype),
+        np.zeros(n, dtype=dtype),
+    )
+    sim.aberrate_points = lambda lon, lat, dtype=np.float64: (
+        np.asarray(lon, dtype=dtype),
+        np.asarray(lat, dtype=dtype),
+        np.zeros(np.asarray(lon).shape, dtype=dtype),
+    )
+    sim.boost_magnitudes = lambda magnitudes, angle, spectral_index, dtype=np.float64: (
+        np.asarray(magnitudes, dtype=dtype)
+    )
+    sim._source_isin_mask = lambda lon, lat: (
+        np.ones(np.asarray(lon).shape[0], dtype=bool),
+        np.arange(np.asarray(lon).shape[0], dtype=np.int64) % n_pix,
+    )
+    sim.add_error = lambda w1, w2, **kwargs: (
+        np.asarray(w1[0]),
+        np.asarray(w2[0]),
+        np.asarray(w1[1]),
+        np.asarray(w2[1]),
+    )
+    return sim, magnitude_call_sizes
+
+
+class CatwisePoissonClusteringTests(unittest.TestCase):
+    def test_generate_dipole_rejects_invalid_lambda_clus(self):
+        sim, _ = _configure_minimal_catwise_sim()
+        with self.assertRaisesRegex(ValueError, "lambda_clus must be non-negative"):
+            sim.generate_dipole(np.log10(8.0), lambda_clus=-0.1)
+
+    def test_generate_dipole_rejects_lambda_clus_with_correlated_points(self):
+        cfg = CatwiseConfig(
+            cat_w1_max=17.0,
+            cat_w12_min=0.5,
+            magnitude_error_dist="gaussian",
+            generate_correlated_points=True,
+        )
+        sim = Catwise(cfg)
+        sim.lookups_are_initialised = True
+        with self.assertRaisesRegex(ValueError, "generate_correlated_points=True"):
+            sim.generate_dipole(np.log10(8.0), lambda_clus=0.5)
+
+    def test_generate_dipole_normalizes_parent_count_by_expected_multiplicity(self):
+        sim, magnitude_call_sizes = _configure_minimal_catwise_sim()
+        sim.generate_dipole(np.log10(12.0), lambda_clus=1.0)
+        self.assertEqual(magnitude_call_sizes[0], 6)
+
+    def test_generate_dipole_adds_poisson_children_on_top_of_parents(self):
+        sim, magnitude_call_sizes = _configure_minimal_catwise_sim()
+
+        sim.sample_clustered_points = lambda parent_lon, parent_lat, counts, rng=None, dtype=np.float64: (
+            (np.repeat(np.asarray(parent_lon, dtype=np.float64), counts) + 0.01).astype(
+                dtype,
+                copy=False,
+            ),
+            np.repeat(np.asarray(parent_lat, dtype=np.float64), counts).astype(
+                dtype,
+                copy=False,
+            ),
+        )
+
+        class _FixedClusterRng:
+            def __init__(self):
+                self._delegate = np.random.default_rng(123)
+
+            def poisson(self, lam, size=None):
+                if size == 5 and np.isscalar(lam):
+                    return np.array([2, 0, 1, 0, 0], dtype=np.int64)
+                return self._delegate.poisson(lam=lam, size=size)
+
+            def __getattr__(self, name):
+                return getattr(self._delegate, name)
+
+        class _FixedClusterKey:
+            def _generator(self):
+                return _FixedClusterRng()
+
+        density_map, _ = sim.generate_dipole(
+            np.log10(10.0),
+            lambda_clus=1.0,
+            rng_key=_FixedClusterKey(),
+        )
+
+        self.assertEqual(magnitude_call_sizes[:2], [5, 3])
+        self.assertEqual(float(np.nansum(density_map)), 8.0)
+
+
 class CatwiseJaxImportTests(unittest.TestCase):
     def test_base_import_does_not_eagerly_import_jax(self):
         env = os.environ.copy()
@@ -210,6 +341,83 @@ class CatwiseJaxTests(unittest.TestCase):
         self.assertEqual(density_map.shape, mask.shape)
         self.assertTrue(np.all(np.isfinite(density_map[mask])))
 
+    def test_poisson_clustering_path_runs(self):
+        density_map, mask = self.sim.generate_dipole(
+            np.log10(16.0),
+            observer_speed=0.0,
+            lambda_clus=0.5,
+            key=jax.random.PRNGKey(705),
+        )
+
+        self.assertEqual(density_map.shape, mask.shape)
+        self.assertTrue(np.all(np.isfinite(density_map[mask])))
+
+    def test_batch_generate_dipole_accepts_vector_lambda_clus(self):
+        maps, masks = self.sim.batch_generate_dipole(
+            {
+                "log10_n_initial_samples": np.full(2, 2.0, dtype=np.float32),
+                "lambda_clus": np.array([0.0, 0.5], dtype=np.float32),
+            },
+            jax.random.PRNGKey(706),
+            batch_size=2,
+        )
+
+        self.assertEqual(maps.shape, (2, hp.nside2npix(64)))
+        self.assertEqual(masks.shape, (2, hp.nside2npix(64)))
+
+    def test_zero_lambda_clus_uses_no_child_slots(self):
+        parameters = self.sim._normalise_theta(
+            {
+                "log10_n_initial_samples": np.full(2, 2.0),
+                "lambda_clus": np.zeros(2),
+            }
+        )
+        self.assertEqual(self.sim._active_max_children(parameters), 0)
+
+    def test_positive_lambda_clus_uses_configured_child_cap(self):
+        parameters = self.sim._normalise_theta(
+            {
+                "log10_n_initial_samples": np.full(2, 2.0),
+                "lambda_clus": np.array([0.0, 0.5]),
+            }
+        )
+        self.assertEqual(
+            self.sim._active_max_children(parameters),
+            self.sim.max_cluster_children_per_parent,
+        )
+
+    def test_negative_lambda_clus_raises_clear_error(self):
+        with self.assertRaisesRegex(ValueError, "lambda_clus must be non-negative"):
+            self.sim.generate_dipole(
+                np.log10(16.0),
+                lambda_clus=-0.1,
+                key=jax.random.PRNGKey(707),
+            )
+
+    def test_overfill_probability_warning_is_explicit(self):
+        from catsim import CatwiseJax
+
+        cfg = CatwiseConfig(
+            cat_w1_max=17.0,
+            cat_w12_min=0.5,
+            magnitude_error_dist="gaussian",
+            chunk_size=8,
+            store_final_samples=False,
+            max_cluster_children_per_parent=1,
+        )
+        sim = CatwiseJax(cfg)
+        sim.initialise_data()
+
+        with self.assertWarnsRegex(
+            RuntimeWarning,
+            r"P\(children_per_parent > 1\)",
+        ):
+            sim.generate_dipole(
+                np.log10(16.0),
+                lambda_clus=1.0,
+                key=jax.random.PRNGKey(708),
+            )
+
     def test_unsupported_options_raise_clear_errors(self):
         from catsim import CatwiseJax
 
@@ -270,6 +478,7 @@ class CatwiseJaxTests(unittest.TestCase):
             theta={
                 "log10_n_initial_samples": np.full(n_numpy, log10_n, dtype=np.float32),
                 "observer_speed": np.zeros(n_numpy, dtype=np.float32),
+                "lambda_clus": np.full(n_numpy, 0.5, dtype=np.float32),
             },
             model_callable=numpy_sim.generate_dipole,
             n_workers=1,
@@ -282,6 +491,7 @@ class CatwiseJaxTests(unittest.TestCase):
             theta={
                 "log10_n_initial_samples": np.full(n_jax, log10_n, dtype=np.float32),
                 "observer_speed": np.zeros(n_jax, dtype=np.float32),
+                "lambda_clus": np.full(n_jax, 0.5, dtype=np.float32),
             },
             key=jax.random.PRNGKey(30_000),
             batch_size=10,

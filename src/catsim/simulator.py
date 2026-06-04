@@ -155,6 +155,7 @@ class Catwise:
             log10_magnitude_error_shape_param: float = 0.,
             cluster_rate_param: Optional[float] = 10.,
             log10_cluster_scale_param: Optional[float] = 3.,
+            lambda_clus: float = 0.0,
             log10_w1conf_scale: Optional[float] = None,
             log10_w2conf_scale: Optional[float] = None,
             rng_key: Optional[NPKey] = None,
@@ -175,9 +176,16 @@ class Catwise:
             dipole_latitude=self.dipole_latitude
         )
 
-        self.n_samples = int(10 ** log10_n_initial_samples)
-        if self.n_samples < 0:
+        n_expected_sources = int(10 ** log10_n_initial_samples)
+        if n_expected_sources < 0:
             raise ValueError('n_initial_samples must be non-negative.')
+        if lambda_clus < 0:
+            raise ValueError('lambda_clus must be non-negative.')
+        if lambda_clus > 0 and self.generate_correlated_points:
+            raise ValueError(
+                'lambda_clus cannot be used when generate_correlated_points=True.'
+            )
+        self.n_samples = int(n_expected_sources / (1.0 + lambda_clus))
 
         chunk_size = self.chunk_size
         store_final_samples = self.store_final_samples
@@ -249,6 +257,38 @@ class Catwise:
                 rng=rng
             )
 
+            if lambda_clus > 0:
+                per_parent_n_components = rng.poisson(
+                    lambda_clus,
+                    size=current_chunk,
+                ).astype(np.int64, copy=False)
+                total_n_components = int(per_parent_n_components.sum())
+                if total_n_components > 0:
+                    child_lon_deg, child_lat_deg = self.sample_clustered_points(
+                        rest_source_lon_deg,
+                        rest_source_lat_deg,
+                        per_parent_n_components,
+                        rng=rng,
+                        dtype=self.dtype,
+                    )
+                    child_w1_samples, child_w2_samples = self.sample_magnitudes(
+                        total_n_components,
+                        dtype=self.dtype,
+                        rng=rng,
+                    )
+                    rest_w1_samples = np.concatenate(
+                        (rest_w1_samples, child_w1_samples)
+                    ).astype(self.dtype, copy=False)
+                    rest_w2_samples = np.concatenate(
+                        (rest_w2_samples, child_w2_samples)
+                    ).astype(self.dtype, copy=False)
+                    rest_source_lon_deg = np.concatenate(
+                        (rest_source_lon_deg, child_lon_deg)
+                    ).astype(self.dtype, copy=False)
+                    rest_source_lat_deg = np.concatenate(
+                        (rest_source_lat_deg, child_lat_deg)
+                    ).astype(self.dtype, copy=False)
+
             boosted_source_lon_deg, boosted_source_lat_deg, \
                 rest_source_to_dipole_angle_deg = self.aberrate_points(
                     rest_source_lon_deg, rest_source_lat_deg, dtype=self.dtype
@@ -272,10 +312,16 @@ class Catwise:
             if rest_w1_samples.size == 0:
                 continue
 
-            current_colour = colour_buffer[:rest_w1_samples.size]
+            if rest_w1_samples.size <= colour_buffer.size:
+                current_colour = colour_buffer[:rest_w1_samples.size]
+            else:
+                current_colour = np.empty(rest_w1_samples.size, dtype=self.dtype)
             np.subtract(rest_w1_samples, rest_w2_samples, out=current_colour)
 
-            spectral_indices = spectral_buffer[:current_colour.size]
+            if current_colour.size <= spectral_buffer.size:
+                spectral_indices = spectral_buffer[:current_colour.size]
+            else:
+                spectral_indices = np.empty(current_colour.size, dtype=np.float32)
             self.spectral_lookup.fit_alpha(
                 w12_colour=current_colour,
                 out=spectral_indices
@@ -336,10 +382,16 @@ class Catwise:
                 confusion_scale=(w1conf_scale, w2conf_scale)
             )
 
-            current_noise_buffers = (
-                noise_buffer_w1[:boosted_w1_samples.size],
-                noise_buffer_w2[:boosted_w2_samples.size]
-            )
+            if boosted_w1_samples.size <= noise_buffer_w1.size:
+                current_noise_buffers = (
+                    noise_buffer_w1[:boosted_w1_samples.size],
+                    noise_buffer_w2[:boosted_w2_samples.size]
+                )
+            else:
+                current_noise_buffers = (
+                    np.empty(boosted_w1_samples.size, dtype=np.float64),
+                    np.empty(boosted_w2_samples.size, dtype=np.float64)
+                )
 
             boosted_w1_samples, boosted_w2_samples, w1e, w2e = self.add_error(
                 w1=(boosted_w1_samples, total_w1_error),
@@ -1437,6 +1489,60 @@ class Catwise:
         '''
         w1_samples, w2_samples = self.colour_mag_sampler.sample(n_samples, rng=rng)
         return w1_samples.astype(dtype), w2_samples.astype(dtype)
+
+    def sample_clustered_points(
+            self,
+            parent_lon_deg: NDArray[np.floating],
+            parent_lat_deg: NDArray[np.floating],
+            per_parent_n_components: NDArray[np.integer],
+            rng: Optional[np.random.Generator] = None,
+            dtype: type = np.float64,
+    ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+        """Sample clustered component positions around parent sources."""
+        if rng is None:
+            rng = np.random.default_rng()
+
+        counts = np.asarray(per_parent_n_components, dtype=np.int64)
+        total_n_components = int(counts.sum())
+        if total_n_components == 0:
+            empty = np.empty(0, dtype=dtype)
+            return empty, empty
+
+        parent_indices = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+        parent_lon_rad = np.deg2rad(
+            np.asarray(parent_lon_deg, dtype=np.float64)[parent_indices]
+        )
+        parent_lat_rad = np.deg2rad(
+            np.asarray(parent_lat_deg, dtype=np.float64)[parent_indices]
+        )
+
+        phi = rng.uniform(0.0, 2.0 * np.pi, size=total_n_components)
+        radial_arcsec = self.cfg.cluster_r_cut_arcsec + rng.exponential(
+            scale=self.cfg.cluster_r0_arcsec,
+            size=total_n_components,
+        )
+        angular_distance_rad = np.deg2rad(radial_arcsec / 3600.0)
+
+        sin_parent_lat = np.sin(parent_lat_rad)
+        cos_parent_lat = np.cos(parent_lat_rad)
+        sin_distance = np.sin(angular_distance_rad)
+        cos_distance = np.cos(angular_distance_rad)
+
+        child_lat_rad = np.arcsin(
+            sin_parent_lat * cos_distance
+            + cos_parent_lat * sin_distance * np.cos(phi)
+        )
+        child_lon_rad = parent_lon_rad + np.arctan2(
+            np.sin(phi) * sin_distance * cos_parent_lat,
+            cos_distance - sin_parent_lat * np.sin(child_lat_rad),
+        )
+
+        child_lon_deg = np.mod(np.rad2deg(child_lon_rad), 360.0)
+        child_lat_deg = np.rad2deg(child_lat_rad)
+        return (
+            child_lon_deg.astype(dtype, copy=False),
+            child_lat_deg.astype(dtype, copy=False),
+        )
     
     def sample_points(
             self,

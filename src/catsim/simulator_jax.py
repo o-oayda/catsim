@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from functools import partial
 import math
 from typing import Optional
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.stats import poisson
 
 try:
     import jax
@@ -20,7 +22,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised via package i
     raise
 
 from .configs import CatwiseConfig
-from .racs_jax import _aberrate_points_jax, jax_ang2pix_nest_lonlat
+from .racs_jax import (
+    _aberrate_points_jax,
+    _sample_clustered_positions_jax,
+    jax_ang2pix_nest_lonlat,
+)
 from .simulator import Catwise
 from .utils.constants import CMB_B, CMB_BETA, CMB_L
 from .utils.healsphere import downgrade_ignore_nan
@@ -29,6 +35,7 @@ from .utils.physics import rotation_matrices_for_dipole
 
 _GAUSSIAN_ERROR = 0
 _STUDENTS_T_ERROR = 1
+_OVERFILL_WARNING_THRESHOLD = 0.01
 
 
 @dataclass(frozen=True)
@@ -216,7 +223,8 @@ def _add_magnitude_error_jax(
 
 def _simulate_one_catwise_jax(
     key: jax.Array,
-    source_count: jax.Array,
+    parent_count: jax.Array,
+    lambda_clus: jax.Array,
     w1_max: jax.Array,
     w1_min: jax.Array,
     w12_min: jax.Array,
@@ -232,6 +240,9 @@ def _simulate_one_catwise_jax(
     nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
+    max_children: int,
+    cluster_r0_arcsec: float,
+    cluster_r_cut_arcsec: float,
 ) -> tuple[jax.Array, jax.Array]:
     (
         mag_x_flat,
@@ -253,38 +264,76 @@ def _simulate_one_catwise_jax(
     ) = lookup_tuple
 
     n_pix = mask_map.shape[0]
+    source_slots = 1 + max_children
+    child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
 
     def chunk_body(chunk_index: jax.Array, current_density: jax.Array) -> jax.Array:
         chunk_key = jax.random.fold_in(key, chunk_index)
         (
             key_position,
+            key_child_counts,
+            key_child_position,
             key_magnitude,
             key_hashgrid,
             key_formal_jitter,
             key_noise,
-        ) = jax.random.split(chunk_key, 5)
+        ) = jax.random.split(chunk_key, 7)
 
         source_indices = chunk_index * chunk_size + jnp.arange(chunk_size, dtype=jnp.int32)
-        source_valid = source_indices < source_count
+        parent_valid = source_indices < parent_count
 
         key_lon, key_lat = jax.random.split(key_position)
-        lon = 360.0 * jax.random.uniform(key_lon, (chunk_size,), dtype=jnp.float32)
-        lat = jnp.rad2deg(
+        parent_lon = 360.0 * jax.random.uniform(key_lon, (chunk_size,), dtype=jnp.float32)
+        parent_lat = jnp.rad2deg(
             jnp.arcsin(
                 2.0 * jax.random.uniform(key_lat, (chunk_size,), dtype=jnp.float32)
                 - 1.0
             )
         )
 
+        if max_children == 0:
+            child_lon = jnp.empty((chunk_size, 0), dtype=jnp.float32)
+            child_lat = jnp.empty((chunk_size, 0), dtype=jnp.float32)
+            child_valid = jnp.empty((chunk_size, 0), dtype=jnp.bool_)
+        else:
+            child_counts = jax.random.poisson(
+                key_child_counts,
+                lam=lambda_clus,
+                shape=(chunk_size,),
+            ).astype(jnp.int32)
+            child_counts = jnp.where(parent_valid, child_counts, 0)
+            child_counts = jnp.minimum(child_counts, jnp.int32(max_children))
+            child_valid = (
+                (child_ordinals[None, :] < child_counts[:, None])
+                & parent_valid[:, None]
+            )
+            child_lon, child_lat = _sample_clustered_positions_jax(
+                key_child_position,
+                parent_lon,
+                parent_lat,
+                max_children=max_children,
+                cluster_r0_arcsec=cluster_r0_arcsec,
+                cluster_r_cut_arcsec=cluster_r_cut_arcsec,
+            )
+
+        lon = jnp.concatenate((parent_lon[:, None], child_lon), axis=1).reshape(-1)
+        lat = jnp.concatenate((parent_lat[:, None], child_lat), axis=1).reshape(-1)
+        source_valid = jnp.concatenate(
+            (parent_valid[:, None], child_valid),
+            axis=1,
+        ).reshape(-1)
+
         rest_w1, rest_w2 = _sample_magnitudes_jax(
             key_magnitude,
-            (chunk_size,),
+            (chunk_size, source_slots),
             mag_x_flat,
             mag_y_flat,
             mag_x_widths_flat,
             mag_y_widths_flat,
             mag_cdf,
         )
+        rest_w1 = rest_w1.reshape(-1)
+        rest_w2 = rest_w2.reshape(-1)
 
         boosted_lon, boosted_lat, angle_to_dipole = _aberrate_points_jax(
             lon,
@@ -330,12 +379,12 @@ def _simulate_one_catwise_jax(
         jitter_w1, jitter_w2 = jax.random.split(key_formal_jitter)
         formal_w1_error = formal_errors[:, 0] + 0.001 * jax.random.normal(
             jitter_w1,
-            (chunk_size,),
+            pixel_indices.shape,
             dtype=jnp.float32,
         )
         formal_w2_error = formal_errors[:, 1] + 0.001 * jax.random.normal(
             jitter_w2,
-            (chunk_size,),
+            pixel_indices.shape,
             dtype=jnp.float32,
         )
         total_w1_error, total_w2_error = _total_errors_jax(
@@ -380,11 +429,15 @@ def _simulate_one_catwise_jax(
         "error_model_code",
         "nside",
         "chunk_size",
+        "max_children",
+        "cluster_r0_arcsec",
+        "cluster_r_cut_arcsec",
     ),
 )
 def _simulate_catwise_batch_jax(
     keys: jax.Array,
-    source_counts: jax.Array,
+    parent_counts: jax.Array,
+    lambda_clus: jax.Array,
     w1_max: jax.Array,
     w1_min: jax.Array,
     w12_min: jax.Array,
@@ -400,6 +453,9 @@ def _simulate_catwise_batch_jax(
     nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
+    max_children: int,
+    cluster_r0_arcsec: float,
+    cluster_r_cut_arcsec: float,
 ) -> tuple[jax.Array, jax.Array]:
     return jax.vmap(
         partial(
@@ -409,10 +465,14 @@ def _simulate_catwise_batch_jax(
             nside=nside,
             n_chunks=n_chunks,
             chunk_size=chunk_size,
+            max_children=max_children,
+            cluster_r0_arcsec=cluster_r0_arcsec,
+            cluster_r_cut_arcsec=cluster_r_cut_arcsec,
         )
     )(
         keys,
-        source_counts,
+        parent_counts,
+        lambda_clus,
         w1_max,
         w1_min,
         w12_min,
@@ -433,6 +493,7 @@ class CatwiseJax:
         self.nside = 64
         self.chunk_size = config.chunk_size
         self.downscale_nside = config.downscale_nside
+        self.max_cluster_children_per_parent = config.max_cluster_children_per_parent
         self.lookups_are_initialised = False
         self._lookup_arrays: Optional[_CatwiseLookupArrays] = None
         self.mask_map: Optional[NDArray[np.bool_]] = None
@@ -504,6 +565,7 @@ class CatwiseJax:
         log10_magnitude_error_shape_param: float = 0.0,
         cluster_rate_param: Optional[float] = 10.0,
         log10_cluster_scale_param: Optional[float] = 3.0,
+        lambda_clus: float = 0.0,
         log10_w1conf_scale: Optional[float] = None,
         log10_w2conf_scale: Optional[float] = None,
         key: Optional[jax.Array] = None,
@@ -530,6 +592,7 @@ class CatwiseJax:
             "log10_cluster_scale_param": np.asarray(
                 [np.nan if log10_cluster_scale_param is None else log10_cluster_scale_param]
             ),
+            "lambda_clus": np.asarray([lambda_clus]),
             "log10_w1conf_scale": np.asarray(
                 [np.nan if log10_w1conf_scale is None else log10_w1conf_scale]
             ),
@@ -555,6 +618,7 @@ class CatwiseJax:
 
         parameters = self._normalise_theta(theta)
         self._validate_parameters(parameters)
+        self._warn_if_cluster_cap_overfills(parameters)
 
         n_sims = parameters["log10_n_initial_samples"].shape[0]
         root_keys = jax.random.split(key, n_sims)
@@ -575,8 +639,9 @@ class CatwiseJax:
         for start in batch_starts:
             stop = min(start + batch_size, n_sims)
             chunk = {name: values[start:stop] for name, values in parameters.items()}
-            source_counts = self._source_counts(chunk)
-            n_chunks = max(1, int(math.ceil(int(source_counts.max(initial=0)) / self.chunk_size)))
+            parent_counts = self._parent_counts(chunk)
+            n_chunks = max(1, int(math.ceil(int(parent_counts.max(initial=0)) / self.chunk_size)))
+            active_max_children = self._active_max_children(chunk)
             forward, inverse = self._rotation_matrices_for_parameters(chunk)
             actual_batch_size = stop - start
 
@@ -586,7 +651,7 @@ class CatwiseJax:
                     name: np.pad(values, (0, pad_count), mode="edge")
                     for name, values in chunk.items()
                 }
-                source_counts = np.pad(source_counts, (0, pad_count), mode="constant")
+                parent_counts = np.pad(parent_counts, (0, pad_count), mode="constant")
                 forward = np.pad(forward, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
                 inverse = np.pad(inverse, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
                 batch_keys = jax.random.split(jax.random.fold_in(key, start), batch_size)
@@ -595,7 +660,8 @@ class CatwiseJax:
 
             batch_maps, batch_masks = _simulate_catwise_batch_jax(
                 keys=jnp.asarray(batch_keys),
-                source_counts=jnp.asarray(source_counts, dtype=jnp.int32),
+                parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
+                lambda_clus=jnp.asarray(chunk["lambda_clus"], dtype=jnp.float32),
                 w1_max=jnp.asarray(chunk["w1_max"], dtype=jnp.float32),
                 w1_min=jnp.asarray(chunk["w1_min"], dtype=jnp.float32),
                 w12_min=jnp.asarray(chunk["w12_min"], dtype=jnp.float32),
@@ -616,6 +682,9 @@ class CatwiseJax:
                 nside=self.nside,
                 n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                 chunk_size=self.chunk_size,
+                max_children=active_max_children,
+                cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
+                cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
             )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
@@ -690,6 +759,7 @@ class CatwiseJax:
             "log10_magnitude_error_shape_param": 0.0,
             "cluster_rate_param": 10.0,
             "log10_cluster_scale_param": 3.0,
+            "lambda_clus": 0.0,
             "log10_w1conf_scale": np.nan,
             "log10_w2conf_scale": np.nan,
         }
@@ -734,16 +804,44 @@ class CatwiseJax:
             values = parameters["log10_magnitude_error_shape_param"]
             if np.any(~np.isfinite(values)):
                 raise ValueError("log10_magnitude_error_shape_param must be finite.")
+        if np.any(parameters["lambda_clus"] < 0):
+            raise ValueError("lambda_clus must be non-negative.")
 
-    def _source_counts(self, parameters: dict[str, NDArray[np.float64]]) -> NDArray[np.int32]:
-        source_counts = np.power(
+    def _warn_if_cluster_cap_overfills(
+        self,
+        parameters: dict[str, NDArray[np.float64]],
+    ) -> None:
+        cap = self.max_cluster_children_per_parent
+        active = parameters["lambda_clus"] > 0
+        if not np.any(active):
+            return
+        probabilities = poisson.sf(cap, parameters["lambda_clus"])
+        max_probability = float(np.max(probabilities[active]))
+        if max_probability > _OVERFILL_WARNING_THRESHOLD:
+            warnings.warn(
+                "CatwiseJax clustering parameters have "
+                f"P(children_per_parent > {cap}) = {max_probability:.3g}; "
+                "excess children will be truncated.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _active_max_children(self, parameters: dict[str, NDArray[np.float64]]) -> int:
+        if np.any(parameters["lambda_clus"] > 0):
+            return self.max_cluster_children_per_parent
+        return 0
+
+    def _parent_counts(self, parameters: dict[str, NDArray[np.float64]]) -> NDArray[np.int32]:
+        expected_counts = np.power(
             10.0,
             parameters["log10_n_initial_samples"],
         ).astype(np.int64)
-        source_counts = np.maximum(source_counts, 0)
-        if np.any(source_counts > np.iinfo(np.int32).max):
-            raise ValueError("source count exceeds int32 range.")
-        return source_counts.astype(np.int32, copy=False)
+        expected_multiplicity = 1.0 + parameters["lambda_clus"]
+        parent_counts = (expected_counts / expected_multiplicity).astype(np.int64)
+        parent_counts = np.maximum(parent_counts, 0)
+        if np.any(parent_counts > np.iinfo(np.int32).max):
+            raise ValueError("parent source count exceeds int32 range.")
+        return parent_counts.astype(np.int32, copy=False)
 
     def _rotation_matrices_for_parameters(
         self,
