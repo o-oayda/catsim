@@ -7,6 +7,17 @@ from .utils.rng import prng_key
 
 
 def __getattr__(name: str):
+    if name == "CatwiseJax":
+        try:
+            from .simulator_jax import CatwiseJax
+        except ModuleNotFoundError as exc:
+            if exc.name and (exc.name == "jax" or exc.name.startswith("jax.")):
+                raise ImportError(
+                    "CatwiseJax requires the optional JAX dependencies. "
+                    "Install them with `pip install 'catsim[jax]'`."
+                ) from exc
+            raise
+        return CatwiseJax
     if name == "RacsLow3Jax":
         try:
             from .racs_jax import RacsLow3Jax
@@ -23,6 +34,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "Catwise",
+    "CatwiseJax",
     "CatwiseConfig",
     "RacsLow3",
     "RacsLow3Jax",
