@@ -23,7 +23,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised via package i
         ) from exc
     raise
 
-from .racs import LOW3_TEMPERATURE_EPSILON_FLOOR, RacsLow3, RacsLow3Config
+from .racs import RACS_TEMPERATURE_EPSILON_FLOOR, RACS_LOW3, Racs, RacsConfig
 from .utils.constants import CMB_B, CMB_BETA, CMB_L
 from .utils.healsphere import downgrade_ignore_nan
 from .utils.physics import rotation_matrices_for_dipole
@@ -420,7 +420,7 @@ def _simulate_one_jax(
         valid_temperature = (sampled_tile >= 0) & jnp.isfinite(temperatures)
         hot_temperature = jnp.maximum(temperatures - paf_reference_temp_c, 0.0)
         enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
-        enhancement = jnp.maximum(enhancement, LOW3_TEMPERATURE_EPSILON_FLOOR)
+        enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         systematics_flux = dipole_flux * enhancement
 
         error_count = error_counts[pixel_indices]
@@ -542,10 +542,10 @@ def _simulate_batch_jax(
     )
 
 
-class RacsLow3Jax:
-    """Fixed-shape JAX implementation of the RACS-low3 map simulator."""
+class RacsJax:
+    """Fixed-shape JAX implementation of the RACS map simulator."""
 
-    def __init__(self, config: RacsLow3Config):
+    def __init__(self, config: RacsConfig):
         self.cfg = config
         self.nside = config.nside
         self.chunk_size = config.chunk_size
@@ -556,7 +556,7 @@ class RacsLow3Jax:
         self.mask_map: Optional[NDArray[np.bool_]] = None
 
     def initialise_data(self) -> None:
-        reference = RacsLow3(self.cfg)
+        reference = Racs(self.cfg)
         reference.initialise_data()
 
         self.mask_map = reference.mask_map.astype(np.bool_, copy=False)
@@ -661,8 +661,8 @@ class RacsLow3Jax:
             raise RuntimeError("Run initialise_data() before generating maps.")
         if self.cfg.store_final_samples:
             raise NotImplementedError(
-                "RacsLow3Jax does not support store_final_samples=True. "
-                "Use RacsLow3Config(..., store_final_samples=False)."
+                "RacsJax does not support store_final_samples=True. "
+                "Use RacsConfig(..., store_final_samples=False)."
             )
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -867,7 +867,7 @@ class RacsLow3Jax:
         max_probability = float(np.max(probabilities[active]))
         if max_probability > _OVERFILL_WARNING_THRESHOLD:
             warnings.warn(
-                "RacsLow3Jax clustering parameters have "
+                "RacsJax clustering parameters have "
                 f"P(children_per_parent > {cap}) = {max_probability:.3g} "
                 f"for the {model_name} model; excess children will be truncated.",
                 RuntimeWarning,
@@ -919,3 +919,12 @@ class RacsLow3Jax:
         )
         equatorial = coord.icrs
         return float(equatorial.ra.deg), float(equatorial.dec.deg)
+
+
+class RacsLow3Jax(RacsJax):
+    """Backwards-compatible LOW3 JAX simulator wrapper."""
+
+    def __init__(self, config: RacsConfig):
+        if config.product != RACS_LOW3:
+            raise ValueError("RacsLow3Jax requires a LOW3 RACS product configuration.")
+        super().__init__(config)

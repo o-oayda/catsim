@@ -13,6 +13,7 @@ config = RacsLow3Config(
     flux_min=15.0,
     chunk_size=100_000,
     store_final_samples=True,
+    paf_reference_temp_c=27.1,
 )
 sim = RacsLow3(config)
 
@@ -20,16 +21,12 @@ init_t0 = time()
 sim.initialise_data()
 init_t1 = time()
 t0 = time()
-A = -0.159
-B = -A + 1
 dmap, mask = sim.generate_dipole(
     log10_n_initial_samples=6.664,
     observer_speed=2.72,
     dipole_longitude=308,
     dipole_latitude=-1,
-    temp_slope=A,
-    temp_intercept=B,
-    temp_pivot_c=27.1,
+    temp_beta=0.015,
     # fractional_error_eta=40.
 )
 t1 = time()

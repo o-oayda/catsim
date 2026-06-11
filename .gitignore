@@ -224,5 +224,6 @@ src/catsim/data/catwise_w120p5_confdata.fits
 src/catsim/data/catwise_agns_*
 src/catsim/data/0p5_17p0/mag_coverage/archive/*
 src/catsim/data/racs_low3/lookups/*
+src/catsim/data/racs_mid1/lookups/*
 
 .codex

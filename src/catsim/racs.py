@@ -23,13 +23,15 @@ from .utils.physics import (
 )
 from .utils.rng import NPKey
 from .utils.weather import get_mean_paf_temperatures_for_observations
+from .racs_products import RACS_LOW3, RacsProductSpec, resolve_racs_product
 
 LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
+RACS_TEMPERATURE_EPSILON_FLOOR = LOW3_TEMPERATURE_EPSILON_FLOOR
 
 
 @dataclass
-class RacsLow3Config:
-    """Configuration for the RACS-low3 simulator.
+class RacsConfig:
+    """Configuration for the RACS simulator.
 
     ``cluster_count_model`` selects how many component sources each parent can
     add. ``"geometric"`` uses Bernoulli source selection plus geometric
@@ -45,6 +47,7 @@ class RacsLow3Config:
     masked pixels.
     """
     flux_min: float
+    product: RacsProductSpec | str = RACS_LOW3
     nside: int = 64
     chunk_size: int = 50_000
     use_float32: bool = False
@@ -65,11 +68,17 @@ class RacsLow3Config:
     paf_max_interpolation_gap_minutes: float = 20.0
 
     def __post_init__(self) -> None:
+        self.product = resolve_racs_product(self.product)
         if self.flux_min <= 0:
             raise ValueError("flux_min must be positive.")
-        if self.mask_map is None and self.nside != 64:
+        if (
+            self.mask_map is None
+            and self.product.default_mask_filename is not None
+            and self.nside != 64
+        ):
             raise ValueError(
-                "RacsLow3 currently requires nside=64 when using the packaged mask."
+                f"{self.product.label} currently requires nside=64 when using "
+                "the packaged mask."
             )
         if self.mask_map is not None:
             if self.mask_map.ndim != 1:
@@ -112,11 +121,15 @@ class RacsLow3Config:
                 )
 
 
-class RacsLow3:
-    """Skeleton RACS-low3 simulator following the Catwise initialise/simulate split."""
+RacsLow3Config = RacsConfig
 
-    def __init__(self, config: RacsLow3Config):
+
+class Racs:
+    """RACS simulator following the Catwise initialise/simulate split."""
+
+    def __init__(self, config: RacsConfig):
         self.cfg = config
+        self.product = config.product
         self.nside = config.nside
         self.dtype = np.float32 if config.use_float32 else np.float64
         self.chunk_size = config.chunk_size
@@ -158,7 +171,7 @@ class RacsLow3:
         self.final_temperature_samples: Optional[NDArray[np.float32]] = None
 
     def _cache_dir(self) -> Path:
-        return Path(__file__).resolve().parent / "data" / "racs_low3" / "lookups"
+        return Path(__file__).resolve().parent / "data" / self.product.data_dir_name / "lookups"
 
     def _sbid_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"sbid_lookup_nside{self.nside}.npz"
@@ -205,24 +218,28 @@ class RacsLow3:
         plt.close(fig)
 
     def _mask_map_path(self) -> Path:
+        if self.product.default_mask_filename is None:
+            raise FileNotFoundError(
+                f"No packaged mask is configured for {self.product.label}."
+            )
         return (
             Path(__file__).resolve().parent
             / "data"
-            / "racs_low3"
-            / "racs-low3_mask_nside64_ring.npy"
+            / self.product.data_dir_name
+            / self.product.default_mask_filename
         )
 
     def load_catalogue(self) -> None:
-        """Load the real RACS-low3 catalogue from a configured path or dipole-utils."""
+        """Load the real RACS catalogue from a configured path or dipole-utils."""
         if self.cfg.catalogue_path is not None:
             catalogue_path = Path(self.cfg.catalogue_path).expanduser()
             if not catalogue_path.exists():
                 raise FileNotFoundError(
-                    f"RacsLow3Config.catalogue_path points to missing file: {catalogue_path}"
+                    f"RacsConfig.catalogue_path points to missing file: {catalogue_path}"
                 )
             self.catalogue = Table.read(catalogue_path, unit_parse_strict="silent")
         else:
-            self.catalogue = DataLoader("racs", "low3").load()
+            self.catalogue = DataLoader(*self.product.data_loader_args).load()
 
         self.catalogue_is_loaded = True
 
@@ -257,10 +274,12 @@ class RacsLow3:
         """Build the empirical 1D log-flux sampler used by ``sample_fluxes``."""
         assert self.catalogue_is_loaded, "Load the catalogue before building flux lookups."
 
-        flux = np.asarray(self.catalogue["Total_flux"], dtype=np.float64)
+        flux = np.asarray(self.catalogue[self.product.columns.total_flux], dtype=np.float64)
         flux = flux[np.isfinite(flux) & (flux > 0)]
         if flux.size == 0:
-            raise ValueError("No positive finite Total_flux values available.")
+            raise ValueError(
+                f"No positive finite {self.product.columns.total_flux} values available."
+            )
 
         log_flux = np.log10(flux)
         counts, edges = np.histogram(log_flux, bins=self.cfg.flux_hist_bins)
@@ -315,9 +334,9 @@ class RacsLow3:
         """Build per-pixel dominant-SBID and SBID-mixture lookup products."""
         assert self.catalogue_is_loaded, "Load the catalogue before building tile lookups."
 
-        ra = np.asarray(self.catalogue["RA"], dtype=np.float64)
-        dec = np.asarray(self.catalogue["Dec"], dtype=np.float64)
-        sbid = np.asarray(self.catalogue["SBID"], dtype=np.int64)
+        ra = np.asarray(self.catalogue[self.product.columns.ra], dtype=np.float64)
+        dec = np.asarray(self.catalogue[self.product.columns.dec], dtype=np.float64)
+        sbid = np.asarray(self.catalogue[self.product.columns.tile_id], dtype=np.int64)
 
         pixel_indices = hp.ang2pix(self.nside, ra, dec, lonlat=True, nest=True)
         n_pix = hp.nside2npix(self.nside)
@@ -389,7 +408,7 @@ class RacsLow3:
         self._save_lookup_map_png(
             tile_lookup_map,
             cache_path.with_suffix(".png"),
-            title=f"RACS LOW3 Dominant SBID Lookup (nside={self.nside})",
+            title=f"{self.product.label} Dominant SBID Lookup (nside={self.nside})",
             unit="SBID",
             cmap="viridis",
         )
@@ -450,28 +469,37 @@ class RacsLow3:
         return True
 
     def load_mask_map(self) -> None:
-        """Load a custom mask if configured, otherwise use the packaged RACS-low3 mask."""
+        """Load a custom mask, packaged product mask, or empirical footprint mask."""
         expected_shape = (hp.nside2npix(self.nside),)
 
         if self.cfg.mask_map is not None:
             mask_map = np.asarray(self.cfg.mask_map)
             if mask_map.shape != expected_shape:
                 raise ValueError(
-                    "Custom RACS-low3 mask has unexpected shape: "
+                    f"Custom {self.product.label} mask has unexpected shape: "
                     f"{mask_map.shape}, expected {expected_shape}"
                 )
-        else:
+        elif self.product.default_mask_filename is not None:
             mask_path = self._mask_map_path()
             if not mask_path.exists():
-                raise FileNotFoundError(f"Packaged RACS-low3 mask not found: {mask_path}")
+                raise FileNotFoundError(
+                    f"Packaged {self.product.label} mask not found: {mask_path}"
+                )
 
             mask_map_ring = np.load(mask_path, allow_pickle=False)
             mask_map = hp.reorder(mask_map_ring, r2n=True)
             if mask_map.shape != expected_shape:
                 raise ValueError(
-                    "Packaged RACS-low3 mask has unexpected shape: "
+                    f"Packaged {self.product.label} mask has unexpected shape: "
                     f"{mask_map.shape}, expected {expected_shape}"
                 )
+        elif hasattr(self, "tile_lookup_map"):
+            mask_map = self.tile_lookup_map >= 0
+        else:
+            raise FileNotFoundError(
+                f"No mask_map or packaged mask is available for {self.product.label}; "
+                "run initialise_data() so the empirical tile footprint can be used."
+            )
 
         self.mask_map = np.asarray(mask_map == 1, dtype=np.bool_)
 
@@ -479,10 +507,16 @@ class RacsLow3:
         """Collect one row of metadata per SBID for later tile-level systematics."""
         assert self.catalogue_is_loaded, "Load the catalogue before building tile metadata."
 
-        sbid = np.asarray(self.catalogue["SBID"], dtype=np.int64)
-        field_id = np.asarray(self.catalogue["Field_ID"])
-        scan_start_mjd = np.asarray(self.catalogue["Scan_start_MJD"], dtype=np.float64)
-        scan_length = np.asarray(self.catalogue["Scan_length"], dtype=np.float64)
+        sbid = np.asarray(self.catalogue[self.product.columns.tile_id], dtype=np.int64)
+        field_id = np.asarray(self.catalogue[self.product.columns.field_id])
+        scan_start_mjd = np.asarray(
+            self.catalogue[self.product.columns.scan_start_mjd],
+            dtype=np.float64,
+        )
+        scan_length = np.asarray(
+            self.catalogue[self.product.columns.scan_length],
+            dtype=np.float64,
+        )
 
         unique_sbid, first_indices = np.unique(sbid, return_index=True)
         self.tile_sbids = unique_sbid.astype(np.int32, copy=False)
@@ -574,7 +608,7 @@ class RacsLow3:
             self._save_lookup_map_png(
                 self.temperature_map,
                 cache_path.with_suffix(".png"),
-                title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
+                title=f"{self.product.label} Mean PAF Temperature Lookup (nside={self.nside})",
                 unit="deg C",
                 cmap="coolwarm",
             )
@@ -582,7 +616,7 @@ class RacsLow3:
                 self._save_lookup_map_png(
                     self.temperature_map,
                     f'{str(self._cache_dir())}/temperature_lookup_paf_{coord_str}.png',
-                    title=f"RACS LOW3 Mean PAF Temperature Lookup (nside={self.nside})",
+                    title=f"{self.product.label} Mean PAF Temperature Lookup (nside={self.nside})",
                     unit="deg C",
                     cmap="coolwarm",
                     coord=coord
@@ -610,6 +644,7 @@ class RacsLow3:
                 copy=False,
             )
 
+        self._validate_tile_temperatures()
         self.build_temperature_map()
         return True
 
@@ -617,10 +652,13 @@ class RacsLow3:
         """Build a per-pixel empirical lookup of fractional flux errors."""
         assert self.catalogue_is_loaded, "Load the catalogue before building error lookups."
 
-        flux = np.asarray(self.catalogue["Total_flux"], dtype=np.float64)
-        flux_error = np.asarray(self.catalogue["E_Total_flux"], dtype=np.float64)
-        ra = np.asarray(self.catalogue["RA"], dtype=np.float64)
-        dec = np.asarray(self.catalogue["Dec"], dtype=np.float64)
+        flux = np.asarray(self.catalogue[self.product.columns.total_flux], dtype=np.float64)
+        flux_error = np.asarray(
+            self.catalogue[self.product.columns.total_flux_error],
+            dtype=np.float64,
+        )
+        ra = np.asarray(self.catalogue[self.product.columns.ra], dtype=np.float64)
+        dec = np.asarray(self.catalogue[self.product.columns.dec], dtype=np.float64)
 
         valid = (
             np.isfinite(flux)
@@ -679,7 +717,7 @@ class RacsLow3:
                 self.fractional_error_map,
                 cache_path.with_suffix(".png"),
                 title=(
-                    "RACS LOW3 Fractional Flux Error Lookup "
+                    f"{self.product.label} Fractional Flux Error Lookup "
                     f"(nside={self.nside}, flux>={self.cfg.fractional_error_flux_min_mjy:g} mJy)"
                 ),
                 unit="fractional error",
@@ -799,16 +837,36 @@ class RacsLow3:
             dtype=np.float64,
         )
 
+        self._validate_tile_temperatures()
         self.build_temperature_map()
-        if np.any(np.isfinite(self.tile_temperature_by_index)):
-            self.save_temperature_lookup()
+        self.save_temperature_lookup()
+
+    def _validate_tile_temperatures(self) -> None:
+        """Fail initialisation if any SBID has no finite PAF temperature."""
+        if self.tile_temperature_by_index is None:
+            return
+
+        temperatures = np.asarray(self.tile_temperature_by_index, dtype=np.float64)
+        invalid = ~np.isfinite(temperatures)
+        if not np.any(invalid):
+            return
+
+        invalid_indices = np.flatnonzero(invalid)
+        invalid_sbids = self.tile_sbids[invalid_indices]
+        preview = ", ".join(str(int(sbid)) for sbid in invalid_sbids[:10])
+        if invalid_sbids.size > 10:
+            preview += ", ..."
+        raise ValueError(
+            f"{self.product.label} PAF temperature lookup contains non-finite "
+            f"temperatures for {invalid_sbids.size} SBID(s): {preview}."
+        )
 
     def _resolve_paf_temperature_data_dir(self) -> Path:
         if self.cfg.paf_temperature_data_dir is not None:
             data_dir = Path(self.cfg.paf_temperature_data_dir).expanduser().resolve()
             if not data_dir.exists():
                 raise FileNotFoundError(
-                    "RacsLow3Config.paf_temperature_data_dir points to missing directory: "
+                    "RacsConfig.paf_temperature_data_dir points to missing directory: "
                     f"{data_dir}"
                 )
             return data_dir
@@ -820,7 +878,7 @@ class RacsLow3:
 
         raise FileNotFoundError(
             "Could not find PAF temperature data. Set "
-            "RacsLow3Config.paf_temperature_data_dir or provide "
+            "RacsConfig.paf_temperature_data_dir or provide "
             f"{default_dir}."
         )
 
@@ -1097,7 +1155,7 @@ class RacsLow3:
         temperatures = np.full(tile_indices.shape, np.nan, dtype=np.float32)
 
         if self.tile_temperature_by_index is None:
-            enhancement = np.maximum(enhancement, LOW3_TEMPERATURE_EPSILON_FLOOR)
+            enhancement = np.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
             return enhancement.astype(self.dtype, copy=False), temperatures
 
         valid = tile_indices >= 0
@@ -1113,12 +1171,12 @@ class RacsLow3:
                 enhancement_valid = 1.0 - temp_beta * hot_temperature
                 enhancement_valid = np.maximum(
                     enhancement_valid,
-                    LOW3_TEMPERATURE_EPSILON_FLOOR,
+                    RACS_TEMPERATURE_EPSILON_FLOOR,
                 )
                 enhancement_indices = np.flatnonzero(valid)[valid_temperature]
                 enhancement[enhancement_indices] = enhancement_valid
 
-        enhancement = np.maximum(enhancement, LOW3_TEMPERATURE_EPSILON_FLOOR)
+        enhancement = np.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         return enhancement.astype(self.dtype, copy=False), temperatures
 
     def apply_temperature_enhancement(
@@ -1193,7 +1251,7 @@ class RacsLow3:
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
-        """Coordinate the CatSIM-like simulation pipeline for RACS-low3.
+        """Coordinate the CatSIM-like simulation pipeline for RACS.
 
         ``log10_n_initial_samples`` sets the expected total number of
         pre-selection sources after clustering. The simulator derives the
@@ -1201,7 +1259,7 @@ class RacsLow3:
         multiplicity.
 
         The clustering count model is selected by
-        ``RacsLow3Config.cluster_count_model``. ``"geometric"`` draws
+        ``RacsConfig.cluster_count_model``. ``"geometric"`` draws
         ``X ~ Bernoulli(p_clus)`` for each parent and, if ``X = 1``, draws
         ``K ~ Geometric(clus_stop_prob)`` on support ``1, 2, 3, ...``.
         ``"poisson"`` draws ``K ~ Poisson(lambda_clus)`` for every parent.
@@ -1478,3 +1536,12 @@ class RacsLow3:
             self.final_temperature_samples = None
 
         return output_map, output_mask
+
+
+class RacsLow3(Racs):
+    """Backwards-compatible LOW3 simulator wrapper."""
+
+    def __init__(self, config: RacsConfig):
+        if config.product != RACS_LOW3:
+            raise ValueError("RacsLow3 requires a LOW3 RACS product configuration.")
+        super().__init__(config)

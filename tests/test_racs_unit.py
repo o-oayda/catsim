@@ -33,8 +33,9 @@ if "dipoleutils.utils.data_loader" not in sys.modules:
     sys.modules["dipoleutils.utils"] = utils_module
     sys.modules["dipoleutils.utils.data_loader"] = data_loader_module
 
-from catsim import RacsLow3, RacsLow3Config
+from catsim import RACS_MID1, Racs, RacsConfig, RacsLow3, RacsLow3Config
 from catsim.racs import LOW3_TEMPERATURE_EPSILON_FLOOR
+from catsim.racs_products import RacsCatalogueColumns, RacsProductSpec, resolve_racs_product
 from catsim.utils import weather
 
 
@@ -690,6 +691,74 @@ class PafWeatherLookupTests(unittest.TestCase):
 
 
 class RacsInitialiseDataTests(unittest.TestCase):
+    def test_product_registry_resolves_low3_and_mid1_metadata(self):
+        low3 = resolve_racs_product("low3")
+        mid1 = resolve_racs_product("racs_mid1")
+
+        self.assertEqual(low3.data_loader_args, ("racs", "low3"))
+        self.assertEqual(low3.data_dir_name, "racs_low3")
+        self.assertEqual(low3.columns.dec, "Dec")
+        self.assertEqual(mid1, RACS_MID1)
+        self.assertEqual(mid1.data_loader_args, ("racs", "mid1"))
+        self.assertEqual(mid1.data_dir_name, "racs_mid1")
+        self.assertEqual(mid1.columns.dec, "DEC")
+        self.assertEqual(mid1.columns.field_id, "Tile_ID")
+
+        with self.assertRaisesRegex(ValueError, "Unknown RACS product"):
+            resolve_racs_product("not-a-product")
+
+    def test_lookup_builders_use_product_column_mapping(self):
+        product = RacsProductSpec(
+            key="synthetic",
+            label="Synthetic RACS",
+            data_loader_catalogue="racs",
+            data_loader_variant="synthetic",
+            data_dir_name="racs_synthetic",
+            columns=RacsCatalogueColumns(
+                ra="source_ra",
+                dec="source_dec",
+                tile_id="tile_sbid",
+                total_flux="flux_total",
+                total_flux_error="flux_error_total",
+                scan_start_mjd="scan_mjd",
+                scan_length="scan_duration",
+                field_id="field_name",
+            ),
+        )
+        sim = Racs(
+            RacsConfig(
+                flux_min=1.0,
+                product=product,
+                nside=1,
+                chunk_size=16,
+                fractional_error_flux_min_mjy=1.0,
+            )
+        )
+        sim.catalogue = Table(
+            {
+                "source_ra": np.array([0.0, 90.0, 180.0, 270.0]),
+                "source_dec": np.array([0.0, 20.0, -20.0, 40.0]),
+                "tile_sbid": np.array([101, 101, 202, 303]),
+                "flux_total": np.array([1.0, 2.0, 4.0, 8.0]),
+                "flux_error_total": np.array([0.1, 0.2, 0.4, 0.8]),
+                "scan_mjd": np.array([60000.0, 60000.0, 60001.0, 60002.0]),
+                "scan_duration": np.array([10.0, 10.0, 12.0, 14.0]),
+                "field_name": np.array(["a", "a", "b", "c"]),
+            }
+        )
+        sim.catalogue_is_loaded = True
+
+        sim.build_flux_distribution()
+        sim.build_tile_metadata()
+        sim.build_tile_lookup()
+        sim.build_fractional_error_lookup()
+        sim.load_mask_map()
+
+        np.testing.assert_array_equal(sim.tile_sbids, np.array([101, 202, 303], dtype=np.int32))
+        self.assertEqual(sim.log_flux_bin_cdf[-1], 1.0)
+        self.assertGreater(sim.error_lookup_fractional_values.size, 0)
+        np.testing.assert_array_equal(sim.mask_map, sim.tile_lookup_map >= 0)
+
     def test_config_rejects_invalid_clustering_parameters(self):
         with self.assertRaisesRegex(ValueError, "cluster_r0_arcsec must be positive"):
             RacsLow3Config(
@@ -864,6 +933,39 @@ class RacsInitialiseDataTests(unittest.TestCase):
             self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
             self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.png").exists())
 
+    def test_load_temperature_table_raises_when_any_sbid_temperature_is_nan(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_dir = tmp_path / "cache"
+            paf_dir = tmp_path / "paf"
+            cache_dir.mkdir()
+            paf_dir.mkdir()
+            _make_full_antenna_set(paf_dir, minute_offset=120)
+
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    paf_temperature_data_dir=str(paf_dir),
+                    paf_max_interpolation_gap_minutes=1.0,
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array(
+                [
+                    Time(datetime(2023, 12, 31, 16, 4, tzinfo=UTC)).mjd,
+                    Time(datetime(2023, 12, 31, 16, 4, tzinfo=UTC)).mjd,
+                ],
+                dtype=np.float64,
+            )
+
+            with self.assertRaisesRegex(ValueError, "non-finite temperatures.*101, 202"):
+                sim.load_temperature_table()
+
+            self.assertFalse((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
+
     def test_load_temperature_table_uses_cached_paf_lookup_when_present(self):
         with TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir)
@@ -892,6 +994,33 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 sim.temperature_map[:2],
                 np.array([20.0, 21.0], dtype=np.float32),
             )
+
+    def test_load_temperature_table_rejects_cached_nan_temperature(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            n_pix = hp.nside2npix(64)
+            sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
+            sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
+            np.savez_compressed(
+                sim._temperature_lookup_cache_path(),
+                nside=np.asarray(sim.nside, dtype=np.int64),
+                tile_sbids=sim.tile_sbids.astype(np.int32, copy=False),
+                tile_temperature_by_index=np.array([20.0, np.nan], dtype=np.float64),
+            )
+
+            with self.assertRaisesRegex(ValueError, "non-finite temperatures.*202"):
+                sim.load_temperature_table()
 
     def test_pickle_excludes_catalogue_payload(self):
         sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
