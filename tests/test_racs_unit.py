@@ -689,6 +689,38 @@ class PafWeatherLookupTests(unittest.TestCase):
                 np.full(2, np.mean(np.arange(41.0, 77.0))),
             )
 
+    def test_get_open_meteo_temperatures_for_mjd_linearly_interpolates_hourly_data(self):
+        hourly_unix = np.array(
+            [
+                datetime(2024, 1, 1, 0, 0, tzinfo=UTC).timestamp(),
+                datetime(2024, 1, 1, 1, 0, tzinfo=UTC).timestamp(),
+                datetime(2024, 1, 1, 2, 0, tzinfo=UTC).timestamp(),
+            ],
+            dtype=float,
+        )
+        hourly_temperatures = np.array([10.0, 14.0, 18.0], dtype=float)
+        mjd_values = [
+            Time(datetime(2024, 1, 1, 1, 0, tzinfo=UTC)).mjd,
+            Time(datetime(2024, 1, 1, 1, 30, tzinfo=UTC)).mjd,
+        ]
+
+        with patch(
+            "catsim.utils.weather._fetch_open_meteo_hourly_temperature",
+            return_value=(hourly_unix, hourly_temperatures),
+        ) as mocked_fetch:
+            temperatures = weather.get_open_meteo_temperatures_for_mjd(
+                mjd_values,
+                latitude_deg=-1.0,
+                longitude_deg=2.0,
+                timeout=3.0,
+            )
+
+        np.testing.assert_allclose(temperatures, np.array([14.0, 16.0]))
+        mocked_fetch.assert_called_once()
+        self.assertEqual(mocked_fetch.call_args.kwargs["latitude_deg"], -1.0)
+        self.assertEqual(mocked_fetch.call_args.kwargs["longitude_deg"], 2.0)
+        self.assertEqual(mocked_fetch.call_args.kwargs["timeout"], 3.0)
+
 
 class RacsInitialiseDataTests(unittest.TestCase):
     def test_product_registry_resolves_low3_and_mid1_metadata(self):
@@ -965,6 +997,145 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 sim.load_temperature_table()
 
             self.assertFalse((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
+
+    def test_load_temperature_table_falls_back_to_open_meteo_when_configured(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            n_pix = hp.nside2npix(64)
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    temperature_fallback="open_meteo",
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
+            sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
+
+            with (
+                self.assertLogs("catsim.racs", level="WARNING") as logs,
+                patch(
+                    "catsim.racs.get_mean_paf_temperatures_for_observations",
+                    side_effect=FileNotFoundError("no paf"),
+                ) as paf_lookup,
+                patch(
+                    "catsim.racs.get_open_meteo_temperatures_for_mjd",
+                    return_value=np.array([20.0, 21.0], dtype=np.float64),
+                ) as meteo_lookup,
+            ):
+                sim.load_temperature_table()
+
+            paf_lookup.assert_called_once()
+            meteo_lookup.assert_called_once()
+            self.assertIn("falling back to Open-Meteo", logs.output[0])
+            self.assertIn("no paf", logs.output[0])
+            np.testing.assert_allclose(
+                sim.tile_temperature_by_index,
+                np.array([20.0, 21.0], dtype=np.float64),
+            )
+            self.assertTrue(
+                (cache_dir / "temperature_lookup_nside64_open_meteo.npz").exists()
+            )
+            self.assertFalse(
+                (cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists()
+            )
+
+            with np.load(cache_dir / "temperature_lookup_nside64_open_meteo.npz") as data:
+                self.assertEqual(str(data["temperature_source"]), "open_meteo")
+                np.testing.assert_array_equal(data["tile_sbids"], sim.tile_sbids)
+
+    def test_load_temperature_table_uses_cached_open_meteo_fallback(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            n_pix = hp.nside2npix(64)
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    temperature_fallback="open_meteo",
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
+            sim._tile_index_from_sbid = {101: 0, 202: 1}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[:2] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_starts[1] = 1
+            sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
+            sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
+            sim.temperature_map = np.full(n_pix, np.nan, dtype=np.float32)
+            sim.temperature_map[:2] = np.array([20.0, 21.0], dtype=np.float32)
+            sim.save_temperature_lookup(source="open_meteo")
+
+            with (
+                patch("catsim.racs.get_mean_paf_temperatures_for_observations") as paf_lookup,
+                patch("catsim.racs.get_open_meteo_temperatures_for_mjd") as meteo_lookup,
+            ):
+                sim.load_temperature_table()
+
+            paf_lookup.assert_not_called()
+            meteo_lookup.assert_not_called()
+            np.testing.assert_allclose(
+                sim.temperature_map[:2],
+                np.array([20.0, 21.0], dtype=np.float32),
+            )
+
+    def test_load_temperature_table_rejects_nan_open_meteo_fallback(self):
+        with TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    temperature_fallback="open_meteo",
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
+
+            with (
+                patch(
+                    "catsim.racs.get_mean_paf_temperatures_for_observations",
+                    side_effect=FileNotFoundError("no paf"),
+                ),
+                patch(
+                    "catsim.racs.get_open_meteo_temperatures_for_mjd",
+                    return_value=np.array([20.0, np.nan], dtype=np.float64),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "Open-Meteo.*202"):
+                    sim.load_temperature_table()
+
+            self.assertFalse(
+                (cache_dir / "temperature_lookup_nside64_open_meteo.npz").exists()
+            )
+
+    def test_mid1_open_meteo_temperature_lookup_path_is_product_specific(self):
+        sim = Racs(RacsConfig(product=RACS_MID1, flux_min=15.0))
+
+        self.assertIn(
+            "racs_mid1/lookups/temperature_lookup_nside64_open_meteo.npz",
+            sim._open_meteo_temperature_lookup_cache_path().as_posix(),
+        )
 
     def test_load_temperature_table_uses_cached_paf_lookup_when_present(self):
         with TemporaryDirectory() as tmpdir:
