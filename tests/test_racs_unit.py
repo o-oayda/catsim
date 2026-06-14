@@ -52,17 +52,24 @@ def _write_paf_csv(path: Path, rows: list[tuple[str, str]]) -> None:
     )
 
 
-def _make_full_antenna_set(tmp_path: Path, minute_offset: int = 0) -> None:
+def _make_full_antenna_set(
+    tmp_path: Path,
+    minute_offset: int = 0,
+    temperature_offset: float = 0.0,
+) -> None:
     base_time = datetime(2024, 1, 1, 0, 0, tzinfo=UTC) + timedelta(minutes=minute_offset)
     for antenna_index in range(1, 37):
         antenna_name = f"ak{antenna_index:02d}"
         _write_paf_csv(
             tmp_path / f"{antenna_name} ctrl_adc1_pafAvTemp-data.csv",
             [
-                (base_time.strftime("%Y-%m-%d %H:%M:%S"), f"{antenna_index:.1f}"),
+                (
+                    base_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    f"{antenna_index + temperature_offset:.1f}",
+                ),
                 (
                     (base_time + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S"),
-                    f"{antenna_index + 100:.1f}",
+                    f"{antenna_index + 100 + temperature_offset:.1f}",
                 ),
             ],
         )
@@ -951,7 +958,8 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
             sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
 
-            sim.load_temperature_table()
+            with self.assertLogs("catsim.racs", level="WARNING") as logs:
+                sim.load_temperature_table()
 
             expected_temperature = np.mean(np.arange(41.0, 77.0))
             np.testing.assert_allclose(
@@ -964,6 +972,108 @@ class RacsInitialiseDataTests(unittest.TestCase):
             )
             self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
             self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.png").exists())
+            self.assertTrue(
+                any("legacy flat directory" in message for message in logs.output)
+            )
+
+    def test_load_temperature_table_uses_product_paf_subdirectory(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_root = tmp_path / "paf_temps"
+            low3_paf_dir = paf_root / "low3"
+            mid1_paf_dir = paf_root / "mid1"
+            cache_dir = tmp_path / "cache"
+            n_pix = hp.nside2npix(64)
+            low3_paf_dir.mkdir(parents=True)
+            mid1_paf_dir.mkdir(parents=True)
+            _make_full_antenna_set(low3_paf_dir, temperature_offset=0.0)
+            _make_full_antenna_set(mid1_paf_dir, temperature_offset=1000.0)
+
+            sim = Racs(
+                RacsConfig(
+                    product=RACS_MID1,
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    paf_temperature_data_dir=str(paf_root),
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array(
+                [Time(datetime(2023, 12, 31, 16, 4, tzinfo=UTC)).mjd],
+                dtype=np.float64,
+            )
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[0] = 101
+            sim._tile_index_from_sbid = {101: 0}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[0] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_tile_indices = np.array([0], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0], dtype=np.float64)
+
+            with self.assertLogs("catsim.racs", level="INFO") as logs:
+                sim.load_temperature_table()
+
+            expected_temperature = np.mean(np.arange(1041.0, 1077.0))
+            np.testing.assert_allclose(
+                sim.tile_temperature_by_index,
+                np.array([expected_temperature]),
+            )
+            self.assertTrue(any(str(mid1_paf_dir) in message for message in logs.output))
+            self.assertFalse(any(str(low3_paf_dir) in message for message in logs.output))
+            with np.load(cache_dir / "temperature_lookup_nside64_mean_paf.npz") as data:
+                self.assertEqual(str(data["paf_product_key"]), "mid1")
+                self.assertEqual(str(data["paf_temperature_data_dir"]), str(mid1_paf_dir))
+
+    def test_configured_paf_root_ignores_legacy_cache_without_source_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_dir = tmp_path / "cache"
+            paf_root = tmp_path / "paf_temps"
+            paf_dir = paf_root / "low3"
+            n_pix = hp.nside2npix(64)
+            cache_dir.mkdir()
+            paf_dir.mkdir(parents=True)
+            _make_full_antenna_set(paf_dir)
+
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    paf_temperature_data_dir=str(paf_root),
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array(
+                [Time(datetime(2023, 12, 31, 16, 4, tzinfo=UTC)).mjd],
+                dtype=np.float64,
+            )
+            sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
+            sim.tile_lookup_map[0] = 101
+            sim._tile_index_from_sbid = {101: 0}
+            sim.sbid_mixture_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_counts[0] = 1
+            sim.sbid_mixture_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.sbid_mixture_tile_indices = np.array([0], dtype=np.int32)
+            sim.sbid_mixture_probabilities = np.array([1.0], dtype=np.float64)
+            np.savez_compressed(
+                sim._temperature_lookup_cache_path(),
+                nside=np.asarray(sim.nside, dtype=np.int64),
+                tile_sbids=sim.tile_sbids.astype(np.int32, copy=False),
+                tile_temperature_by_index=np.array([999.0], dtype=np.float64),
+            )
+
+            sim.load_temperature_table()
+
+            expected_temperature = np.mean(np.arange(41.0, 77.0))
+            np.testing.assert_allclose(
+                sim.tile_temperature_by_index,
+                np.array([expected_temperature]),
+            )
 
     def test_load_temperature_table_raises_when_any_sbid_temperature_is_nan(self):
         with TemporaryDirectory() as tmpdir:

@@ -634,6 +634,23 @@ class Racs:
             ),
             "temperature_source": np.asarray(source),
         }
+        if source == "mean_paf":
+            paf_data_dir: Path | None
+            try:
+                paf_data_dir = self._resolve_paf_temperature_data_dir()
+            except FileNotFoundError:
+                paf_data_dir = None
+            if paf_data_dir is not None:
+                payload.update(
+                    {
+                        "paf_product_key": np.asarray(self.product.key),
+                        "paf_temperature_data_dir": np.asarray(str(paf_data_dir)),
+                        "paf_max_interpolation_gap_minutes": np.asarray(
+                            self.cfg.paf_max_interpolation_gap_minutes,
+                            dtype=np.float64,
+                        ),
+                    }
+                )
         if source == "open_meteo":
             payload.update(
                 {
@@ -697,6 +714,12 @@ class Racs:
             if not np.array_equal(cache_tile_sbids, self.tile_sbids):
                 return False
 
+            if (
+                source == "mean_paf"
+                and not self._temperature_lookup_cache_matches_paf_config(data)
+            ):
+                return False
+
             self.tile_temperature_by_index = data["tile_temperature_by_index"].astype(
                 np.float64,
                 copy=False,
@@ -705,6 +728,33 @@ class Racs:
         self._validate_tile_temperatures(source=source)
         self.build_temperature_map()
         return True
+
+    def _temperature_lookup_cache_matches_paf_config(
+        self,
+        data: np.lib.npyio.NpzFile,
+    ) -> bool:
+        """Return whether a cached PAF lookup matches the configured raw data source."""
+        required_fields = {
+            "paf_product_key",
+            "paf_temperature_data_dir",
+            "paf_max_interpolation_gap_minutes",
+        }
+        if not required_fields.issubset(data.files):
+            return self.cfg.paf_temperature_data_dir is None
+
+        if str(data["paf_product_key"]) != self.product.key:
+            return False
+        if not np.isclose(
+            float(data["paf_max_interpolation_gap_minutes"]),
+            self.cfg.paf_max_interpolation_gap_minutes,
+        ):
+            return False
+        if self.cfg.paf_temperature_data_dir is None:
+            return True
+
+        return str(data["paf_temperature_data_dir"]) == str(
+            self._resolve_paf_temperature_data_dir()
+        )
 
     def build_fractional_error_lookup(self) -> None:
         """Build a per-pixel empirical lookup of fractional flux errors."""
@@ -968,23 +1018,47 @@ class Racs:
 
     def _resolve_paf_temperature_data_dir(self) -> Path:
         if self.cfg.paf_temperature_data_dir is not None:
-            data_dir = Path(self.cfg.paf_temperature_data_dir).expanduser().resolve()
-            if not data_dir.exists():
+            root_dir = Path(self.cfg.paf_temperature_data_dir).expanduser().resolve()
+            if not root_dir.exists():
                 raise FileNotFoundError(
                     "RacsConfig.paf_temperature_data_dir points to missing directory: "
-                    f"{data_dir}"
+                    f"{root_dir}"
                 )
-            return data_dir
+            return self._select_product_paf_temperature_data_dir(root_dir)
 
         repo_root = Path(__file__).resolve().parents[2]
-        default_dir = repo_root.parent / "dipole-utils" / "data" / "paf_temps"
-        if default_dir.exists():
-            return default_dir
+        default_root = repo_root.parent / "dipole-utils" / "data" / "paf_temps"
+        if default_root.exists():
+            return self._select_product_paf_temperature_data_dir(default_root)
 
         raise FileNotFoundError(
             "Could not find PAF temperature data. Set "
             "RacsConfig.paf_temperature_data_dir or provide "
-            f"{default_dir}."
+            f"{default_root}."
+        )
+
+    def _select_product_paf_temperature_data_dir(self, root_dir: Path) -> Path:
+        product_dir = root_dir / self.product.key
+        if product_dir.is_dir():
+            LOGGER.info(
+                "%s loading PAF temperatures from product directory: %s",
+                self.product.label,
+                product_dir,
+            )
+            return product_dir
+
+        if any(root_dir.glob("ak*csv")):
+            LOGGER.warning(
+                "%s loading PAF temperatures from legacy flat directory: %s",
+                self.product.label,
+                root_dir,
+            )
+            return root_dir
+
+        raise FileNotFoundError(
+            f"Could not find PAF temperature files for {self.product.label}. "
+            f"Expected product directory {product_dir} containing ak*csv files, "
+            f"or a legacy flat directory {root_dir} containing ak*csv files."
         )
 
     def initialise_data(self) -> None:
