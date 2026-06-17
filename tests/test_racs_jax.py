@@ -192,6 +192,52 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(maps.dtype, np.float32)
         self.assertEqual(masks.dtype, np.bool_)
 
+    def test_histogram_flux_quantiles_interpolates_raw_flux_values(self):
+        from catsim.racs_jax import _histogram_flux_quantiles_jax
+
+        hist = jnp.asarray([[1.0, 1.0], [0.0, 0.0]], dtype=jnp.float32)
+        features = _histogram_flux_quantiles_jax(
+            hist,
+            jnp.asarray(10.0, dtype=jnp.float32),
+            jnp.asarray(1000.0, dtype=jnp.float32),
+            jnp.asarray([0.0, 0.5, 1.0], dtype=jnp.float32),
+        )
+
+        expected = np.asarray([10.0, 100.0, 1000.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        np.testing.assert_allclose(np.asarray(features), expected, rtol=1e-5)
+
+    def test_batch_generate_dipole_with_flux_temperature_summary_returns_features(self):
+        temperatures = self.sim.tile_temperature_by_index
+        self.assertIsNotNone(temperatures)
+        finite_temperatures = temperatures[np.isfinite(temperatures)]
+        self.assertGreater(finite_temperatures.size, 1)
+        temperature_edges = np.linspace(
+            float(np.min(finite_temperatures)),
+            float(np.max(finite_temperatures)),
+            4,
+            dtype=np.float32,
+        )
+
+        maps, masks, summaries = self.sim.batch_generate_dipole_with_flux_temperature_summary(
+            theta={
+                "log10_n_initial_samples": np.log10(np.asarray([8.0, 8.0])),
+                "observer_speed": np.zeros(2, dtype=np.float32),
+                "p_clus": np.zeros(2, dtype=np.float32),
+                "clus_stop_prob": np.ones(2, dtype=np.float32),
+            },
+            key=jax.random.PRNGKey(123),
+            batch_size=2,
+            temperature_edges=temperature_edges,
+            quantiles=(0.25, 0.5),
+            n_flux_bins=8,
+            flux_max_mjy=1000.0,
+        )
+
+        self.assertEqual(maps.shape, (2, hp.nside2npix(64)))
+        self.assertEqual(masks.shape, (2, hp.nside2npix(64)))
+        self.assertEqual(summaries.shape, (2, 6))
+        self.assertTrue(np.all(np.isfinite(summaries)))
+
     def test_batch_generate_dipole_accepts_dynamic_source_counts(self):
         low_maps, low_masks = self.sim.batch_generate_dipole(
             {"log10_n_initial_samples": np.full(2, 1.0)},

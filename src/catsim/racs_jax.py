@@ -32,6 +32,7 @@ from .utils.physics import rotation_matrices_for_dipole
 _GEOMETRIC_MODEL = 0
 _POISSON_MODEL = 1
 _OVERFILL_WARNING_THRESHOLD = 0.01
+_DEFAULT_FLUX_TEMPERATURE_SUMMARY_FLUX_QUANTILE = 0.999
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,47 @@ def _sample_clustered_positions_jax(
     return child_ra_deg, child_dec_deg
 
 
+def _histogram_flux_quantiles_jax(
+    hist: jax.Array,
+    flux_min: jax.Array,
+    flux_max: jax.Array,
+    quantiles: jax.Array,
+    *,
+    empty_value: float = 0.0,
+) -> jax.Array:
+    """Approximate raw-flux quantiles from a temp x log-flux histogram."""
+    n_flux_bins = hist.shape[1]
+    z_max = jnp.log10(flux_max / flux_min)
+    z_edges = jnp.linspace(0.0, z_max, n_flux_bins + 1, dtype=jnp.float32)
+
+    counts = jnp.sum(hist, axis=1)
+    cumulative = jnp.cumsum(hist, axis=1)
+
+    def one_quantile(q: jax.Array) -> jax.Array:
+        target = jnp.where(q <= 0.0, jnp.finfo(jnp.float32).eps, q * counts)
+        reached = cumulative >= target[:, None]
+        bin_index = jnp.argmax(reached, axis=1).astype(jnp.int32)
+
+        previous_index = jnp.maximum(bin_index - 1, 0)
+        previous_cdf = jnp.where(
+            bin_index > 0,
+            cumulative[jnp.arange(hist.shape[0]), previous_index],
+            0.0,
+        )
+        current_cdf = cumulative[jnp.arange(hist.shape[0]), bin_index]
+        denominator = jnp.maximum(current_cdf - previous_cdf, jnp.finfo(jnp.float32).eps)
+        fraction = jnp.clip((target - previous_cdf) / denominator, 0.0, 1.0)
+
+        z_low = z_edges[bin_index]
+        z_high = z_edges[bin_index + 1]
+        z_quantile = z_low + fraction * (z_high - z_low)
+        flux_quantile = flux_min * jnp.power(10.0, z_quantile)
+        return jnp.where(counts > 0.0, flux_quantile, empty_value)
+
+    values = jax.vmap(one_quantile)(quantiles)
+    return jnp.swapaxes(values, 0, 1).reshape(-1).astype(jnp.float32)
+
+
 def _simulate_one_jax(
     key: jax.Array,
     parent_count: jax.Array,
@@ -473,6 +515,229 @@ def _simulate_one_jax(
     return jnp.where(mask_map, density, jnp.nan), mask_map
 
 
+def _simulate_one_jax_with_flux_temperature_summary(
+    key: jax.Array,
+    parent_count: jax.Array,
+    flux_min: jax.Array,
+    p_clus: jax.Array,
+    clus_stop_prob: jax.Array,
+    lambda_clus: jax.Array,
+    observer_beta: jax.Array,
+    forward_matrix: jax.Array,
+    inverse_matrix: jax.Array,
+    temp_beta: jax.Array,
+    fractional_error_eta: jax.Array,
+    flux_max: jax.Array,
+    temperature_edges: jax.Array,
+    quantiles: jax.Array,
+    lookup_tuple: tuple[jax.Array, ...],
+    *,
+    cluster_model_code: int,
+    nside: int,
+    n_chunks: jax.Array,
+    chunk_size: int,
+    max_children: int,
+    alpha_mean: float,
+    alpha_sigma: float,
+    cluster_r0_arcsec: float,
+    cluster_r_cut_arcsec: float,
+    paf_reference_temp_c: float,
+    n_flux_bins: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    (
+        log_flux_edges,
+        log_flux_cdf,
+        mask_map,
+        tile_counts,
+        tile_indices,
+        tile_cdf,
+        error_counts,
+        error_values_by_pixel,
+        global_error_values,
+        tile_temperature_by_index,
+    ) = lookup_tuple
+
+    n_pix = mask_map.shape[0]
+    source_slots = 1 + max_children
+    child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
+    error_max_count = error_values_by_pixel.shape[1]
+    n_temp_bins = temperature_edges.shape[0] - 1
+    flux_z_max = jnp.maximum(
+        jnp.log10(flux_max / flux_min),
+        jnp.finfo(jnp.float32).eps,
+    )
+
+    def chunk_body(
+        state: tuple[jax.Array, jax.Array],
+        chunk_index: jax.Array,
+    ) -> tuple[tuple[jax.Array, jax.Array], None]:
+        density_accumulator, flux_temperature_hist = state
+        chunk_key = jax.random.fold_in(key, chunk_index)
+        (
+            key_parent_pos,
+            key_counts,
+            key_child_pos,
+            key_flux,
+            key_alpha,
+            key_tile,
+            key_error,
+            key_global_error,
+            key_noise,
+        ) = jax.random.split(chunk_key, 9)
+
+        parent_indices = chunk_index * chunk_size + jnp.arange(chunk_size, dtype=jnp.int32)
+        parent_valid = parent_indices < parent_count
+
+        key_ra, key_dec = jax.random.split(key_parent_pos)
+        parent_ra = 360.0 * jax.random.uniform(key_ra, (chunk_size,), dtype=jnp.float32)
+        parent_dec = jnp.rad2deg(
+            jnp.arcsin(
+                2.0 * jax.random.uniform(key_dec, (chunk_size,), dtype=jnp.float32) - 1.0
+            )
+        )
+
+        child_counts = _cluster_counts_jax(
+            key_counts,
+            parent_valid,
+            p_clus,
+            clus_stop_prob,
+            lambda_clus,
+            cluster_model_code=cluster_model_code,
+            max_children=max_children,
+        )
+        child_valid = (child_ordinals[None, :] < child_counts[:, None]) & parent_valid[:, None]
+        child_ra, child_dec = _sample_clustered_positions_jax(
+            key_child_pos,
+            parent_ra,
+            parent_dec,
+            max_children=max_children,
+            cluster_r0_arcsec=cluster_r0_arcsec,
+            cluster_r_cut_arcsec=cluster_r_cut_arcsec,
+        )
+
+        source_ra = jnp.concatenate((parent_ra[:, None], child_ra), axis=1).reshape(-1)
+        source_dec = jnp.concatenate((parent_dec[:, None], child_dec), axis=1).reshape(-1)
+        source_valid = jnp.concatenate((parent_valid[:, None], child_valid), axis=1).reshape(-1)
+        source_shape = (chunk_size, source_slots)
+
+        intrinsic_flux = _sample_fluxes_jax(
+            key_flux,
+            source_shape,
+            log_flux_edges,
+            log_flux_cdf,
+        ).reshape(-1)
+        alpha = (
+            alpha_mean
+            + alpha_sigma * jax.random.normal(key_alpha, source_shape, dtype=jnp.float32)
+        ).reshape(-1)
+
+        boosted_ra, boosted_dec, angle_to_dipole = _aberrate_points_jax(
+            source_ra,
+            source_dec,
+            observer_beta,
+            forward_matrix,
+            inverse_matrix,
+        )
+        gamma = 1.0 / jnp.sqrt(1.0 - observer_beta**2)
+        delta = gamma * (1.0 + observer_beta * jnp.cos(jnp.deg2rad(angle_to_dipole)))
+        dipole_flux = intrinsic_flux * jnp.power(delta, 1.0 + alpha)
+
+        pixel_indices = jax_ang2pix_nest_lonlat(nside, boosted_ra, boosted_dec)
+        in_mask = mask_map[pixel_indices]
+
+        tile_count = tile_counts[pixel_indices]
+        safe_tile_count = jnp.maximum(tile_count, 1)
+        tile_u = jax.random.uniform(key_tile, pixel_indices.shape, dtype=jnp.float32)
+        pixel_tile_cdf = tile_cdf[pixel_indices]
+        tile_choice = jnp.sum(tile_u[:, None] > pixel_tile_cdf, axis=1).astype(jnp.int32)
+        tile_choice = jnp.minimum(tile_choice, safe_tile_count - 1)
+        sampled_tile = tile_indices[pixel_indices, tile_choice]
+        sampled_tile = jnp.where(tile_count > 0, sampled_tile, -1)
+
+        safe_tile = jnp.maximum(sampled_tile, 0)
+        temperatures = tile_temperature_by_index[safe_tile]
+        valid_temperature = (sampled_tile >= 0) & jnp.isfinite(temperatures)
+        hot_temperature = jnp.maximum(temperatures - paf_reference_temp_c, 0.0)
+        enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
+        enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
+        systematics_flux = dipole_flux * enhancement
+
+        error_count = error_counts[pixel_indices]
+        safe_error_count = jnp.maximum(error_count, 1)
+        error_u = jax.random.uniform(key_error, pixel_indices.shape, dtype=jnp.float32)
+        error_choice = jnp.floor(error_u * safe_error_count.astype(jnp.float32)).astype(jnp.int32)
+        error_choice = jnp.minimum(error_choice, error_max_count - 1)
+        pixel_fractional_error = error_values_by_pixel[pixel_indices, error_choice]
+
+        global_choice = jax.random.randint(
+            key_global_error,
+            pixel_indices.shape,
+            minval=0,
+            maxval=global_error_values.shape[0],
+            dtype=jnp.int32,
+        )
+        global_fractional_error = global_error_values[global_choice]
+        base_fractional_error = jnp.where(
+            error_count > 0,
+            pixel_fractional_error,
+            global_fractional_error,
+        )
+        flux_sigma = (
+            base_fractional_error
+            * systematics_flux
+            * jnp.sqrt(1.0 + fractional_error_eta)
+        )
+        observed_flux = systematics_flux + jax.random.normal(
+            key_noise,
+            pixel_indices.shape,
+            dtype=jnp.float32,
+        ) * flux_sigma
+
+        keep = source_valid & in_mask & (sampled_tile >= 0) & (observed_flux >= flux_min)
+        density_accumulator = density_accumulator.at[pixel_indices].add(
+            keep.astype(jnp.float32)
+        )
+
+        temp_bin = jnp.searchsorted(temperature_edges, temperatures, side="right") - 1
+        temp_bin = jnp.clip(temp_bin, 0, n_temp_bins - 1).astype(jnp.int32)
+        log_flux_ratio = jnp.log10(jnp.maximum(observed_flux, flux_min) / flux_min)
+        flux_bin = jnp.floor(
+            jnp.clip(log_flux_ratio / flux_z_max, 0.0, 1.0 - jnp.finfo(jnp.float32).eps)
+            * n_flux_bins
+        ).astype(jnp.int32)
+        flux_bin = jnp.clip(flux_bin, 0, n_flux_bins - 1)
+        summary_keep = keep & valid_temperature & jnp.isfinite(log_flux_ratio)
+        flat_bin = temp_bin * n_flux_bins + flux_bin
+        hist_flat = flux_temperature_hist.reshape(-1)
+        hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
+        flux_temperature_hist = hist_flat.reshape((n_temp_bins, n_flux_bins))
+        return (density_accumulator, flux_temperature_hist), None
+
+    density = jnp.zeros((n_pix,), dtype=jnp.float32)
+    flux_temperature_hist = jnp.zeros((n_temp_bins, n_flux_bins), dtype=jnp.float32)
+
+    def fori_body(
+        chunk_index: jax.Array,
+        state: tuple[jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        state, _ = chunk_body(state, chunk_index)
+        return state
+
+    density, flux_temperature_hist = jax.lax.fori_loop(
+        jnp.asarray(0, dtype=jnp.int32),
+        n_chunks,
+        fori_body,
+        (density, flux_temperature_hist),
+    )
+    summary = _histogram_flux_quantiles_jax(
+        flux_temperature_hist,
+        flux_min,
+        flux_max,
+        quantiles,
+    )
+    return jnp.where(mask_map, density, jnp.nan), mask_map, summary
+
+
 @partial(
     jax.jit,
     static_argnames=(
@@ -542,11 +807,90 @@ def _simulate_batch_jax(
     )
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "cluster_model_code",
+        "nside",
+        "chunk_size",
+        "max_children",
+        "alpha_mean",
+        "alpha_sigma",
+        "cluster_r0_arcsec",
+        "cluster_r_cut_arcsec",
+        "paf_reference_temp_c",
+        "n_flux_bins",
+    ),
+)
+def _simulate_batch_jax_with_flux_temperature_summary(
+    keys: jax.Array,
+    parent_counts: jax.Array,
+    flux_mins: jax.Array,
+    p_clus: jax.Array,
+    clus_stop_prob: jax.Array,
+    lambda_clus: jax.Array,
+    observer_beta: jax.Array,
+    forward_matrices: jax.Array,
+    inverse_matrices: jax.Array,
+    temp_beta: jax.Array,
+    fractional_error_eta: jax.Array,
+    flux_maxes: jax.Array,
+    temperature_edges: jax.Array,
+    quantiles: jax.Array,
+    lookup_tuple: tuple[jax.Array, ...],
+    *,
+    cluster_model_code: int,
+    nside: int,
+    n_chunks: jax.Array,
+    chunk_size: int,
+    max_children: int,
+    alpha_mean: float,
+    alpha_sigma: float,
+    cluster_r0_arcsec: float,
+    cluster_r_cut_arcsec: float,
+    paf_reference_temp_c: float,
+    n_flux_bins: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return jax.vmap(
+        partial(
+            _simulate_one_jax_with_flux_temperature_summary,
+            temperature_edges=temperature_edges,
+            quantiles=quantiles,
+            lookup_tuple=lookup_tuple,
+            cluster_model_code=cluster_model_code,
+            nside=nside,
+            n_chunks=n_chunks,
+            chunk_size=chunk_size,
+            max_children=max_children,
+            alpha_mean=alpha_mean,
+            alpha_sigma=alpha_sigma,
+            cluster_r0_arcsec=cluster_r0_arcsec,
+            cluster_r_cut_arcsec=cluster_r_cut_arcsec,
+            paf_reference_temp_c=paf_reference_temp_c,
+            n_flux_bins=n_flux_bins,
+        )
+    )(
+        keys,
+        parent_counts,
+        flux_mins,
+        p_clus,
+        clus_stop_prob,
+        lambda_clus,
+        observer_beta,
+        forward_matrices,
+        inverse_matrices,
+        temp_beta,
+        fractional_error_eta,
+        flux_maxes,
+    )
+
+
 class RacsJax:
     """Fixed-shape JAX implementation of the RACS map simulator."""
 
     def __init__(self, config: RacsConfig):
         self.cfg = config
+        self.product = config.product
         self.nside = config.nside
         self.chunk_size = config.chunk_size
         self.downscale_nside = config.downscale_nside
@@ -554,12 +898,18 @@ class RacsJax:
         self.lookups_are_initialised = False
         self._lookup_arrays: Optional[_LookupArrays] = None
         self.mask_map: Optional[NDArray[np.bool_]] = None
+        self.tile_sbids: Optional[NDArray[np.int32]] = None
+        self._tile_index_from_sbid: dict[int, int] = {}
+        self.tile_temperature_by_index: Optional[NDArray[np.float32]] = None
+        self.flux_temperature_summary_flux_max_mjy: Optional[float] = None
 
     def initialise_data(self) -> None:
         reference = Racs(self.cfg)
         reference.initialise_data()
 
         self.mask_map = reference.mask_map.astype(np.bool_, copy=False)
+        self.tile_sbids = reference.tile_sbids.astype(np.int32, copy=False)
+        self._tile_index_from_sbid = dict(reference._tile_index_from_sbid)
 
         tile_counts = reference.sbid_mixture_counts.astype(np.int32, copy=False)
         tile_indices = _pad_flat_lookup(
@@ -598,6 +948,21 @@ class RacsJax:
                 np.float32,
                 copy=False,
             )
+        self.tile_temperature_by_index = tile_temperature_by_index
+
+        flux_quantile_bin = int(
+            np.searchsorted(
+                reference.log_flux_bin_cdf,
+                _DEFAULT_FLUX_TEMPERATURE_SUMMARY_FLUX_QUANTILE,
+                side="right",
+            )
+        )
+        flux_quantile_bin = int(
+            np.clip(flux_quantile_bin, 0, reference.log_flux_bin_edges.size - 2)
+        )
+        self.flux_temperature_summary_flux_max_mjy = float(
+            10.0 ** reference.log_flux_bin_edges[flux_quantile_bin + 1]
+        )
 
         self._lookup_arrays = _LookupArrays(
             log_flux_edges=jnp.asarray(reference.log_flux_bin_edges, dtype=jnp.float32),
@@ -618,6 +983,30 @@ class RacsJax:
             ),
         )
         self.lookups_are_initialised = True
+
+    def _downscale_batch_output(
+        self,
+        maps: np.ndarray,
+        masks: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.downscale_nside is None:
+            return maps, masks
+
+        coarse_maps = []
+        coarse_masks = []
+        for density_map, mask in zip(maps, masks):
+            coarse_map, coarse_mask = downgrade_ignore_nan(
+                density_map,
+                mask,
+                self.downscale_nside,
+            )
+            coarse_map = coarse_map.astype(np.float32, copy=False)
+            coarse_mask = coarse_mask.astype(np.bool_, copy=False)
+            coarse_map = coarse_map.copy()
+            coarse_map[~coarse_mask] = np.nan
+            coarse_maps.append(coarse_map)
+            coarse_masks.append(coarse_mask)
+        return np.stack(coarse_maps, axis=0), np.stack(coarse_masks, axis=0)
 
     def generate_dipole(
         self,
@@ -742,24 +1131,153 @@ class RacsJax:
 
         out_maps = np.concatenate(maps, axis=0)
         out_masks = np.concatenate(masks, axis=0)
-        if self.downscale_nside is not None:
-            coarse_maps = []
-            coarse_masks = []
-            for density_map, mask in zip(out_maps, out_masks):
-                coarse_map, coarse_mask = downgrade_ignore_nan(
-                    density_map,
-                    mask,
-                    self.downscale_nside,
+        return self._downscale_batch_output(out_maps, out_masks)
+
+    def batch_generate_dipole_with_flux_temperature_summary(
+        self,
+        theta: dict[str, np.ndarray | jax.Array],
+        key: jax.Array,
+        batch_size: int,
+        *,
+        temperature_edges: np.ndarray,
+        quantiles: tuple[float, ...] | np.ndarray,
+        n_flux_bins: int = 128,
+        flux_max_mjy: Optional[float] = None,
+        show_progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.lookups_are_initialised or self._lookup_arrays is None:
+            raise RuntimeError("Run initialise_data() before generating maps.")
+        if self.cfg.store_final_samples:
+            raise NotImplementedError(
+                "RacsJax does not support store_final_samples=True. "
+                "Use RacsConfig(..., store_final_samples=False)."
+            )
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        temperature_edges_np = np.asarray(temperature_edges, dtype=np.float32)
+        if temperature_edges_np.ndim != 1 or temperature_edges_np.size < 2:
+            raise ValueError("temperature_edges must be a one-dimensional array.")
+        if (
+            np.any(~np.isfinite(temperature_edges_np))
+            or np.any(np.diff(temperature_edges_np) <= 0)
+        ):
+            raise ValueError("temperature_edges must be finite and strictly increasing.")
+
+        quantiles_np = np.asarray(quantiles, dtype=np.float32)
+        if quantiles_np.ndim != 1 or quantiles_np.size == 0:
+            raise ValueError("At least one flux quantile is required.")
+        if np.any((quantiles_np < 0.0) | (quantiles_np > 1.0)):
+            raise ValueError("Flux quantiles must lie in [0, 1].")
+        if n_flux_bins < 1:
+            raise ValueError("n_flux_bins must be at least 1.")
+
+        parameters = self._normalise_theta(theta)
+        self._validate_parameters(parameters)
+        self._warn_if_cluster_cap_overfills(parameters)
+
+        resolved_flux_max = (
+            self.flux_temperature_summary_flux_max_mjy
+            if flux_max_mjy is None
+            else float(flux_max_mjy)
+        )
+        if resolved_flux_max is None or not np.isfinite(resolved_flux_max):
+            raise ValueError("flux_max_mjy must be finite.")
+        max_flux_min = float(np.max(parameters["flux_min"]))
+        if resolved_flux_max <= max_flux_min:
+            raise ValueError("flux_max_mjy must be greater than all simulated flux_min values.")
+
+        n_sims = parameters["log10_n_initial_samples"].shape[0]
+        root_keys = jax.random.split(key, n_sims)
+        maps: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        summaries: list[np.ndarray] = []
+
+        batch_starts = range(0, n_sims, batch_size)
+        if show_progress:
+            from tqdm import tqdm
+
+            batch_starts = tqdm(
+                batch_starts,
+                total=(n_sims + batch_size - 1) // batch_size,
+                unit="batch",
+                desc="simulating",
+            )
+
+        for start in batch_starts:
+            stop = min(start + batch_size, n_sims)
+            chunk = {name: values[start:stop] for name, values in parameters.items()}
+            parent_counts = self._parent_counts(chunk)
+            n_chunks = max(1, int(math.ceil(int(parent_counts.max(initial=0)) / self.chunk_size)))
+            forward, inverse = self._rotation_matrices_for_parameters(chunk)
+            actual_batch_size = stop - start
+
+            if actual_batch_size < batch_size:
+                pad_count = batch_size - actual_batch_size
+                chunk = {
+                    name: np.pad(values, (0, pad_count), mode="edge")
+                    for name, values in chunk.items()
+                }
+                parent_counts = np.pad(parent_counts, (0, pad_count), mode="constant")
+                forward = np.pad(forward, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
+                inverse = np.pad(inverse, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
+                batch_keys = jax.random.split(jax.random.fold_in(key, start), batch_size)
+            else:
+                batch_keys = root_keys[start:stop]
+
+            batch_maps, batch_masks, batch_summaries = (
+                _simulate_batch_jax_with_flux_temperature_summary(
+                    keys=jnp.asarray(batch_keys),
+                    parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
+                    flux_mins=jnp.asarray(chunk["flux_min"], dtype=jnp.float32),
+                    p_clus=jnp.asarray(chunk["p_clus"], dtype=jnp.float32),
+                    clus_stop_prob=jnp.asarray(chunk["clus_stop_prob"], dtype=jnp.float32),
+                    lambda_clus=jnp.asarray(chunk["lambda_clus"], dtype=jnp.float32),
+                    observer_beta=jnp.asarray(
+                        chunk["observer_speed"] * CMB_BETA,
+                        dtype=jnp.float32,
+                    ),
+                    forward_matrices=jnp.asarray(forward, dtype=jnp.float32),
+                    inverse_matrices=jnp.asarray(inverse, dtype=jnp.float32),
+                    temp_beta=jnp.asarray(chunk["temp_beta"], dtype=jnp.float32),
+                    fractional_error_eta=jnp.asarray(
+                        chunk["fractional_error_eta"],
+                        dtype=jnp.float32,
+                    ),
+                    flux_maxes=jnp.full(
+                        (batch_size,),
+                        resolved_flux_max,
+                        dtype=jnp.float32,
+                    ),
+                    temperature_edges=jnp.asarray(temperature_edges_np, dtype=jnp.float32),
+                    quantiles=jnp.asarray(quantiles_np, dtype=jnp.float32),
+                    lookup_tuple=self._lookup_arrays.as_tuple(),
+                    cluster_model_code=self._cluster_model_code(),
+                    nside=self.nside,
+                    n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
+                    chunk_size=self.chunk_size,
+                    max_children=self.max_cluster_children_per_parent,
+                    alpha_mean=float(self.cfg.alpha_mean),
+                    alpha_sigma=float(self.cfg.alpha_sigma),
+                    cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
+                    cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
+                    paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
+                    n_flux_bins=int(n_flux_bins),
                 )
-                coarse_map = coarse_map.astype(np.float32, copy=False)
-                coarse_mask = coarse_mask.astype(np.bool_, copy=False)
-                coarse_map = coarse_map.copy()
-                coarse_map[~coarse_mask] = np.nan
-                coarse_maps.append(coarse_map)
-                coarse_masks.append(coarse_mask)
-            out_maps = np.stack(coarse_maps, axis=0)
-            out_masks = np.stack(coarse_masks, axis=0)
-        return out_maps, out_masks
+            )
+            maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
+            masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
+            summaries.append(
+                np.asarray(batch_summaries[:actual_batch_size], dtype=np.float32)
+            )
+            if show_progress:
+                batch_starts.set_postfix(completed=stop, total=n_sims)
+
+        out_maps = np.concatenate(maps, axis=0)
+        out_masks = np.concatenate(masks, axis=0)
+        out_summaries = np.concatenate(summaries, axis=0)
+        out_maps, out_masks = self._downscale_batch_output(out_maps, out_masks)
+        return out_maps, out_masks, out_summaries
 
     def _cluster_model_code(self) -> int:
         if self.cfg.cluster_count_model == "geometric":
