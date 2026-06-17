@@ -16,6 +16,7 @@ class RacsCatalogueColumns:
     scan_start_mjd: str
     scan_length: str
     field_id: str
+    source_name: str
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ RACS_LOW3 = RacsProductSpec(
         scan_start_mjd="Scan_start_MJD",
         scan_length="Scan_length",
         field_id="Field_ID",
+        source_name="Name",
     ),
 )
 
@@ -70,6 +72,7 @@ RACS_MID1 = RacsProductSpec(
         scan_start_mjd="Scan_start_MJD",
         scan_length="Scan_length",
         field_id="Tile_ID",
+        source_name="Source_Name",
     ),
 )
 

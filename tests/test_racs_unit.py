@@ -737,11 +737,13 @@ class RacsInitialiseDataTests(unittest.TestCase):
         self.assertEqual(low3.data_loader_args, ("racs", "low3"))
         self.assertEqual(low3.data_dir_name, "racs_low3")
         self.assertEqual(low3.columns.dec, "Dec")
+        self.assertEqual(low3.columns.source_name, "Name")
         self.assertEqual(mid1, RACS_MID1)
         self.assertEqual(mid1.data_loader_args, ("racs", "mid1"))
         self.assertEqual(mid1.data_dir_name, "racs_mid1")
         self.assertEqual(mid1.columns.dec, "DEC")
         self.assertEqual(mid1.columns.field_id, "Tile_ID")
+        self.assertEqual(mid1.columns.source_name, "Source_Name")
 
         with self.assertRaisesRegex(ValueError, "Unknown RACS product"):
             resolve_racs_product("not-a-product")
@@ -762,6 +764,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 scan_start_mjd="scan_mjd",
                 scan_length="scan_duration",
                 field_id="field_name",
+                source_name="source_name",
             ),
         )
         sim = Racs(
