@@ -119,6 +119,14 @@ class RacsFluxErrorTests(unittest.TestCase):
         sim.apply_temperature_enhancement = lambda flux, enhancement, dtype=np.float64: (
             np.asarray(flux, dtype=dtype)
         )
+        sim.sample_elevations = lambda pixel_indices, rng=None: np.full(
+            pixel_indices.shape[0],
+            60.0,
+            dtype=np.float32,
+        )
+        sim.evaluate_elevation_enhancement = lambda elevations, elevation_amp, elevation_trough: (
+            np.ones(elevations.shape[0], dtype=np.float64)
+        )
         sim.add_flux_error = lambda flux, flux_error, rng=None, dtype=np.float64: (
             np.asarray(flux, dtype=dtype)
         )
@@ -295,6 +303,10 @@ class RacsFluxErrorTests(unittest.TestCase):
         expected_effective = np.full(n_samples, 0.2, dtype=np.float32)
         np.testing.assert_allclose(sim.final_base_fractional_error_samples, base_fractional_error)
         np.testing.assert_allclose(sim.final_fractional_error_samples, expected_effective)
+        np.testing.assert_allclose(
+            sim.final_elevation_samples,
+            np.full(n_samples, 60.0, dtype=np.float32),
+        )
 
         sampled_map = sim.sampled_fractional_error_map
         self.assertIsNotNone(sampled_map)
@@ -347,6 +359,34 @@ class RacsFluxErrorTests(unittest.TestCase):
                 temp_beta=np.nan,
             )
 
+    def test_evaluate_elevation_enhancement_uses_degree_angles(self):
+        enhancement = self.sim.evaluate_elevation_enhancement(
+            np.array([30.0, 120.0, 210.0], dtype=np.float32),
+            elevation_amp=0.5,
+            elevation_trough=30.0,
+        )
+
+        np.testing.assert_allclose(
+            enhancement,
+            np.array([1.0, 1.5, 2.0], dtype=self.sim.dtype),
+            rtol=1e-6,
+        )
+
+    def test_evaluate_elevation_enhancement_rejects_invalid_parameters(self):
+        with self.assertRaisesRegex(ValueError, "elevation_amp must be finite"):
+            self.sim.evaluate_elevation_enhancement(
+                np.array([60.0], dtype=np.float32),
+                elevation_amp=-0.1,
+                elevation_trough=30.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "elevation_trough must be finite"):
+            self.sim.evaluate_elevation_enhancement(
+                np.array([60.0], dtype=np.float32),
+                elevation_amp=0.1,
+                elevation_trough=np.nan,
+            )
+
     def test_generate_dipole_remains_finite_when_linear_enhancement_hits_floor(self):
         sim = self.sim
         self._configure_minimal_generate_dipole_sim(n_samples=8)
@@ -369,6 +409,39 @@ class RacsFluxErrorTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(sim.final_observed_flux_samples)))
         self.assertTrue(np.all(np.isfinite(sim.final_flux_error_samples)))
         self.assertTrue(np.all(sim.final_flux_error_samples >= 0.0))
+
+    def test_generate_dipole_applies_elevation_enhancement(self):
+        sim = self.sim
+        n_samples = 6
+        self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
+        sim.sample_elevations = lambda pixel_indices, rng=None: np.full(
+            pixel_indices.shape[0],
+            90.0,
+            dtype=np.float32,
+        )
+        sim.evaluate_elevation_enhancement = Racs.evaluate_elevation_enhancement.__get__(
+            sim,
+            Racs,
+        )
+        sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.zeros(
+            pixel_indices.shape[0],
+            dtype=np.float32,
+        )
+
+        sim.generate_dipole(
+            log10_n_initial_samples=np.log10(float(n_samples)),
+            elevation_amp=1.0,
+            elevation_trough=0.0,
+        )
+
+        np.testing.assert_allclose(
+            sim.final_observed_flux_samples,
+            np.full(n_samples, 200.0, dtype=np.float32),
+        )
+        np.testing.assert_allclose(
+            sim.final_elevation_samples,
+            np.full(n_samples, 90.0, dtype=np.float32),
+        )
 
     def test_generate_dipole_skips_clustering_when_p_clus_zero(self):
         sim = self.sim
@@ -738,12 +811,14 @@ class RacsInitialiseDataTests(unittest.TestCase):
         self.assertEqual(low3.data_dir_name, "racs_low3")
         self.assertEqual(low3.columns.dec, "Dec")
         self.assertEqual(low3.columns.source_name, "Name")
+        self.assertIsNone(low3.columns.elevation)
         self.assertEqual(mid1, RACS_MID1)
         self.assertEqual(mid1.data_loader_args, ("racs", "mid1"))
         self.assertEqual(mid1.data_dir_name, "racs_mid1")
         self.assertEqual(mid1.columns.dec, "DEC")
         self.assertEqual(mid1.columns.field_id, "Tile_ID")
         self.assertEqual(mid1.columns.source_name, "Source_Name")
+        self.assertEqual(mid1.columns.elevation, "ALT")
 
         with self.assertRaisesRegex(ValueError, "Unknown RACS product"):
             resolve_racs_product("not-a-product")
@@ -765,6 +840,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 scan_length="scan_duration",
                 field_id="field_name",
                 source_name="source_name",
+                elevation="source_alt",
             ),
         )
         sim = Racs(
@@ -786,6 +862,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 "scan_mjd": np.array([60000.0, 60000.0, 60001.0, 60002.0]),
                 "scan_duration": np.array([10.0, 10.0, 12.0, 14.0]),
                 "field_name": np.array(["a", "a", "b", "c"]),
+                "source_alt": np.array([40.0, 45.0, 50.0, 55.0]),
             }
         )
         sim.catalogue_is_loaded = True
@@ -794,12 +871,62 @@ class RacsInitialiseDataTests(unittest.TestCase):
         sim.build_tile_metadata()
         sim.build_tile_lookup()
         sim.build_fractional_error_lookup()
+        sim.build_elevation_lookup()
         sim.load_mask_map()
 
         np.testing.assert_array_equal(sim.tile_sbids, np.array([101, 202, 303], dtype=np.int32))
         self.assertEqual(sim.log_flux_bin_cdf[-1], 1.0)
         self.assertGreater(sim.error_lookup_fractional_values.size, 0)
+        self.assertGreater(sim.elevation_lookup_values.size, 0)
         np.testing.assert_array_equal(sim.mask_map, sim.tile_lookup_map >= 0)
+
+    def test_build_elevation_lookup_rejects_missing_elevation_column(self):
+        sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+        sim.catalogue = Table(
+            {
+                "RA": np.array([0.0]),
+                "Dec": np.array([0.0]),
+            }
+        )
+        sim.catalogue_is_loaded = True
+
+        with self.assertRaisesRegex(ValueError, "does not define an elevation column"):
+            sim.build_elevation_lookup()
+
+    def test_sample_elevations_uses_pixel_values_and_global_fallback(self):
+        product = RacsProductSpec(
+            key="synthetic",
+            label="Synthetic RACS",
+            data_loader_catalogue="racs",
+            data_loader_variant="synthetic",
+            data_dir_name="racs_synthetic",
+            columns=RacsCatalogueColumns(
+                ra="RA",
+                dec="Dec",
+                tile_id="SBID",
+                total_flux="Total_flux",
+                total_flux_error="E_Total_flux",
+                scan_start_mjd="Scan_start_MJD",
+                scan_length="Scan_length",
+                field_id="Field_ID",
+                source_name="Name",
+                elevation="ALT",
+            ),
+        )
+        sim = Racs(RacsConfig(product=product, flux_min=15.0, nside=1, chunk_size=16))
+        n_pix = hp.nside2npix(sim.nside)
+        sim.elevation_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
+        sim.elevation_lookup_pixel_counts[0] = 2
+        sim.elevation_lookup_pixel_starts = np.zeros(n_pix, dtype=np.int64)
+        sim.elevation_lookup_values = np.array([10.0, 20.0], dtype=np.float32)
+
+        samples = sim.sample_elevations(
+            np.array([0, 1], dtype=np.int64),
+            rng=np.random.default_rng(3),
+        )
+
+        self.assertIn(float(samples[0]), {10.0, 20.0})
+        self.assertIn(float(samples[1]), {10.0, 20.0})
 
     def test_config_rejects_invalid_clustering_parameters(self):
         with self.assertRaisesRegex(ValueError, "cluster_r0_arcsec must be positive"):
@@ -836,7 +963,27 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
     def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):
         with TemporaryDirectory() as tmpdir:
-            sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+            product = RacsProductSpec(
+                key="synthetic",
+                label="Synthetic RACS",
+                data_loader_catalogue="racs",
+                data_loader_variant="synthetic",
+                data_dir_name="racs_synthetic",
+                default_mask_filename="mask.npy",
+                columns=RacsCatalogueColumns(
+                    ra="RA",
+                    dec="Dec",
+                    tile_id="SBID",
+                    total_flux="Total_flux",
+                    total_flux_error="E_Total_flux",
+                    scan_start_mjd="Scan_start_MJD",
+                    scan_length="Scan_length",
+                    field_id="Field_ID",
+                    source_name="Name",
+                    elevation="ALT",
+                ),
+            )
+            sim = Racs(RacsConfig(product=product, flux_min=15.0, nside=64, chunk_size=16))
             cache_dir = Path(tmpdir)
             n_pix = hp.nside2npix(sim.nside)
 
@@ -887,6 +1034,18 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.save_temperature_lookup()
             self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.png").exists())
 
+            sim.elevation_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
+            sim.elevation_lookup_pixel_counts[:2] = 1
+            sim.elevation_lookup_pixel_starts = np.zeros(n_pix, dtype=np.int64)
+            sim.elevation_lookup_pixel_starts[1] = 1
+            sim.elevation_lookup_values = np.array([50.0, 60.0], dtype=np.float32)
+            sim.elevation_map = np.full(n_pix, np.nan, dtype=np.float32)
+            sim.elevation_map[:2] = np.array([50.0, 60.0], dtype=np.float32)
+            sim.save_elevation_lookup()
+            self.assertTrue((cache_dir / "elevation_lookup_nside64.png").exists())
+            self.assertTrue((cache_dir / "elevation_lookup_eq.png").exists())
+            self.assertTrue((cache_dir / "elevation_lookup_gal.png").exists())
+
             sim.load_catalogue = lambda: (_ for _ in ()).throw(
                 AssertionError("initialise_data() unexpectedly loaded the catalogue")
             )
@@ -900,6 +1059,10 @@ class RacsInitialiseDataTests(unittest.TestCase):
             np.testing.assert_allclose(
                 sim.temperature_map[:2],
                 np.array([20.0, 21.0], dtype=np.float32),
+            )
+            np.testing.assert_allclose(
+                sim.elevation_map[:2],
+                np.array([50.0, 60.0], dtype=np.float32),
             )
             np.testing.assert_array_equal(sim.sbid_mixture_tile_indices, np.array([0, 1], dtype=np.int32))
 

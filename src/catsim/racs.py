@@ -177,6 +177,7 @@ class Racs:
         self._coarse_density_map: Optional[NDArray[np.float32]] = None
         self._coarse_mask: Optional[NDArray[np.bool_]] = None
         self.temperature_map: Optional[NDArray[np.float32]] = None
+        self.elevation_map: Optional[NDArray[np.float32]] = None
         self.fractional_error_map: Optional[NDArray[np.float32]] = None
         self.sampled_fractional_error_map: Optional[NDArray[np.float32]] = None
 
@@ -191,6 +192,7 @@ class Racs:
         self.final_longitudes: Optional[NDArray[np.float32]] = None
         self.final_latitudes: Optional[NDArray[np.float32]] = None
         self.final_temperature_samples: Optional[NDArray[np.float32]] = None
+        self.final_elevation_samples: Optional[NDArray[np.float32]] = None
 
     def _cache_dir(self) -> Path:
         return Path(__file__).resolve().parent / "data" / self.product.data_dir_name / "lookups"
@@ -212,6 +214,9 @@ class Racs:
 
     def _open_meteo_temperature_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"temperature_lookup_nside{self.nside}_open_meteo.npz"
+
+    def _elevation_lookup_cache_path(self) -> Path:
+        return self._cache_dir() / f"elevation_lookup_nside{self.nside}.npz"
 
     def _fractional_error_lookup_cache_path(self) -> Path:
         flux_token = str(self.cfg.fractional_error_flux_min_mjy).replace(".", "p")
@@ -729,6 +734,131 @@ class Racs:
         self.build_temperature_map()
         return True
 
+    def build_elevation_lookup(self) -> None:
+        """Build a per-pixel empirical lookup of source elevations in degrees."""
+        assert self.catalogue_is_loaded, "Load the catalogue before building elevation lookups."
+        if self.product.columns.elevation is None:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "source-elevation systematics require catalogue ALT data."
+            )
+        if self.product.columns.elevation not in self.catalogue.colnames:
+            raise ValueError(
+                f"{self.product.label} catalogue is missing elevation column "
+                f"{self.product.columns.elevation!r}."
+            )
+
+        ra = np.asarray(self.catalogue[self.product.columns.ra], dtype=np.float64)
+        dec = np.asarray(self.catalogue[self.product.columns.dec], dtype=np.float64)
+        elevation = np.asarray(
+            self.catalogue[self.product.columns.elevation],
+            dtype=np.float64,
+        )
+
+        valid = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(elevation)
+        if not np.any(valid):
+            raise ValueError("No valid source elevations available to build elevation lookup.")
+
+        pixel_indices = hp.ang2pix(
+            self.nside,
+            ra[valid],
+            dec[valid],
+            lonlat=True,
+            nest=True,
+        ).astype(np.int64, copy=False)
+        elevation_values = elevation[valid].astype(np.float32, copy=False)
+
+        order = np.argsort(pixel_indices, kind="stable")
+        pix_sorted = pixel_indices[order]
+        elevation_sorted = elevation_values[order]
+
+        n_pix = hp.nside2npix(self.nside)
+        counts = np.bincount(pix_sorted, minlength=n_pix).astype(np.int64)
+        starts = np.cumsum(counts, dtype=np.int64) - counts
+
+        self.elevation_lookup_pixel_counts = counts
+        self.elevation_lookup_pixel_starts = starts
+        self.elevation_lookup_values = elevation_sorted
+
+        elevation_map = np.full(n_pix, np.nan, dtype=np.float32)
+        populated = counts > 0
+        if np.any(populated):
+            for pix in np.flatnonzero(populated):
+                start = starts[pix]
+                count = counts[pix]
+                elevation_map[pix] = np.median(elevation_sorted[start:start + count])
+        self.elevation_map = elevation_map
+
+    def save_elevation_lookup(self) -> None:
+        """Persist the per-pixel source-elevation lookup."""
+        cache_path = self._elevation_lookup_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            nside=np.asarray(self.nside, dtype=np.int64),
+            elevation_column=np.asarray(self.product.columns.elevation or ""),
+            counts=self.elevation_lookup_pixel_counts.astype(np.int64, copy=False),
+            starts=self.elevation_lookup_pixel_starts.astype(np.int64, copy=False),
+            elevation=self.elevation_lookup_values.astype(np.float32, copy=False),
+        )
+        if self.elevation_map is not None:
+            self._save_lookup_map_png(
+                self.elevation_map,
+                cache_path.with_suffix(".png"),
+                title=f"{self.product.label} Elevation Lookup (nside={self.nside})",
+                unit="deg",
+                cmap="viridis",
+            )
+            for coord, coord_str in zip([['C'], ['C', 'G']], ['eq', 'gal']):
+                self._save_lookup_map_png(
+                    self.elevation_map,
+                    self._cache_dir() / f"elevation_lookup_{coord_str}.png",
+                    title=f"{self.product.label} Elevation Lookup (nside={self.nside})",
+                    unit="deg",
+                    cmap="viridis",
+                    coord=coord,
+                )
+
+    def load_elevation_lookup(self) -> bool:
+        """Load the cached per-pixel elevation lookup if available."""
+        if self.product.columns.elevation is None:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "source-elevation systematics require catalogue ALT data."
+            )
+
+        cache_path = self._elevation_lookup_cache_path()
+        if not cache_path.exists():
+            return False
+
+        with np.load(cache_path) as data:
+            cache_nside = int(data["nside"])
+            if cache_nside != self.nside:
+                return False
+            if "elevation_column" in data.files:
+                cache_column = str(data["elevation_column"])
+                if cache_column != self.product.columns.elevation:
+                    return False
+            self.elevation_lookup_pixel_counts = data["counts"].astype(np.int64, copy=False)
+            self.elevation_lookup_pixel_starts = data["starts"].astype(np.int64, copy=False)
+            self.elevation_lookup_values = data["elevation"].astype(np.float32, copy=False)
+
+        if self.elevation_lookup_values.size == 0:
+            raise ValueError("Cached elevation lookup contains no elevation samples.")
+
+        n_pix = hp.nside2npix(self.nside)
+        elevation_map = np.full(n_pix, np.nan, dtype=np.float32)
+        populated = self.elevation_lookup_pixel_counts > 0
+        if np.any(populated):
+            for pix in np.flatnonzero(populated):
+                start = self.elevation_lookup_pixel_starts[pix]
+                count = self.elevation_lookup_pixel_counts[pix]
+                elevation_map[pix] = np.median(
+                    self.elevation_lookup_values[start:start + count]
+                )
+        self.elevation_map = elevation_map
+        return True
+
     def _temperature_lookup_cache_matches_paf_config(
         self,
         data: np.lib.npyio.NpzFile,
@@ -894,6 +1024,57 @@ class Racs:
             out[~valid] = self.error_lookup_fractional_values[pick]
 
         return out
+
+    def sample_elevations(
+        self,
+        pixel_indices: NDArray[np.int_],
+        rng: Optional[np.random.Generator] = None,
+    ) -> NDArray[np.float32]:
+        """Sample source elevations in degrees from each pixel's empirical distribution."""
+        assert hasattr(self, "elevation_lookup_pixel_counts"), "Run initialise_data() first."
+        if rng is None:
+            rng = np.random.default_rng()
+
+        pix = np.asarray(pixel_indices, dtype=np.int64)
+        counts = self.elevation_lookup_pixel_counts[pix]
+        starts = self.elevation_lookup_pixel_starts[pix]
+
+        out = np.empty(pix.shape[0], dtype=np.float32)
+        valid = counts > 0
+        if np.any(valid):
+            rand_offsets = rng.integers(0, counts[valid], dtype=np.int64)
+            pick = starts[valid] + rand_offsets
+            out[valid] = self.elevation_lookup_values[pick]
+
+        if np.any(~valid):
+            if self.elevation_lookup_values.size == 0:
+                raise ValueError("Elevation lookup contains no global fallback samples.")
+            pick = rng.integers(
+                0,
+                self.elevation_lookup_values.size,
+                size=np.count_nonzero(~valid),
+                dtype=np.int64,
+            )
+            out[~valid] = self.elevation_lookup_values[pick]
+
+        return out
+
+    def evaluate_elevation_enhancement(
+        self,
+        elevations_deg: NDArray[np.floating],
+        elevation_amp: float,
+        elevation_trough: float,
+    ) -> NDArray[np.floating]:
+        """Evaluate the source-elevation flux enhancement for degree-valued angles."""
+        if not np.isfinite(elevation_amp) or elevation_amp < 0:
+            raise ValueError("elevation_amp must be finite and non-negative.")
+        if not np.isfinite(elevation_trough):
+            raise ValueError("elevation_trough must be finite.")
+
+        elevations = np.asarray(elevations_deg, dtype=np.float64)
+        delta_rad = np.deg2rad(elevations - elevation_trough)
+        enhancement = 1.0 + elevation_amp * (1.0 - np.cos(delta_rad))
+        return enhancement.astype(self.dtype, copy=False)
 
     def compute_total_flux_error(
         self,
@@ -1068,6 +1249,7 @@ class Racs:
         need_tile_lookup = not self.load_tile_lookup()
         need_sbid_mixture_lookup = False
         need_fractional_error_lookup = not self.load_fractional_error_lookup()
+        need_elevation_lookup = not self.load_elevation_lookup()
 
         if not need_tile_metadata:
             need_sbid_mixture_lookup = not self.load_sbid_mixture_lookup()
@@ -1078,6 +1260,7 @@ class Racs:
             or need_tile_lookup
             or need_sbid_mixture_lookup
             or need_fractional_error_lookup
+            or need_elevation_lookup
         ):
             if not self.catalogue_is_loaded:
                 self.load_catalogue()
@@ -1099,6 +1282,9 @@ class Racs:
                 if need_fractional_error_lookup:
                     self.build_fractional_error_lookup()
                     self.save_fractional_error_lookup()
+                if need_elevation_lookup:
+                    self.build_elevation_lookup()
+                    self.save_elevation_lookup()
             finally:
                 self.release_catalogue()
 
@@ -1427,6 +1613,8 @@ class Racs:
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
         temp_beta: float = 0.0,
+        elevation_amp: float = 0.0,
+        elevation_trough: float = 0.0,
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
@@ -1518,6 +1706,7 @@ class Racs:
         final_ra: list[NDArray[np.float32]] = []
         final_dec: list[NDArray[np.float32]] = []
         final_temperature: list[NDArray[np.float32]] = []
+        final_elevation: list[NDArray[np.float32]] = []
 
         for start in range(0, n_samples, self.chunk_size):
             current_chunk = min(self.chunk_size, n_samples - start)
@@ -1597,6 +1786,16 @@ class Racs:
                 enhancement,
                 dtype=self.dtype,
             )
+            elevations = self.sample_elevations(pixel_indices, rng=rng)
+            elevation_enhancement = self.evaluate_elevation_enhancement(
+                elevations,
+                elevation_amp=elevation_amp,
+                elevation_trough=elevation_trough,
+            )
+            systematics_flux = (
+                np.asarray(systematics_flux, dtype=np.float64)
+                * np.asarray(elevation_enhancement, dtype=np.float64)
+            ).astype(self.dtype, copy=False)
             base_fractional_error = self.sample_fractional_errors(pixel_indices, rng=rng)
             flux_error = self.compute_total_flux_error(
                 systematics_flux,
@@ -1651,6 +1850,7 @@ class Racs:
                 final_ra.append(boosted_ra_deg[keep].astype(np.float32, copy=False))
                 final_dec.append(boosted_dec_deg[keep].astype(np.float32, copy=False))
                 final_temperature.append(temperatures[keep].astype(np.float32, copy=False))
+                final_elevation.append(elevations[keep].astype(np.float32, copy=False))
 
         self._density_map = density_accumulator.astype(np.float32, copy=False)
         sampled_fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
@@ -1701,6 +1901,9 @@ class Racs:
             self.final_temperature_samples = (
                 np.concatenate(final_temperature) if final_temperature else np.empty(0, dtype=np.float32)
             )
+            self.final_elevation_samples = (
+                np.concatenate(final_elevation) if final_elevation else np.empty(0, dtype=np.float32)
+            )
         else:
             self.final_intrinsic_flux_samples = None
             self.final_observed_flux_samples = None
@@ -1713,6 +1916,7 @@ class Racs:
             self.final_longitudes = None
             self.final_latitudes = None
             self.final_temperature_samples = None
+            self.final_elevation_samples = None
 
         return output_map, output_mask
 

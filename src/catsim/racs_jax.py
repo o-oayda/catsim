@@ -46,6 +46,9 @@ class _LookupArrays:
     error_counts: jax.Array
     error_values_by_pixel: jax.Array
     global_error_values: jax.Array
+    elevation_counts: jax.Array
+    elevation_values_by_pixel: jax.Array
+    global_elevation_values: jax.Array
     tile_temperature_by_index: jax.Array
 
     def as_tuple(self) -> tuple[jax.Array, ...]:
@@ -59,6 +62,9 @@ class _LookupArrays:
             self.error_counts,
             self.error_values_by_pixel,
             self.global_error_values,
+            self.elevation_counts,
+            self.elevation_values_by_pixel,
+            self.global_elevation_values,
             self.tile_temperature_by_index,
         )
 
@@ -342,6 +348,8 @@ def _simulate_one_jax(
     forward_matrix: jax.Array,
     inverse_matrix: jax.Array,
     temp_beta: jax.Array,
+    elevation_amp: jax.Array,
+    elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
@@ -366,6 +374,9 @@ def _simulate_one_jax(
         error_counts,
         error_values_by_pixel,
         global_error_values,
+        elevation_counts,
+        elevation_values_by_pixel,
+        global_elevation_values,
         tile_temperature_by_index,
     ) = lookup_tuple
 
@@ -373,6 +384,7 @@ def _simulate_one_jax(
     source_slots = 1 + max_children
     child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
     error_max_count = error_values_by_pixel.shape[1]
+    elevation_max_count = elevation_values_by_pixel.shape[1]
 
     def chunk_body(accumulator: jax.Array, chunk_index: jax.Array) -> tuple[jax.Array, None]:
         chunk_key = jax.random.fold_in(key, chunk_index)
@@ -383,10 +395,12 @@ def _simulate_one_jax(
             key_flux,
             key_alpha,
             key_tile,
+            key_elevation,
             key_error,
             key_global_error,
+            key_global_elevation,
             key_noise,
-        ) = jax.random.split(chunk_key, 9)
+        ) = jax.random.split(chunk_key, 11)
 
         parent_indices = chunk_index * chunk_size + jnp.arange(chunk_size, dtype=jnp.int32)
         parent_valid = parent_indices < parent_count
@@ -464,6 +478,32 @@ def _simulate_one_jax(
         enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
         enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         systematics_flux = dipole_flux * enhancement
+
+        elevation_count = elevation_counts[pixel_indices]
+        safe_elevation_count = jnp.maximum(elevation_count, 1)
+        elevation_u = jax.random.uniform(
+            key_elevation,
+            pixel_indices.shape,
+            dtype=jnp.float32,
+        )
+        elevation_choice = jnp.floor(
+            elevation_u * safe_elevation_count.astype(jnp.float32)
+        ).astype(jnp.int32)
+        elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
+        pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
+
+        global_elevation_choice = jax.random.randint(
+            key_global_elevation,
+            pixel_indices.shape,
+            minval=0,
+            maxval=global_elevation_values.shape[0],
+            dtype=jnp.int32,
+        )
+        global_elevation = global_elevation_values[global_elevation_choice]
+        elevation = jnp.where(elevation_count > 0, pixel_elevation, global_elevation)
+        elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
+        elevation_enhancement = 1.0 + elevation_amp * (1.0 - jnp.cos(elevation_delta_rad))
+        systematics_flux = systematics_flux * elevation_enhancement
 
         error_count = error_counts[pixel_indices]
         safe_error_count = jnp.maximum(error_count, 1)
@@ -526,6 +566,8 @@ def _simulate_one_jax_with_flux_temperature_summary(
     forward_matrix: jax.Array,
     inverse_matrix: jax.Array,
     temp_beta: jax.Array,
+    elevation_amp: jax.Array,
+    elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
     flux_max: jax.Array,
     temperature_edges: jax.Array,
@@ -554,6 +596,9 @@ def _simulate_one_jax_with_flux_temperature_summary(
         error_counts,
         error_values_by_pixel,
         global_error_values,
+        elevation_counts,
+        elevation_values_by_pixel,
+        global_elevation_values,
         tile_temperature_by_index,
     ) = lookup_tuple
 
@@ -561,6 +606,7 @@ def _simulate_one_jax_with_flux_temperature_summary(
     source_slots = 1 + max_children
     child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
     error_max_count = error_values_by_pixel.shape[1]
+    elevation_max_count = elevation_values_by_pixel.shape[1]
     n_temp_bins = temperature_edges.shape[0] - 1
     flux_z_max = jnp.maximum(
         jnp.log10(flux_max / flux_min),
@@ -580,10 +626,12 @@ def _simulate_one_jax_with_flux_temperature_summary(
             key_flux,
             key_alpha,
             key_tile,
+            key_elevation,
             key_error,
             key_global_error,
+            key_global_elevation,
             key_noise,
-        ) = jax.random.split(chunk_key, 9)
+        ) = jax.random.split(chunk_key, 11)
 
         parent_indices = chunk_index * chunk_size + jnp.arange(chunk_size, dtype=jnp.int32)
         parent_valid = parent_indices < parent_count
@@ -661,6 +709,32 @@ def _simulate_one_jax_with_flux_temperature_summary(
         enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
         enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         systematics_flux = dipole_flux * enhancement
+
+        elevation_count = elevation_counts[pixel_indices]
+        safe_elevation_count = jnp.maximum(elevation_count, 1)
+        elevation_u = jax.random.uniform(
+            key_elevation,
+            pixel_indices.shape,
+            dtype=jnp.float32,
+        )
+        elevation_choice = jnp.floor(
+            elevation_u * safe_elevation_count.astype(jnp.float32)
+        ).astype(jnp.int32)
+        elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
+        pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
+
+        global_elevation_choice = jax.random.randint(
+            key_global_elevation,
+            pixel_indices.shape,
+            minval=0,
+            maxval=global_elevation_values.shape[0],
+            dtype=jnp.int32,
+        )
+        global_elevation = global_elevation_values[global_elevation_choice]
+        elevation = jnp.where(elevation_count > 0, pixel_elevation, global_elevation)
+        elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
+        elevation_enhancement = 1.0 + elevation_amp * (1.0 - jnp.cos(elevation_delta_rad))
+        systematics_flux = systematics_flux * elevation_enhancement
 
         error_count = error_counts[pixel_indices]
         safe_error_count = jnp.maximum(error_count, 1)
@@ -763,6 +837,8 @@ def _simulate_batch_jax(
     forward_matrices: jax.Array,
     inverse_matrices: jax.Array,
     temp_beta: jax.Array,
+    elevation_amp: jax.Array,
+    elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
@@ -803,6 +879,8 @@ def _simulate_batch_jax(
         forward_matrices,
         inverse_matrices,
         temp_beta,
+        elevation_amp,
+        elevation_trough,
         fractional_error_eta,
     )
 
@@ -833,6 +911,8 @@ def _simulate_batch_jax_with_flux_temperature_summary(
     forward_matrices: jax.Array,
     inverse_matrices: jax.Array,
     temp_beta: jax.Array,
+    elevation_amp: jax.Array,
+    elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
     flux_maxes: jax.Array,
     temperature_edges: jax.Array,
@@ -880,6 +960,8 @@ def _simulate_batch_jax_with_flux_temperature_summary(
         forward_matrices,
         inverse_matrices,
         temp_beta,
+        elevation_amp,
+        elevation_trough,
         fractional_error_eta,
         flux_maxes,
     )
@@ -936,6 +1018,17 @@ class RacsJax:
             fill_value=0.0,
             dtype=np.float32,
         )
+        elevation_counts = reference.elevation_lookup_pixel_counts.astype(
+            np.int32,
+            copy=False,
+        )
+        elevation_values_by_pixel = _pad_flat_lookup(
+            elevation_counts,
+            reference.elevation_lookup_pixel_starts,
+            reference.elevation_lookup_values,
+            fill_value=0.0,
+            dtype=np.float32,
+        )
 
         if reference.tile_temperature_by_index is None:
             tile_temperature_by_index = np.full(
@@ -975,6 +1068,15 @@ class RacsJax:
             error_values_by_pixel=jnp.asarray(error_values_by_pixel, dtype=jnp.float32),
             global_error_values=jnp.asarray(
                 reference.error_lookup_fractional_values,
+                dtype=jnp.float32,
+            ),
+            elevation_counts=jnp.asarray(elevation_counts, dtype=jnp.int32),
+            elevation_values_by_pixel=jnp.asarray(
+                elevation_values_by_pixel,
+                dtype=jnp.float32,
+            ),
+            global_elevation_values=jnp.asarray(
+                reference.elevation_lookup_values,
                 dtype=jnp.float32,
             ),
             tile_temperature_by_index=jnp.asarray(
@@ -1019,6 +1121,8 @@ class RacsJax:
         dipole_longitude: float = CMB_L,
         dipole_latitude: float = CMB_B,
         temp_beta: float = 0.0,
+        elevation_amp: float = 0.0,
+        elevation_trough: float = 0.0,
         fractional_error_eta: float = 0.0,
         key: Optional[jax.Array] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1034,6 +1138,8 @@ class RacsJax:
             "dipole_longitude": np.asarray([dipole_longitude]),
             "dipole_latitude": np.asarray([dipole_latitude]),
             "temp_beta": np.asarray([temp_beta]),
+            "elevation_amp": np.asarray([elevation_amp]),
+            "elevation_trough": np.asarray([elevation_trough]),
             "fractional_error_eta": np.asarray([fractional_error_eta]),
         }
         maps, masks = self.batch_generate_dipole(theta, key, batch_size=1)
@@ -1108,6 +1214,11 @@ class RacsJax:
                 forward_matrices=jnp.asarray(forward, dtype=jnp.float32),
                 inverse_matrices=jnp.asarray(inverse, dtype=jnp.float32),
                 temp_beta=jnp.asarray(chunk["temp_beta"], dtype=jnp.float32),
+                elevation_amp=jnp.asarray(chunk["elevation_amp"], dtype=jnp.float32),
+                elevation_trough=jnp.asarray(
+                    chunk["elevation_trough"],
+                    dtype=jnp.float32,
+                ),
                 fractional_error_eta=jnp.asarray(
                     chunk["fractional_error_eta"],
                     dtype=jnp.float32,
@@ -1240,6 +1351,14 @@ class RacsJax:
                     forward_matrices=jnp.asarray(forward, dtype=jnp.float32),
                     inverse_matrices=jnp.asarray(inverse, dtype=jnp.float32),
                     temp_beta=jnp.asarray(chunk["temp_beta"], dtype=jnp.float32),
+                    elevation_amp=jnp.asarray(
+                        chunk["elevation_amp"],
+                        dtype=jnp.float32,
+                    ),
+                    elevation_trough=jnp.asarray(
+                        chunk["elevation_trough"],
+                        dtype=jnp.float32,
+                    ),
                     fractional_error_eta=jnp.asarray(
                         chunk["fractional_error_eta"],
                         dtype=jnp.float32,
@@ -1307,6 +1426,8 @@ class RacsJax:
             "dipole_longitude": CMB_L,
             "dipole_latitude": CMB_B,
             "temp_beta": 0.0,
+            "elevation_amp": 0.0,
+            "elevation_trough": 0.0,
             "fractional_error_eta": 0.0,
         }
         out: dict[str, NDArray[np.float64]] = {
@@ -1330,6 +1451,12 @@ class RacsJax:
             raise ValueError("flux_min must be positive.")
         if np.any(parameters["temp_beta"] < 0) or np.any(~np.isfinite(parameters["temp_beta"])):
             raise ValueError("temp_beta must be finite and non-negative.")
+        if np.any(parameters["elevation_amp"] < 0) or np.any(
+            ~np.isfinite(parameters["elevation_amp"])
+        ):
+            raise ValueError("elevation_amp must be finite and non-negative.")
+        if np.any(~np.isfinite(parameters["elevation_trough"])):
+            raise ValueError("elevation_trough must be finite.")
         if np.any(parameters["fractional_error_eta"] < 0):
             raise ValueError("fractional_error_eta must be non-negative.")
 

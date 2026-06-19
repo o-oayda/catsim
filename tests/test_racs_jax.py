@@ -7,7 +7,7 @@ import unittest
 import healpy as hp
 import numpy as np
 
-from catsim import RacsLow3, RacsLow3Config, batch_simulate
+from catsim import RACS_MID1, Racs, RacsConfig, RacsLow3, RacsLow3Config, batch_simulate
 from catsim.utils.rng import prng_key
 
 try:
@@ -140,15 +140,16 @@ except ImportError as exc:
 class RacsJaxTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from catsim import RacsLow3Jax
+        from catsim import RacsJax
 
-        cfg = RacsLow3Config(
+        cfg = RacsConfig(
+            product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
             store_final_samples=False,
             max_cluster_children_per_parent=4,
         )
-        cls.sim = RacsLow3Jax(cfg)
+        cls.sim = RacsJax(cfg)
         cls.sim.initialise_data()
 
     def test_healpix_ang2pix_matches_healpy_for_representative_points(self):
@@ -180,6 +181,8 @@ class RacsJaxTests(unittest.TestCase):
             "log10_n_initial_samples": np.log10(np.array([4.0, 8.0])),
             "p_clus": np.array([0.0, 0.5]),
             "clus_stop_prob": np.array([1.0, 0.8]),
+            "elevation_amp": np.array([0.0, 0.1]),
+            "elevation_trough": np.array([45.0, 50.0]),
         }
         maps, masks = self.sim.batch_generate_dipole(
             theta,
@@ -254,6 +257,17 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(low_masks.shape, high_masks.shape)
         np.testing.assert_array_equal(low_masks, high_masks)
 
+    def test_batch_generate_dipole_rejects_invalid_elevation_amp(self):
+        with self.assertRaisesRegex(ValueError, "elevation_amp must be finite"):
+            self.sim.batch_generate_dipole(
+                {
+                    "log10_n_initial_samples": np.full(1, 1.0),
+                    "elevation_amp": np.array([-0.1], dtype=np.float32),
+                },
+                jax.random.PRNGKey(704),
+                batch_size=1,
+            )
+
     def test_batch_generate_dipole_pads_final_host_batch(self):
         maps, masks = self.sim.batch_generate_dipole(
             {"log10_n_initial_samples": np.full(3, 1.0)},
@@ -276,16 +290,17 @@ class RacsJaxTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(density_map[mask])))
 
     def test_poisson_clustering_path_runs(self):
-        from catsim import RacsLow3Jax
+        from catsim import RacsJax
 
-        cfg = RacsLow3Config(
+        cfg = RacsConfig(
+            product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
             store_final_samples=False,
             cluster_count_model="poisson",
             max_cluster_children_per_parent=6,
         )
-        sim = RacsLow3Jax(cfg)
+        sim = RacsJax(cfg)
         sim.initialise_data()
 
         density_map, mask = sim.generate_dipole(
@@ -298,15 +313,16 @@ class RacsJaxTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(density_map[mask])))
 
     def test_overfill_probability_warning_is_explicit(self):
-        from catsim import RacsLow3Jax
+        from catsim import RacsJax
 
-        cfg = RacsLow3Config(
+        cfg = RacsConfig(
+            product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
             store_final_samples=False,
             max_cluster_children_per_parent=2,
         )
-        sim = RacsLow3Jax(cfg)
+        sim = RacsJax(cfg)
         sim.initialise_data()
 
         with self.assertWarnsRegex(
@@ -321,14 +337,15 @@ class RacsJaxTests(unittest.TestCase):
             )
 
     def test_store_final_samples_is_not_supported(self):
-        from catsim import RacsLow3Jax
+        from catsim import RacsJax
 
-        cfg = RacsLow3Config(
+        cfg = RacsConfig(
+            product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
             store_final_samples=True,
         )
-        sim = RacsLow3Jax(cfg)
+        sim = RacsJax(cfg)
         sim.initialise_data()
 
         with self.assertRaisesRegex(NotImplementedError, "store_final_samples=True"):
@@ -350,20 +367,21 @@ class RacsJaxTests(unittest.TestCase):
         null distribution is the same statistic computed from random 100-vs-100
         splits of 200 independent NumPy reference maps.
         """
-        from catsim import RacsLow3Jax
+        from catsim import RacsJax
 
         n_numpy = 200
         n_jax = 100
         log10_n = 6.0
 
-        cfg = RacsLow3Config(
+        cfg = RacsConfig(
+            product=RACS_MID1,
             flux_min=15,
             chunk_size=1_000,
             store_final_samples=False,
             max_cluster_children_per_parent=4,
         )
 
-        numpy_sim = RacsLow3(cfg)
+        numpy_sim = Racs(cfg)
         numpy_sim.initialise_data()
         numpy_maps, numpy_masks = batch_simulate(
             theta={
@@ -377,7 +395,7 @@ class RacsJaxTests(unittest.TestCase):
             rng_key=prng_key(20_000),
         )
 
-        jax_sim = RacsLow3Jax(cfg)
+        jax_sim = RacsJax(cfg)
         jax_sim.initialise_data()
         jax_maps, jax_masks = jax_sim.batch_generate_dipole(
             theta={

@@ -17,6 +17,7 @@ class RacsCatalogueColumns:
     scan_length: str
     field_id: str
     source_name: str
+    elevation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ RACS_LOW3 = RacsProductSpec(
         scan_length="Scan_length",
         field_id="Field_ID",
         source_name="Name",
+        elevation=None,
     ),
 )
 
@@ -73,6 +75,7 @@ RACS_MID1 = RacsProductSpec(
         scan_length="Scan_length",
         field_id="Tile_ID",
         source_name="Source_Name",
+        elevation="ALT",
     ),
 )
 
