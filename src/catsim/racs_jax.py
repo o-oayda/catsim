@@ -555,7 +555,7 @@ def _simulate_one_jax(
     return jnp.where(mask_map, density, jnp.nan), mask_map
 
 
-def _simulate_one_jax_with_flux_temperature_summary(
+def _simulate_one_jax_with_flux_summaries(
     key: jax.Array,
     parent_count: jax.Array,
     flux_min: jax.Array,
@@ -571,7 +571,9 @@ def _simulate_one_jax_with_flux_temperature_summary(
     fractional_error_eta: jax.Array,
     flux_max: jax.Array,
     temperature_edges: jax.Array,
-    quantiles: jax.Array,
+    temperature_quantiles: jax.Array,
+    elevation_edges: jax.Array,
+    elevation_quantiles: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
     cluster_model_code: int,
@@ -585,7 +587,9 @@ def _simulate_one_jax_with_flux_temperature_summary(
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
     n_flux_bins: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    include_temperature: bool,
+    include_elevation: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (
         log_flux_edges,
         log_flux_cdf,
@@ -608,16 +612,17 @@ def _simulate_one_jax_with_flux_temperature_summary(
     error_max_count = error_values_by_pixel.shape[1]
     elevation_max_count = elevation_values_by_pixel.shape[1]
     n_temp_bins = temperature_edges.shape[0] - 1
+    n_elevation_bins = elevation_edges.shape[0] - 1
     flux_z_max = jnp.maximum(
         jnp.log10(flux_max / flux_min),
         jnp.finfo(jnp.float32).eps,
     )
 
     def chunk_body(
-        state: tuple[jax.Array, jax.Array],
+        state: tuple[jax.Array, jax.Array, jax.Array],
         chunk_index: jax.Array,
-    ) -> tuple[tuple[jax.Array, jax.Array], None]:
-        density_accumulator, flux_temperature_hist = state
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
+        density_accumulator, flux_temperature_hist, flux_elevation_hist = state
         chunk_key = jax.random.fold_in(key, chunk_index)
         (
             key_parent_pos,
@@ -772,44 +777,78 @@ def _simulate_one_jax_with_flux_temperature_summary(
             keep.astype(jnp.float32)
         )
 
-        temp_bin = jnp.searchsorted(temperature_edges, temperatures, side="right") - 1
-        temp_bin = jnp.clip(temp_bin, 0, n_temp_bins - 1).astype(jnp.int32)
         log_flux_ratio = jnp.log10(jnp.maximum(observed_flux, flux_min) / flux_min)
         flux_bin = jnp.floor(
             jnp.clip(log_flux_ratio / flux_z_max, 0.0, 1.0 - jnp.finfo(jnp.float32).eps)
             * n_flux_bins
         ).astype(jnp.int32)
         flux_bin = jnp.clip(flux_bin, 0, n_flux_bins - 1)
-        summary_keep = keep & valid_temperature & jnp.isfinite(log_flux_ratio)
-        flat_bin = temp_bin * n_flux_bins + flux_bin
-        hist_flat = flux_temperature_hist.reshape(-1)
-        hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
-        flux_temperature_hist = hist_flat.reshape((n_temp_bins, n_flux_bins))
-        return (density_accumulator, flux_temperature_hist), None
+        if include_temperature:
+            temp_bin = jnp.searchsorted(temperature_edges, temperatures, side="right") - 1
+            temp_bin = jnp.clip(temp_bin, 0, n_temp_bins - 1).astype(jnp.int32)
+            summary_keep = keep & valid_temperature & jnp.isfinite(log_flux_ratio)
+            flat_bin = temp_bin * n_flux_bins + flux_bin
+            hist_flat = flux_temperature_hist.reshape(-1)
+            hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
+            flux_temperature_hist = hist_flat.reshape((n_temp_bins, n_flux_bins))
+
+        if include_elevation:
+            elevation_bin = jnp.searchsorted(elevation_edges, elevation, side="right") - 1
+            elevation_bin = jnp.clip(
+                elevation_bin,
+                0,
+                n_elevation_bins - 1,
+            ).astype(jnp.int32)
+            summary_keep = keep & jnp.isfinite(elevation) & jnp.isfinite(log_flux_ratio)
+            flat_bin = elevation_bin * n_flux_bins + flux_bin
+            hist_flat = flux_elevation_hist.reshape(-1)
+            hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
+            flux_elevation_hist = hist_flat.reshape((n_elevation_bins, n_flux_bins))
+
+        return (
+            density_accumulator,
+            flux_temperature_hist,
+            flux_elevation_hist,
+        ), None
 
     density = jnp.zeros((n_pix,), dtype=jnp.float32)
     flux_temperature_hist = jnp.zeros((n_temp_bins, n_flux_bins), dtype=jnp.float32)
+    flux_elevation_hist = jnp.zeros(
+        (n_elevation_bins, n_flux_bins),
+        dtype=jnp.float32,
+    )
 
     def fori_body(
         chunk_index: jax.Array,
-        state: tuple[jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array]:
+        state: tuple[jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         state, _ = chunk_body(state, chunk_index)
         return state
 
-    density, flux_temperature_hist = jax.lax.fori_loop(
+    density, flux_temperature_hist, flux_elevation_hist = jax.lax.fori_loop(
         jnp.asarray(0, dtype=jnp.int32),
         n_chunks,
         fori_body,
-        (density, flux_temperature_hist),
+        (density, flux_temperature_hist, flux_elevation_hist),
     )
-    summary = _histogram_flux_quantiles_jax(
+    temperature_summary = _histogram_flux_quantiles_jax(
         flux_temperature_hist,
         flux_min,
         flux_max,
-        quantiles,
+        temperature_quantiles,
     )
-    return jnp.where(mask_map, density, jnp.nan), mask_map, summary
+    elevation_summary = _histogram_flux_quantiles_jax(
+        flux_elevation_hist,
+        flux_min,
+        flux_max,
+        elevation_quantiles,
+    )
+    return (
+        jnp.where(mask_map, density, jnp.nan),
+        mask_map,
+        temperature_summary,
+        elevation_summary,
+    )
 
 
 @partial(
@@ -898,9 +937,11 @@ def _simulate_batch_jax(
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
         "n_flux_bins",
+        "include_temperature",
+        "include_elevation",
     ),
 )
-def _simulate_batch_jax_with_flux_temperature_summary(
+def _simulate_batch_jax_with_flux_summaries(
     keys: jax.Array,
     parent_counts: jax.Array,
     flux_mins: jax.Array,
@@ -916,7 +957,9 @@ def _simulate_batch_jax_with_flux_temperature_summary(
     fractional_error_eta: jax.Array,
     flux_maxes: jax.Array,
     temperature_edges: jax.Array,
-    quantiles: jax.Array,
+    temperature_quantiles: jax.Array,
+    elevation_edges: jax.Array,
+    elevation_quantiles: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
     cluster_model_code: int,
@@ -930,12 +973,16 @@ def _simulate_batch_jax_with_flux_temperature_summary(
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
     n_flux_bins: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    include_temperature: bool,
+    include_elevation: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     return jax.vmap(
         partial(
-            _simulate_one_jax_with_flux_temperature_summary,
+            _simulate_one_jax_with_flux_summaries,
             temperature_edges=temperature_edges,
-            quantiles=quantiles,
+            temperature_quantiles=temperature_quantiles,
+            elevation_edges=elevation_edges,
+            elevation_quantiles=elevation_quantiles,
             lookup_tuple=lookup_tuple,
             cluster_model_code=cluster_model_code,
             nside=nside,
@@ -948,6 +995,8 @@ def _simulate_batch_jax_with_flux_temperature_summary(
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
             n_flux_bins=n_flux_bins,
+            include_temperature=include_temperature,
+            include_elevation=include_elevation,
         )
     )(
         keys,
@@ -983,6 +1032,8 @@ class RacsJax:
         self.tile_sbids: Optional[NDArray[np.int32]] = None
         self._tile_index_from_sbid: dict[int, int] = {}
         self.tile_temperature_by_index: Optional[NDArray[np.float32]] = None
+        self.elevation_lookup_values: Optional[NDArray[np.float32]] = None
+        self.flux_summary_flux_max_mjy: Optional[float] = None
         self.flux_temperature_summary_flux_max_mjy: Optional[float] = None
 
     def initialise_data(self) -> None:
@@ -1042,6 +1093,10 @@ class RacsJax:
                 copy=False,
             )
         self.tile_temperature_by_index = tile_temperature_by_index
+        self.elevation_lookup_values = reference.elevation_lookup_values.astype(
+            np.float32,
+            copy=False,
+        )
 
         flux_quantile_bin = int(
             np.searchsorted(
@@ -1053,9 +1108,10 @@ class RacsJax:
         flux_quantile_bin = int(
             np.clip(flux_quantile_bin, 0, reference.log_flux_bin_edges.size - 2)
         )
-        self.flux_temperature_summary_flux_max_mjy = float(
+        self.flux_summary_flux_max_mjy = float(
             10.0 ** reference.log_flux_bin_edges[flux_quantile_bin + 1]
         )
+        self.flux_temperature_summary_flux_max_mjy = self.flux_summary_flux_max_mjy
 
         self._lookup_arrays = _LookupArrays(
             log_flux_edges=jnp.asarray(reference.log_flux_bin_edges, dtype=jnp.float32),
@@ -1256,6 +1312,32 @@ class RacsJax:
         flux_max_mjy: Optional[float] = None,
         show_progress: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        maps, masks, summaries = self.batch_generate_dipole_with_flux_summaries(
+            theta,
+            key,
+            batch_size,
+            temperature_edges=temperature_edges,
+            temperature_quantiles=quantiles,
+            n_flux_bins=n_flux_bins,
+            flux_max_mjy=flux_max_mjy,
+            show_progress=show_progress,
+        )
+        return maps, masks, summaries["temperature"]
+
+    def batch_generate_dipole_with_flux_summaries(
+        self,
+        theta: dict[str, np.ndarray | jax.Array],
+        key: jax.Array,
+        batch_size: int,
+        *,
+        temperature_edges: Optional[np.ndarray] = None,
+        temperature_quantiles: Optional[tuple[float, ...] | np.ndarray] = None,
+        elevation_edges: Optional[np.ndarray] = None,
+        elevation_quantiles: Optional[tuple[float, ...] | np.ndarray] = None,
+        n_flux_bins: int = 128,
+        flux_max_mjy: Optional[float] = None,
+        show_progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         if not self.lookups_are_initialised or self._lookup_arrays is None:
             raise RuntimeError("Run initialise_data() before generating maps.")
         if self.cfg.store_final_samples:
@@ -1266,20 +1348,57 @@ class RacsJax:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
 
-        temperature_edges_np = np.asarray(temperature_edges, dtype=np.float32)
-        if temperature_edges_np.ndim != 1 or temperature_edges_np.size < 2:
-            raise ValueError("temperature_edges must be a one-dimensional array.")
-        if (
-            np.any(~np.isfinite(temperature_edges_np))
-            or np.any(np.diff(temperature_edges_np) <= 0)
-        ):
-            raise ValueError("temperature_edges must be finite and strictly increasing.")
+        include_temperature = (
+            temperature_edges is not None or temperature_quantiles is not None
+        )
+        include_elevation = elevation_edges is not None or elevation_quantiles is not None
+        if (temperature_edges is None) != (temperature_quantiles is None):
+            raise ValueError(
+                "temperature_edges and temperature_quantiles must be provided together."
+            )
+        if (elevation_edges is None) != (elevation_quantiles is None):
+            raise ValueError(
+                "elevation_edges and elevation_quantiles must be provided together."
+            )
+        if not include_temperature and not include_elevation:
+            raise ValueError("At least one flux summary must be requested.")
 
-        quantiles_np = np.asarray(quantiles, dtype=np.float32)
-        if quantiles_np.ndim != 1 or quantiles_np.size == 0:
-            raise ValueError("At least one flux quantile is required.")
-        if np.any((quantiles_np < 0.0) | (quantiles_np > 1.0)):
-            raise ValueError("Flux quantiles must lie in [0, 1].")
+        def validate_edges(values: np.ndarray, name: str) -> np.ndarray:
+            edges = np.asarray(values, dtype=np.float32)
+            if edges.ndim != 1 or edges.size < 2:
+                raise ValueError(f"{name} must be a one-dimensional array.")
+            if np.any(~np.isfinite(edges)) or np.any(np.diff(edges) <= 0):
+                raise ValueError(f"{name} must be finite and strictly increasing.")
+            return edges
+
+        def validate_quantiles(values: np.ndarray, name: str) -> np.ndarray:
+            quantile_values = np.asarray(values, dtype=np.float32)
+            if quantile_values.ndim != 1 or quantile_values.size == 0:
+                raise ValueError(f"{name} must contain at least one value.")
+            if np.any((quantile_values < 0.0) | (quantile_values > 1.0)):
+                raise ValueError(f"{name} values must lie in [0, 1].")
+            return quantile_values
+
+        temperature_edges_np = (
+            validate_edges(temperature_edges, "temperature_edges")
+            if include_temperature
+            else np.asarray([0.0, 1.0], dtype=np.float32)
+        )
+        temperature_quantiles_np = (
+            validate_quantiles(temperature_quantiles, "temperature_quantiles")
+            if include_temperature
+            else np.asarray([0.5], dtype=np.float32)
+        )
+        elevation_edges_np = (
+            validate_edges(elevation_edges, "elevation_edges")
+            if include_elevation
+            else np.asarray([0.0, 1.0], dtype=np.float32)
+        )
+        elevation_quantiles_np = (
+            validate_quantiles(elevation_quantiles, "elevation_quantiles")
+            if include_elevation
+            else np.asarray([0.5], dtype=np.float32)
+        )
         if n_flux_bins < 1:
             raise ValueError("n_flux_bins must be at least 1.")
 
@@ -1288,7 +1407,7 @@ class RacsJax:
         self._warn_if_cluster_cap_overfills(parameters)
 
         resolved_flux_max = (
-            self.flux_temperature_summary_flux_max_mjy
+            self.flux_summary_flux_max_mjy
             if flux_max_mjy is None
             else float(flux_max_mjy)
         )
@@ -1302,7 +1421,8 @@ class RacsJax:
         root_keys = jax.random.split(key, n_sims)
         maps: list[np.ndarray] = []
         masks: list[np.ndarray] = []
-        summaries: list[np.ndarray] = []
+        temperature_summaries: list[np.ndarray] = []
+        elevation_summaries: list[np.ndarray] = []
 
         batch_starts = range(0, n_sims, batch_size)
         if show_progress:
@@ -1336,8 +1456,12 @@ class RacsJax:
             else:
                 batch_keys = root_keys[start:stop]
 
-            batch_maps, batch_masks, batch_summaries = (
-                _simulate_batch_jax_with_flux_temperature_summary(
+            (
+                batch_maps,
+                batch_masks,
+                batch_temperature_summaries,
+                batch_elevation_summaries,
+            ) = _simulate_batch_jax_with_flux_summaries(
                     keys=jnp.asarray(batch_keys),
                     parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
                     flux_mins=jnp.asarray(chunk["flux_min"], dtype=jnp.float32),
@@ -1369,7 +1493,15 @@ class RacsJax:
                         dtype=jnp.float32,
                     ),
                     temperature_edges=jnp.asarray(temperature_edges_np, dtype=jnp.float32),
-                    quantiles=jnp.asarray(quantiles_np, dtype=jnp.float32),
+                    temperature_quantiles=jnp.asarray(
+                        temperature_quantiles_np,
+                        dtype=jnp.float32,
+                    ),
+                    elevation_edges=jnp.asarray(elevation_edges_np, dtype=jnp.float32),
+                    elevation_quantiles=jnp.asarray(
+                        elevation_quantiles_np,
+                        dtype=jnp.float32,
+                    ),
                     lookup_tuple=self._lookup_arrays.as_tuple(),
                     cluster_model_code=self._cluster_model_code(),
                     nside=self.nside,
@@ -1382,20 +1514,42 @@ class RacsJax:
                     cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                     paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
                     n_flux_bins=int(n_flux_bins),
+                    include_temperature=include_temperature,
+                    include_elevation=include_elevation,
                 )
-            )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
-            summaries.append(
-                np.asarray(batch_summaries[:actual_batch_size], dtype=np.float32)
-            )
+            if include_temperature:
+                temperature_summaries.append(
+                    np.asarray(
+                        batch_temperature_summaries[:actual_batch_size],
+                        dtype=np.float32,
+                    )
+                )
+            if include_elevation:
+                elevation_summaries.append(
+                    np.asarray(
+                        batch_elevation_summaries[:actual_batch_size],
+                        dtype=np.float32,
+                    )
+                )
             if show_progress:
                 batch_starts.set_postfix(completed=stop, total=n_sims)
 
         out_maps = np.concatenate(maps, axis=0)
         out_masks = np.concatenate(masks, axis=0)
-        out_summaries = np.concatenate(summaries, axis=0)
         out_maps, out_masks = self._downscale_batch_output(out_maps, out_masks)
+        out_summaries: dict[str, np.ndarray] = {}
+        if include_temperature:
+            out_summaries["temperature"] = np.concatenate(
+                temperature_summaries,
+                axis=0,
+            )
+        if include_elevation:
+            out_summaries["elevation"] = np.concatenate(
+                elevation_summaries,
+                axis=0,
+            )
         return out_maps, out_masks, out_summaries
 
     def _cluster_model_code(self) -> int:

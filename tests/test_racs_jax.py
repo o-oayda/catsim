@@ -241,6 +241,68 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(summaries.shape, (2, 6))
         self.assertTrue(np.all(np.isfinite(summaries)))
 
+    def test_batch_generate_dipole_with_combined_flux_summaries(self):
+        temperatures = self.sim.tile_temperature_by_index
+        elevations = self.sim.elevation_lookup_values
+        temperature_edges = np.linspace(
+            float(np.nanmin(temperatures)),
+            float(np.nanmax(temperatures)),
+            4,
+            dtype=np.float32,
+        )
+        elevation_edges = np.linspace(
+            float(np.nanmin(elevations)),
+            float(np.nanmax(elevations)),
+            5,
+            dtype=np.float32,
+        )
+        theta = {
+            "log10_n_initial_samples": np.log10(np.asarray([8.0, 8.0])),
+            "observer_speed": np.zeros(2, dtype=np.float32),
+            "p_clus": np.zeros(2, dtype=np.float32),
+            "clus_stop_prob": np.ones(2, dtype=np.float32),
+        }
+        key = jax.random.PRNGKey(321)
+
+        maps, masks, combined = self.sim.batch_generate_dipole_with_flux_summaries(
+            theta,
+            key,
+            batch_size=2,
+            temperature_edges=temperature_edges,
+            temperature_quantiles=(0.25, 0.5),
+            elevation_edges=elevation_edges,
+            elevation_quantiles=(0.5,),
+            n_flux_bins=8,
+            flux_max_mjy=1000.0,
+        )
+        elevation_maps, elevation_masks, elevation_only = (
+            self.sim.batch_generate_dipole_with_flux_summaries(
+                theta,
+                key,
+                batch_size=2,
+                elevation_edges=elevation_edges,
+                elevation_quantiles=(0.5,),
+                n_flux_bins=8,
+                flux_max_mjy=1000.0,
+            )
+        )
+
+        self.assertEqual(set(combined), {"temperature", "elevation"})
+        self.assertEqual(combined["temperature"].shape, (2, 6))
+        self.assertEqual(combined["elevation"].shape, (2, 4))
+        np.testing.assert_array_equal(maps, elevation_maps)
+        np.testing.assert_array_equal(masks, elevation_masks)
+        np.testing.assert_allclose(combined["elevation"], elevation_only["elevation"])
+
+    def test_batch_generate_dipole_with_flux_summaries_requires_complete_pair(self):
+        with self.assertRaisesRegex(ValueError, "provided together"):
+            self.sim.batch_generate_dipole_with_flux_summaries(
+                {"log10_n_initial_samples": np.log10(np.asarray([8.0]))},
+                jax.random.PRNGKey(1),
+                batch_size=1,
+                elevation_edges=np.asarray([0.0, 90.0]),
+            )
+
     def test_batch_generate_dipole_accepts_dynamic_source_counts(self):
         low_maps, low_masks = self.sim.batch_generate_dipole(
             {"log10_n_initial_samples": np.full(2, 1.0)},
