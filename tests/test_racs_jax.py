@@ -257,6 +257,30 @@ class RacsJaxTests(unittest.TestCase):
         expected = np.asarray([10.0, 100.0, 1000.0, 0.0, 0.0, 0.0], dtype=np.float32)
         np.testing.assert_allclose(np.asarray(features), expected, rtol=1e-5)
 
+    def test_temperature_models_have_numpy_jax_parity(self):
+        from catsim.racs_temperature import evaluate_temperature_response
+
+        temperatures = np.asarray([20.0, 25.0, 30.0, 80.0], dtype=np.float32)
+        for model in ("hot_linear", "hot_quadratic"):
+            expected = evaluate_temperature_response(
+                temperatures,
+                0.02,
+                25.0,
+                model=model,
+                xp=np,
+            )
+            actual = jax.jit(
+                lambda values: evaluate_temperature_response(
+                    values,
+                    0.02,
+                    25.0,
+                    model=model,
+                    xp=jnp,
+                )
+            )(jnp.asarray(temperatures))
+
+            np.testing.assert_allclose(np.asarray(actual), expected, rtol=1e-6)
+
     def test_batch_generate_dipole_with_flux_temperature_summary_returns_features(self):
         temperatures = self.sim.tile_temperature_by_index
         self.assertIsNotNone(temperatures)
@@ -287,6 +311,43 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(maps.shape, (2, hp.nside2npix(64)))
         self.assertEqual(masks.shape, (2, hp.nside2npix(64)))
         self.assertEqual(summaries.shape, (2, 6))
+        self.assertTrue(np.all(np.isfinite(summaries)))
+
+    def test_hot_quadratic_runs_in_ordinary_and_summary_kernels(self):
+        temperatures = self.sim.tile_temperature_by_index
+        finite_temperatures = temperatures[np.isfinite(temperatures)]
+        temperature_edges = np.asarray(
+            [np.min(finite_temperatures), np.max(finite_temperatures)],
+            dtype=np.float32,
+        )
+        original_model = self.sim.cfg.temperature_model
+        self.sim.cfg.temperature_model = "hot_quadratic"
+        try:
+            density_map, mask = self.sim.generate_dipole(
+                np.log10(8.0),
+                temp_beta=0.02,
+                key=jax.random.PRNGKey(811),
+            )
+            maps, masks, summaries = (
+                self.sim.batch_generate_dipole_with_flux_temperature_summary(
+                    theta={
+                        "log10_n_initial_samples": np.asarray([np.log10(8.0)]),
+                        "temp_beta": np.asarray([0.02]),
+                    },
+                    key=jax.random.PRNGKey(812),
+                    batch_size=1,
+                    temperature_edges=temperature_edges,
+                    quantiles=(0.5,),
+                    n_flux_bins=8,
+                    flux_max_mjy=1000.0,
+                )
+            )
+        finally:
+            self.sim.cfg.temperature_model = original_model
+
+        self.assertEqual(density_map.shape, mask.shape)
+        self.assertEqual(maps.shape, masks.shape)
+        self.assertEqual(summaries.shape, (1, 1))
         self.assertTrue(np.all(np.isfinite(summaries)))
 
     def test_batch_generate_dipole_with_combined_flux_summaries(self):

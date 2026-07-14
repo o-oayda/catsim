@@ -353,6 +353,23 @@ class RacsFluxErrorTests(unittest.TestCase):
             np.asarray([1.0, 1.0, 0.9], dtype=self.sim.dtype),
         )
 
+    def test_evaluate_temperature_enhancement_supports_hot_quadratic(self):
+        self.sim.cfg.temperature_model = "hot_quadratic"
+        self.sim.tile_temperature_by_index = np.array(
+            [24.0, 25.0, 30.0],
+            dtype=np.float64,
+        )
+
+        enhancement, _ = self.sim.evaluate_temperature_enhancement(
+            tile_indices=np.array([0, 1, 2], dtype=np.int32),
+            temp_beta=0.02,
+        )
+
+        np.testing.assert_allclose(
+            enhancement,
+            np.asarray([1.0, 1.0, 0.99], dtype=self.sim.dtype),
+        )
+
     def test_evaluate_temperature_enhancement_clips_to_positive_floor(self):
         self.sim.tile_temperature_by_index = np.array([60.0], dtype=np.float64)
 
@@ -1012,6 +1029,13 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 nside=64,
                 chunk_size=16,
                 paf_reference_temp_c=np.nan,
+            )
+
+        self.assertEqual(RacsLow3Config(flux_min=15.0).temperature_model, "hot_linear")
+        with self.assertRaisesRegex(ValueError, "temperature_model must be either"):
+            RacsLow3Config(
+                flux_min=15.0,
+                temperature_model="unknown",
             )
 
     def test_initialise_data_uses_cached_lookups_without_loading_catalogue(self):

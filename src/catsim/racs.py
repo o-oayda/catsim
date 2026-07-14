@@ -35,9 +35,14 @@ from .racs_summaries import (
     validate_bin_edges,
     validate_quantiles,
 )
+from .racs_temperature import (
+    RACS_TEMPERATURE_EPSILON_FLOOR,
+    TEMPERATURE_MODELS,
+    TemperatureModel,
+    evaluate_temperature_response,
+)
 
-LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
-RACS_TEMPERATURE_EPSILON_FLOOR = LOW3_TEMPERATURE_EPSILON_FLOOR
+LOW3_TEMPERATURE_EPSILON_FLOOR = RACS_TEMPERATURE_EPSILON_FLOOR
 LOGGER = logging.getLogger(__name__)
 
 
@@ -78,6 +83,7 @@ class RacsConfig:
     flux_temperature_min_mjy: Optional[float] = None
     paf_temperature_data_dir: Optional[str] = None
     paf_reference_temp_c: float = 25.0
+    temperature_model: TemperatureModel = "hot_linear"
     paf_max_interpolation_gap_minutes: float = 20.0
     temperature_fallback: Literal["none", "open_meteo"] = "none"
     open_meteo_cache_dir: Optional[str] = None
@@ -132,6 +138,10 @@ class RacsConfig:
             raise ValueError("flux_temperature_min_mjy must be positive and finite.")
         if not np.isfinite(self.paf_reference_temp_c):
             raise ValueError("paf_reference_temp_c must be finite.")
+        if self.temperature_model not in TEMPERATURE_MODELS:
+            raise ValueError(
+                "temperature_model must be either 'hot_linear' or 'hot_quadratic'."
+            )
         if self.paf_max_interpolation_gap_minutes <= 0:
             raise ValueError("paf_max_interpolation_gap_minutes must be positive.")
         if self.temperature_fallback not in {"none", "open_meteo"}:
@@ -1524,8 +1534,8 @@ class Racs:
         """Evaluate hot-PAF flux suppression at the tile level.
 
         Temperatures at or below ``cfg.paf_reference_temp_c`` have no flux
-        correction. Hotter observations suppress flux linearly as
-        ``epsilon(T) = 1 - temp_beta * max(T - T_ref, 0)``.
+        correction. Hotter observations use the response selected by
+        ``cfg.temperature_model``.
         """
         if not np.isfinite(temp_beta) or temp_beta < 0:
             raise ValueError("temp_beta must be finite and non-negative.")
@@ -1543,14 +1553,12 @@ class Racs:
             temperatures[valid] = tile_temperatures.astype(np.float32, copy=False)
             valid_temperature = np.isfinite(tile_temperatures)
             if np.any(valid_temperature):
-                hot_temperature = np.maximum(
-                    tile_temperatures[valid_temperature] - self.cfg.paf_reference_temp_c,
-                    0.0,
-                )
-                enhancement_valid = 1.0 - temp_beta * hot_temperature
-                enhancement_valid = np.maximum(
-                    enhancement_valid,
-                    RACS_TEMPERATURE_EPSILON_FLOOR,
+                enhancement_valid = evaluate_temperature_response(
+                    tile_temperatures[valid_temperature],
+                    temp_beta,
+                    self.cfg.paf_reference_temp_c,
+                    model=self.cfg.temperature_model,
+                    xp=np,
                 )
                 enhancement_indices = np.flatnonzero(valid)[valid_temperature]
                 enhancement[enhancement_indices] = enhancement_valid

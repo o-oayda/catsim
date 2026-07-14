@@ -8,6 +8,7 @@ from .racs_summaries import (
     binned_flux_quantiles_histogram,
     empirical_bin_edges,
 )
+from .racs_temperature import TEMPERATURE_MODELS, TemperatureModel
 from .utils.batch_simulate import batch_simulate
 from .utils.plotting import smooth_map
 from .utils.rng import prng_key
@@ -68,6 +69,8 @@ __all__ = [
     "binned_flux_quantiles_exact",
     "binned_flux_quantiles_histogram",
     "empirical_bin_edges",
+    "TEMPERATURE_MODELS",
+    "TemperatureModel",
     "batch_simulate",
     "smooth_map",
     "prng_key",

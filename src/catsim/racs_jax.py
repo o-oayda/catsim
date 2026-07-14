@@ -23,7 +23,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised via package i
         ) from exc
     raise
 
-from .racs import RACS_TEMPERATURE_EPSILON_FLOOR, RACS_LOW3, Racs, RacsConfig
+from .racs import RACS_LOW3, Racs, RacsConfig
+from .racs_temperature import evaluate_temperature_response
 from .utils.constants import CMB_B, CMB_BETA, CMB_L
 from .utils.healsphere import downgrade_ignore_nan
 from .utils.physics import rotation_matrices_for_dipole
@@ -363,6 +364,7 @@ def _simulate_one_jax(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    temperature_model: str,
     use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array]:
     (
@@ -475,9 +477,14 @@ def _simulate_one_jax(
         safe_tile = jnp.maximum(sampled_tile, 0)
         temperatures = tile_temperature_by_index[safe_tile]
         valid_temperature = (sampled_tile >= 0) & jnp.isfinite(temperatures)
-        hot_temperature = jnp.maximum(temperatures - paf_reference_temp_c, 0.0)
-        enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
-        enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
+        temperature_response = evaluate_temperature_response(
+            temperatures,
+            temp_beta,
+            paf_reference_temp_c,
+            model=temperature_model,
+            xp=jnp,
+        )
+        enhancement = jnp.where(valid_temperature, temperature_response, 1.0)
         systematics_flux = dipole_flux * enhancement
 
         if use_elevation:
@@ -591,6 +598,7 @@ def _simulate_one_jax_with_flux_summaries(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    temperature_model: str,
     n_flux_bins: int,
     include_temperature: bool,
     include_elevation: bool,
@@ -720,9 +728,14 @@ def _simulate_one_jax_with_flux_summaries(
         safe_tile = jnp.maximum(sampled_tile, 0)
         temperatures = tile_temperature_by_index[safe_tile]
         valid_temperature = (sampled_tile >= 0) & jnp.isfinite(temperatures)
-        hot_temperature = jnp.maximum(temperatures - paf_reference_temp_c, 0.0)
-        enhancement = jnp.where(valid_temperature, 1.0 - temp_beta * hot_temperature, 1.0)
-        enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
+        temperature_response = evaluate_temperature_response(
+            temperatures,
+            temp_beta,
+            paf_reference_temp_c,
+            model=temperature_model,
+            xp=jnp,
+        )
+        enhancement = jnp.where(valid_temperature, temperature_response, 1.0)
         systematics_flux = dipole_flux * enhancement
 
         elevation = jnp.full(pixel_indices.shape, jnp.nan, dtype=jnp.float32)
@@ -910,6 +923,7 @@ def _simulate_one_jax_with_flux_summaries(
         "cluster_r0_arcsec",
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
+        "temperature_model",
         "use_elevation",
     ),
 )
@@ -939,6 +953,7 @@ def _simulate_batch_jax(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    temperature_model: str,
     use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array]:
     return jax.vmap(
@@ -955,6 +970,7 @@ def _simulate_batch_jax(
             cluster_r0_arcsec=cluster_r0_arcsec,
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
+            temperature_model=temperature_model,
             use_elevation=use_elevation,
         )
     )(
@@ -986,6 +1002,7 @@ def _simulate_batch_jax(
         "cluster_r0_arcsec",
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
+        "temperature_model",
         "n_flux_bins",
         "include_temperature",
         "include_elevation",
@@ -1024,6 +1041,7 @@ def _simulate_batch_jax_with_flux_summaries(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    temperature_model: str,
     n_flux_bins: int,
     include_temperature: bool,
     include_elevation: bool,
@@ -1047,6 +1065,7 @@ def _simulate_batch_jax_with_flux_summaries(
             cluster_r0_arcsec=cluster_r0_arcsec,
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
+            temperature_model=temperature_model,
             n_flux_bins=n_flux_bins,
             include_temperature=include_temperature,
             include_elevation=include_elevation,
@@ -1364,6 +1383,7 @@ class RacsJax:
                 cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
                 cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                 paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
+                temperature_model=self.cfg.temperature_model,
                 use_elevation=use_elevation,
             )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
@@ -1620,6 +1640,7 @@ class RacsJax:
                     cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
                     cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                     paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
+                    temperature_model=self.cfg.temperature_model,
                     n_flux_bins=int(n_flux_bins),
                     include_temperature=include_temperature,
                     include_elevation=include_elevation,
