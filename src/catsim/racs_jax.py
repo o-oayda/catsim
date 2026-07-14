@@ -563,6 +563,7 @@ def _simulate_one_jax_with_flux_summaries(
     key: jax.Array,
     parent_count: jax.Array,
     flux_min: jax.Array,
+    temperature_flux_min: jax.Array,
     p_clus: jax.Array,
     clus_stop_prob: jax.Array,
     lambda_clus: jax.Array,
@@ -618,8 +619,12 @@ def _simulate_one_jax_with_flux_summaries(
     elevation_max_count = elevation_values_by_pixel.shape[1]
     n_temp_bins = temperature_edges.shape[0] - 1
     n_elevation_bins = elevation_edges.shape[0] - 1
-    flux_z_max = jnp.maximum(
+    map_flux_z_max = jnp.maximum(
         jnp.log10(flux_max / flux_min),
+        jnp.finfo(jnp.float32).eps,
+    )
+    temperature_flux_z_max = jnp.maximum(
+        jnp.log10(flux_max / temperature_flux_min),
         jnp.finfo(jnp.float32).eps,
     )
 
@@ -785,35 +790,64 @@ def _simulate_one_jax_with_flux_summaries(
             dtype=jnp.float32,
         ) * flux_sigma
 
-        keep = source_valid & in_mask & (sampled_tile >= 0) & (observed_flux >= flux_min)
+        base_keep = source_valid & in_mask & (sampled_tile >= 0)
+        keep = base_keep & (observed_flux >= flux_min)
         density_accumulator = density_accumulator.at[pixel_indices].add(
             keep.astype(jnp.float32)
         )
 
-        log_flux_ratio = jnp.log10(jnp.maximum(observed_flux, flux_min) / flux_min)
-        flux_bin = jnp.floor(
-            jnp.clip(log_flux_ratio / flux_z_max, 0.0, 1.0 - jnp.finfo(jnp.float32).eps)
-            * n_flux_bins
-        ).astype(jnp.int32)
-        flux_bin = jnp.clip(flux_bin, 0, n_flux_bins - 1)
         if include_temperature:
+            temperature_log_flux_ratio = jnp.log10(
+                jnp.maximum(observed_flux, temperature_flux_min)
+                / temperature_flux_min
+            )
+            temperature_flux_bin = jnp.floor(
+                jnp.clip(
+                    temperature_log_flux_ratio / temperature_flux_z_max,
+                    0.0,
+                    1.0 - jnp.finfo(jnp.float32).eps,
+                )
+                * n_flux_bins
+            ).astype(jnp.int32)
+            temperature_flux_bin = jnp.clip(
+                temperature_flux_bin,
+                0,
+                n_flux_bins - 1,
+            )
             temp_bin = jnp.searchsorted(temperature_edges, temperatures, side="right") - 1
             temp_bin = jnp.clip(temp_bin, 0, n_temp_bins - 1).astype(jnp.int32)
-            summary_keep = keep & valid_temperature & jnp.isfinite(log_flux_ratio)
-            flat_bin = temp_bin * n_flux_bins + flux_bin
+            summary_keep = (
+                base_keep
+                & valid_temperature
+                & (observed_flux >= temperature_flux_min)
+                & jnp.isfinite(temperature_log_flux_ratio)
+            )
+            flat_bin = temp_bin * n_flux_bins + temperature_flux_bin
             hist_flat = flux_temperature_hist.reshape(-1)
             hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
             flux_temperature_hist = hist_flat.reshape((n_temp_bins, n_flux_bins))
 
         if include_elevation:
+            map_log_flux_ratio = jnp.log10(
+                jnp.maximum(observed_flux, flux_min) / flux_min
+            )
+            map_flux_bin = jnp.floor(
+                jnp.clip(
+                    map_log_flux_ratio / map_flux_z_max,
+                    0.0,
+                    1.0 - jnp.finfo(jnp.float32).eps,
+                )
+                * n_flux_bins
+            ).astype(jnp.int32)
+            map_flux_bin = jnp.clip(map_flux_bin, 0, n_flux_bins - 1)
             elevation_bin = jnp.searchsorted(elevation_edges, elevation, side="right") - 1
             elevation_bin = jnp.clip(
                 elevation_bin,
                 0,
                 n_elevation_bins - 1,
             ).astype(jnp.int32)
-            summary_keep = keep & jnp.isfinite(elevation) & jnp.isfinite(log_flux_ratio)
-            flat_bin = elevation_bin * n_flux_bins + flux_bin
+            summary_keep = keep & jnp.isfinite(elevation) & jnp.isfinite(map_log_flux_ratio)
+            flat_bin = elevation_bin * n_flux_bins + map_flux_bin
             hist_flat = flux_elevation_hist.reshape(-1)
             hist_flat = hist_flat.at[flat_bin].add(summary_keep.astype(jnp.float32))
             flux_elevation_hist = hist_flat.reshape((n_elevation_bins, n_flux_bins))
@@ -846,7 +880,7 @@ def _simulate_one_jax_with_flux_summaries(
     )
     temperature_summary = _histogram_flux_quantiles_jax(
         flux_temperature_hist,
-        flux_min,
+        temperature_flux_min,
         flux_max,
         temperature_quantiles,
     )
@@ -962,6 +996,7 @@ def _simulate_batch_jax_with_flux_summaries(
     keys: jax.Array,
     parent_counts: jax.Array,
     flux_mins: jax.Array,
+    temperature_flux_mins: jax.Array,
     p_clus: jax.Array,
     clus_stop_prob: jax.Array,
     lambda_clus: jax.Array,
@@ -1021,6 +1056,7 @@ def _simulate_batch_jax_with_flux_summaries(
         keys,
         parent_counts,
         flux_mins,
+        temperature_flux_mins,
         p_clus,
         clus_stop_prob,
         lambda_clus,
@@ -1443,6 +1479,15 @@ class RacsJax:
 
         parameters = self._normalise_theta(theta)
         self._validate_parameters(parameters)
+        temperature_flux_mins = (
+            parameters["flux_min"]
+            if self.cfg.flux_temperature_min_mjy is None
+            else np.full(
+                parameters["flux_min"].shape,
+                self.cfg.flux_temperature_min_mjy,
+                dtype=np.float64,
+            )
+        )
         use_elevation = include_elevation or bool(
             np.any(parameters["elevation_amp"] > 0.0)
         )
@@ -1460,7 +1505,12 @@ class RacsJax:
         )
         if resolved_flux_max is None or not np.isfinite(resolved_flux_max):
             raise ValueError("flux_max_mjy must be finite.")
-        max_flux_min = float(np.max(parameters["flux_min"]))
+        max_flux_min = float(
+            max(
+                np.max(parameters["flux_min"]),
+                np.max(temperature_flux_mins) if include_temperature else 0.0,
+            )
+        )
         if resolved_flux_max <= max_flux_min:
             raise ValueError("flux_max_mjy must be greater than all simulated flux_min values.")
 
@@ -1485,6 +1535,7 @@ class RacsJax:
         for start in batch_starts:
             stop = min(start + batch_size, n_sims)
             chunk = {name: values[start:stop] for name, values in parameters.items()}
+            chunk_temperature_flux_mins = temperature_flux_mins[start:stop]
             parent_counts = self._parent_counts(chunk)
             n_chunks = max(1, int(math.ceil(int(parent_counts.max(initial=0)) / self.chunk_size)))
             forward, inverse = self._rotation_matrices_for_parameters(chunk)
@@ -1496,6 +1547,11 @@ class RacsJax:
                     name: np.pad(values, (0, pad_count), mode="edge")
                     for name, values in chunk.items()
                 }
+                chunk_temperature_flux_mins = np.pad(
+                    chunk_temperature_flux_mins,
+                    (0, pad_count),
+                    mode="edge",
+                )
                 parent_counts = np.pad(parent_counts, (0, pad_count), mode="constant")
                 forward = np.pad(forward, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
                 inverse = np.pad(inverse, ((0, pad_count), (0, 0), (0, 0)), mode="edge")
@@ -1512,6 +1568,10 @@ class RacsJax:
                     keys=jnp.asarray(batch_keys),
                     parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
                     flux_mins=jnp.asarray(chunk["flux_min"], dtype=jnp.float32),
+                    temperature_flux_mins=jnp.asarray(
+                        chunk_temperature_flux_mins,
+                        dtype=jnp.float32,
+                    ),
                     p_clus=jnp.asarray(chunk["p_clus"], dtype=jnp.float32),
                     clus_stop_prob=jnp.asarray(chunk["clus_stop_prob"], dtype=jnp.float32),
                     lambda_clus=jnp.asarray(chunk["lambda_clus"], dtype=jnp.float32),

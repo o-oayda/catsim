@@ -2,6 +2,12 @@ from .simulator import Catwise
 from .configs import CatwiseConfig
 from .racs import Racs, RacsConfig, RacsLow3, RacsLow3Config
 from .racs_products import RACS_LOW3, RACS_MID1, RACS_PRODUCTS, RacsProductSpec
+from .racs_summaries import (
+    binned_flux_quantile_ndim,
+    binned_flux_quantiles_exact,
+    binned_flux_quantiles_histogram,
+    empirical_bin_edges,
+)
 from .utils.batch_simulate import batch_simulate
 from .utils.plotting import smooth_map
 from .utils.rng import prng_key
@@ -58,6 +64,10 @@ __all__ = [
     "RACS_MID1",
     "RACS_PRODUCTS",
     "RacsProductSpec",
+    "binned_flux_quantile_ndim",
+    "binned_flux_quantiles_exact",
+    "binned_flux_quantiles_histogram",
+    "empirical_bin_edges",
     "batch_simulate",
     "smooth_map",
     "prng_key",

@@ -30,6 +30,11 @@ from .utils.weather import (
     get_open_meteo_temperatures_for_mjd,
 )
 from .racs_products import RACS_LOW3, RacsProductSpec, resolve_racs_product
+from .racs_summaries import (
+    binned_flux_quantiles_exact,
+    validate_bin_edges,
+    validate_quantiles,
+)
 
 LOW3_TEMPERATURE_EPSILON_FLOOR = 1e-6
 RACS_TEMPERATURE_EPSILON_FLOOR = LOW3_TEMPERATURE_EPSILON_FLOOR
@@ -70,6 +75,7 @@ class RacsConfig:
     cluster_r0_arcsec: float = 100.0
     cluster_r_cut_arcsec: float = 20.0
     fractional_error_flux_min_mjy: float = 10.0
+    flux_temperature_min_mjy: Optional[float] = None
     paf_temperature_data_dir: Optional[str] = None
     paf_reference_temp_c: float = 25.0
     paf_max_interpolation_gap_minutes: float = 20.0
@@ -119,6 +125,11 @@ class RacsConfig:
             raise ValueError("cluster_r_cut_arcsec must be non-negative.")
         if self.fractional_error_flux_min_mjy <= 0:
             raise ValueError("fractional_error_flux_min_mjy must be positive.")
+        if self.flux_temperature_min_mjy is not None and (
+            not np.isfinite(self.flux_temperature_min_mjy)
+            or self.flux_temperature_min_mjy <= 0
+        ):
+            raise ValueError("flux_temperature_min_mjy must be positive and finite.")
         if not np.isfinite(self.paf_reference_temp_c):
             raise ValueError("paf_reference_temp_c must be finite.")
         if self.paf_max_interpolation_gap_minutes <= 0:
@@ -1621,6 +1632,71 @@ class Racs:
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
+        output_map, output_mask, _ = self._generate_dipole_impl(
+            log10_n_initial_samples=log10_n_initial_samples,
+            flux_min=flux_min,
+            p_clus=p_clus,
+            clus_stop_prob=clus_stop_prob,
+            lambda_clus=lambda_clus,
+            observer_speed=observer_speed,
+            dipole_longitude=dipole_longitude,
+            dipole_latitude=dipole_latitude,
+            temp_beta=temp_beta,
+            elevation_amp=elevation_amp,
+            elevation_trough=elevation_trough,
+            fractional_error_eta=fractional_error_eta,
+            rng_key=rng_key,
+        )
+        return output_map, output_mask
+
+    def generate_dipole_with_flux_summaries(
+        self,
+        *args,
+        temperature_edges: Optional[NDArray[np.floating]] = None,
+        temperature_quantiles: Optional[tuple[float, ...] | NDArray[np.floating]] = None,
+        elevation_edges: Optional[NDArray[np.floating]] = None,
+        elevation_quantiles: Optional[tuple[float, ...] | NDArray[np.floating]] = None,
+        **kwargs,
+    ) -> tuple[
+        NDArray[np.float32],
+        NDArray[np.bool_],
+        dict[str, NDArray[np.float32]],
+    ]:
+        """Generate a map plus exact source-level flux summaries."""
+        return self._generate_dipole_impl(
+            *args,
+            temperature_edges=temperature_edges,
+            temperature_quantiles=temperature_quantiles,
+            elevation_edges=elevation_edges,
+            elevation_quantiles=elevation_quantiles,
+            **kwargs,
+        )
+
+    def _generate_dipole_impl(
+        self,
+        log10_n_initial_samples: float,
+        flux_min: Optional[float] = None,
+        p_clus: float = 0.0,
+        clus_stop_prob: float = 1.0,
+        lambda_clus: float = 0.0,
+        observer_speed: float = 1.0,
+        dipole_longitude: float = CMB_L,
+        dipole_latitude: float = CMB_B,
+        temp_beta: float = 0.0,
+        elevation_amp: float = 0.0,
+        elevation_trough: float = 0.0,
+        fractional_error_eta: float = 0.0,
+        rng_key: Optional[NPKey] = None,
+        *,
+        temperature_edges: Optional[NDArray[np.floating]] = None,
+        temperature_quantiles: Optional[tuple[float, ...] | NDArray[np.floating]] = None,
+        elevation_edges: Optional[NDArray[np.floating]] = None,
+        elevation_quantiles: Optional[tuple[float, ...] | NDArray[np.floating]] = None,
+    ) -> tuple[
+        NDArray[np.float32],
+        NDArray[np.bool_],
+        dict[str, NDArray[np.float32]],
+    ]:
         """Coordinate the CatSIM-like simulation pipeline for RACS.
 
         ``log10_n_initial_samples`` sets the expected total number of
@@ -1647,6 +1723,27 @@ class Racs:
             raise ValueError("elevation_amp must be finite and non-negative.")
         if not np.isfinite(elevation_trough):
             raise ValueError("elevation_trough must be finite.")
+        include_temperature_summary = (
+            temperature_edges is not None or temperature_quantiles is not None
+        )
+        include_elevation_summary = (
+            elevation_edges is not None or elevation_quantiles is not None
+        )
+        if (temperature_edges is None) != (temperature_quantiles is None):
+            raise ValueError(
+                "temperature_edges and temperature_quantiles must be provided together."
+            )
+        if (elevation_edges is None) != (elevation_quantiles is None):
+            raise ValueError(
+                "elevation_edges and elevation_quantiles must be provided together."
+            )
+        if include_temperature_summary:
+            temperature_edges = validate_bin_edges(temperature_edges, "temperature_edges")
+            temperature_quantiles = validate_quantiles(temperature_quantiles)
+        if include_elevation_summary:
+            elevation_edges = validate_bin_edges(elevation_edges, "elevation_edges")
+            elevation_quantiles = validate_quantiles(elevation_quantiles)
+
         use_elevation = elevation_amp > 0.0
         elevation_is_available = self.product.columns.elevation is not None
         if use_elevation and not elevation_is_available:
@@ -1655,8 +1752,13 @@ class Racs:
                 "source-elevation systematics require catalogue ALT data."
             )
         sample_elevation = elevation_is_available and (
-            use_elevation or self.store_final_samples
+            use_elevation or self.store_final_samples or include_elevation_summary
         )
+        if include_elevation_summary and not elevation_is_available:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "flux-elevation summaries require catalogue ALT data."
+            )
 
         self.observer_speed = observer_speed * CMB_BETA
         self.dipole_longitude = dipole_longitude
@@ -1706,6 +1808,11 @@ class Racs:
         n_samples = int(n_expected_sources / expected_multiplicity)
 
         active_flux_min = self.cfg.flux_min if flux_min is None else flux_min
+        active_temperature_flux_min = (
+            active_flux_min
+            if self.cfg.flux_temperature_min_mjy is None
+            else self.cfg.flux_temperature_min_mjy
+        )
         rng = rng_key._generator() if rng_key is not None else np.random.default_rng()
 
         n_pix = hp.nside2npix(self.nside)
@@ -1725,6 +1832,10 @@ class Racs:
         final_dec: list[NDArray[np.float32]] = []
         final_temperature: list[NDArray[np.float32]] = []
         final_elevation: list[NDArray[np.float32]] = []
+        summary_temperature_flux: list[NDArray[np.float32]] = []
+        summary_temperature: list[NDArray[np.float32]] = []
+        summary_elevation_flux: list[NDArray[np.float32]] = []
+        summary_elevation: list[NDArray[np.float32]] = []
 
         for start in range(0, n_samples, self.chunk_size):
             current_chunk = min(self.chunk_size, n_samples - start)
@@ -1840,8 +1951,32 @@ class Racs:
                 dtype=self.dtype,
             )
 
+            base_keep = mask_slice & (tile_indices >= 0)
+            if include_temperature_summary:
+                temperature_keep = (
+                    base_keep
+                    & np.isfinite(temperatures)
+                    & (observed_flux >= active_temperature_flux_min)
+                )
+                if np.any(temperature_keep):
+                    summary_temperature_flux.append(
+                        observed_flux[temperature_keep].astype(np.float32, copy=False)
+                    )
+                    summary_temperature.append(
+                        temperatures[temperature_keep].astype(np.float32, copy=False)
+                    )
+
             cut_slice = self.flux_cut_boolean(observed_flux, active_flux_min)
-            keep = mask_slice & cut_slice & (tile_indices >= 0)
+            keep = base_keep & cut_slice
+            if include_elevation_summary and elevations is not None:
+                elevation_keep = keep & np.isfinite(elevations)
+                if np.any(elevation_keep):
+                    summary_elevation_flux.append(
+                        observed_flux[elevation_keep].astype(np.float32, copy=False)
+                    )
+                    summary_elevation.append(
+                        elevations[elevation_keep].astype(np.float32, copy=False)
+                    )
             if not np.any(keep):
                 continue
 
@@ -1948,7 +2083,43 @@ class Racs:
             self.final_temperature_samples = None
             self.final_elevation_samples = None
 
-        return output_map, output_mask
+        summaries: dict[str, NDArray[np.float32]] = {}
+        if include_temperature_summary:
+            temperature_flux_values = (
+                np.concatenate(summary_temperature_flux)
+                if summary_temperature_flux
+                else np.empty(0, dtype=np.float32)
+            )
+            temperature_values = (
+                np.concatenate(summary_temperature)
+                if summary_temperature
+                else np.empty(0, dtype=np.float32)
+            )
+            summaries["temperature"] = binned_flux_quantiles_exact(
+                temperature_flux_values,
+                temperature_values,
+                bin_edges=temperature_edges,
+                quantiles=temperature_quantiles,
+            )
+        if include_elevation_summary:
+            elevation_flux_values = (
+                np.concatenate(summary_elevation_flux)
+                if summary_elevation_flux
+                else np.empty(0, dtype=np.float32)
+            )
+            elevation_values = (
+                np.concatenate(summary_elevation)
+                if summary_elevation
+                else np.empty(0, dtype=np.float32)
+            )
+            summaries["elevation"] = binned_flux_quantiles_exact(
+                elevation_flux_values,
+                elevation_values,
+                bin_edges=elevation_edges,
+                quantiles=elevation_quantiles,
+            )
+
+        return output_map, output_mask, summaries
 
 
 class RacsLow3(Racs):

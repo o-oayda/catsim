@@ -178,6 +178,30 @@ class RacsFluxErrorTests(unittest.TestCase):
         np.testing.assert_allclose(sigma_base, np.full(8, 10.0))
         np.testing.assert_allclose(sigma_eta, np.full(8, 20.0))
 
+    def test_temperature_flux_summary_uses_independent_cut_without_changing_map(self):
+        self._configure_minimal_generate_dipole_sim(n_samples=4)
+        self.sim.cfg.flux_temperature_min_mjy = 2.0
+        self.sim.sample_fluxes = lambda n, rng=None: np.asarray(
+            [2.0, 10.0, 20.0, 30.0],
+            dtype=np.float64,
+        )[:n]
+
+        density_map, mask, summaries = self.sim.generate_dipole_with_flux_summaries(
+            log10_n_initial_samples=np.log10(4.0),
+            temperature_edges=np.asarray([0.0, 40.0]),
+            temperature_quantiles=(0.5,),
+        )
+
+        self.assertEqual(float(np.nansum(density_map[mask])), 2.0)
+        np.testing.assert_allclose(summaries["temperature"], np.asarray([15.0]))
+
+    def test_generate_dipole_keeps_two_value_return_api(self):
+        self._configure_minimal_generate_dipole_sim(n_samples=4)
+
+        result = self.sim.generate_dipole(log10_n_initial_samples=np.log10(4.0))
+
+        self.assertEqual(len(result), 2)
+
     def test_compute_total_flux_error_rejects_negative_eta(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             self.sim.compute_total_flux_error(
