@@ -1249,7 +1249,10 @@ class Racs:
         need_tile_lookup = not self.load_tile_lookup()
         need_sbid_mixture_lookup = False
         need_fractional_error_lookup = not self.load_fractional_error_lookup()
-        need_elevation_lookup = not self.load_elevation_lookup()
+        need_elevation_lookup = (
+            self.product.columns.elevation is not None
+            and not self.load_elevation_lookup()
+        )
 
         if not need_tile_metadata:
             need_sbid_mixture_lookup = not self.load_sbid_mixture_lookup()
@@ -1640,6 +1643,21 @@ class Racs:
             "Run initialise_data() first."
         )
 
+        if not np.isfinite(elevation_amp) or elevation_amp < 0:
+            raise ValueError("elevation_amp must be finite and non-negative.")
+        if not np.isfinite(elevation_trough):
+            raise ValueError("elevation_trough must be finite.")
+        use_elevation = elevation_amp > 0.0
+        elevation_is_available = self.product.columns.elevation is not None
+        if use_elevation and not elevation_is_available:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "source-elevation systematics require catalogue ALT data."
+            )
+        sample_elevation = elevation_is_available and (
+            use_elevation or self.store_final_samples
+        )
+
         self.observer_speed = observer_speed * CMB_BETA
         self.dipole_longitude = dipole_longitude
         self.dipole_latitude = dipole_latitude
@@ -1786,16 +1804,20 @@ class Racs:
                 enhancement,
                 dtype=self.dtype,
             )
-            elevations = self.sample_elevations(pixel_indices, rng=rng)
-            elevation_enhancement = self.evaluate_elevation_enhancement(
-                elevations,
-                elevation_amp=elevation_amp,
-                elevation_trough=elevation_trough,
-            )
-            systematics_flux = (
-                np.asarray(systematics_flux, dtype=np.float64)
-                * np.asarray(elevation_enhancement, dtype=np.float64)
-            ).astype(self.dtype, copy=False)
+            elevations = None
+            if sample_elevation:
+                elevations = self.sample_elevations(pixel_indices, rng=rng)
+            if use_elevation:
+                assert elevations is not None
+                elevation_enhancement = self.evaluate_elevation_enhancement(
+                    elevations,
+                    elevation_amp=elevation_amp,
+                    elevation_trough=elevation_trough,
+                )
+                systematics_flux = (
+                    np.asarray(systematics_flux, dtype=np.float64)
+                    * np.asarray(elevation_enhancement, dtype=np.float64)
+                ).astype(self.dtype, copy=False)
             base_fractional_error = self.sample_fractional_errors(pixel_indices, rng=rng)
             flux_error = self.compute_total_flux_error(
                 systematics_flux,
@@ -1850,7 +1872,10 @@ class Racs:
                 final_ra.append(boosted_ra_deg[keep].astype(np.float32, copy=False))
                 final_dec.append(boosted_dec_deg[keep].astype(np.float32, copy=False))
                 final_temperature.append(temperatures[keep].astype(np.float32, copy=False))
-                final_elevation.append(elevations[keep].astype(np.float32, copy=False))
+                if elevations is not None:
+                    final_elevation.append(
+                        elevations[keep].astype(np.float32, copy=False)
+                    )
 
         self._density_map = density_accumulator.astype(np.float32, copy=False)
         sampled_fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
@@ -1901,9 +1926,14 @@ class Racs:
             self.final_temperature_samples = (
                 np.concatenate(final_temperature) if final_temperature else np.empty(0, dtype=np.float32)
             )
-            self.final_elevation_samples = (
-                np.concatenate(final_elevation) if final_elevation else np.empty(0, dtype=np.float32)
-            )
+            if sample_elevation:
+                self.final_elevation_samples = (
+                    np.concatenate(final_elevation)
+                    if final_elevation
+                    else np.empty(0, dtype=np.float32)
+                )
+            else:
+                self.final_elevation_samples = None
         else:
             self.final_intrinsic_flux_samples = None
             self.final_observed_flux_samples = None

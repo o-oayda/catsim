@@ -363,6 +363,7 @@ def _simulate_one_jax(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array]:
     (
         log_flux_edges,
@@ -479,31 +480,34 @@ def _simulate_one_jax(
         enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         systematics_flux = dipole_flux * enhancement
 
-        elevation_count = elevation_counts[pixel_indices]
-        safe_elevation_count = jnp.maximum(elevation_count, 1)
-        elevation_u = jax.random.uniform(
-            key_elevation,
-            pixel_indices.shape,
-            dtype=jnp.float32,
-        )
-        elevation_choice = jnp.floor(
-            elevation_u * safe_elevation_count.astype(jnp.float32)
-        ).astype(jnp.int32)
-        elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
-        pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
+        if use_elevation:
+            elevation_count = elevation_counts[pixel_indices]
+            safe_elevation_count = jnp.maximum(elevation_count, 1)
+            elevation_u = jax.random.uniform(
+                key_elevation,
+                pixel_indices.shape,
+                dtype=jnp.float32,
+            )
+            elevation_choice = jnp.floor(
+                elevation_u * safe_elevation_count.astype(jnp.float32)
+            ).astype(jnp.int32)
+            elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
+            pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
 
-        global_elevation_choice = jax.random.randint(
-            key_global_elevation,
-            pixel_indices.shape,
-            minval=0,
-            maxval=global_elevation_values.shape[0],
-            dtype=jnp.int32,
-        )
-        global_elevation = global_elevation_values[global_elevation_choice]
-        elevation = jnp.where(elevation_count > 0, pixel_elevation, global_elevation)
-        elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
-        elevation_enhancement = 1.0 + elevation_amp * (1.0 - jnp.cos(elevation_delta_rad))
-        systematics_flux = systematics_flux * elevation_enhancement
+            global_elevation_choice = jax.random.randint(
+                key_global_elevation,
+                pixel_indices.shape,
+                minval=0,
+                maxval=global_elevation_values.shape[0],
+                dtype=jnp.int32,
+            )
+            global_elevation = global_elevation_values[global_elevation_choice]
+            elevation = jnp.where(elevation_count > 0, pixel_elevation, global_elevation)
+            elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
+            elevation_enhancement = 1.0 + elevation_amp * (
+                1.0 - jnp.cos(elevation_delta_rad)
+            )
+            systematics_flux = systematics_flux * elevation_enhancement
 
         error_count = error_counts[pixel_indices]
         safe_error_count = jnp.maximum(error_count, 1)
@@ -589,6 +593,7 @@ def _simulate_one_jax_with_flux_summaries(
     n_flux_bins: int,
     include_temperature: bool,
     include_elevation: bool,
+    use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (
         log_flux_edges,
@@ -715,31 +720,39 @@ def _simulate_one_jax_with_flux_summaries(
         enhancement = jnp.maximum(enhancement, RACS_TEMPERATURE_EPSILON_FLOOR)
         systematics_flux = dipole_flux * enhancement
 
-        elevation_count = elevation_counts[pixel_indices]
-        safe_elevation_count = jnp.maximum(elevation_count, 1)
-        elevation_u = jax.random.uniform(
-            key_elevation,
-            pixel_indices.shape,
-            dtype=jnp.float32,
-        )
-        elevation_choice = jnp.floor(
-            elevation_u * safe_elevation_count.astype(jnp.float32)
-        ).astype(jnp.int32)
-        elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
-        pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
+        elevation = jnp.full(pixel_indices.shape, jnp.nan, dtype=jnp.float32)
+        if use_elevation:
+            elevation_count = elevation_counts[pixel_indices]
+            safe_elevation_count = jnp.maximum(elevation_count, 1)
+            elevation_u = jax.random.uniform(
+                key_elevation,
+                pixel_indices.shape,
+                dtype=jnp.float32,
+            )
+            elevation_choice = jnp.floor(
+                elevation_u * safe_elevation_count.astype(jnp.float32)
+            ).astype(jnp.int32)
+            elevation_choice = jnp.minimum(elevation_choice, elevation_max_count - 1)
+            pixel_elevation = elevation_values_by_pixel[pixel_indices, elevation_choice]
 
-        global_elevation_choice = jax.random.randint(
-            key_global_elevation,
-            pixel_indices.shape,
-            minval=0,
-            maxval=global_elevation_values.shape[0],
-            dtype=jnp.int32,
-        )
-        global_elevation = global_elevation_values[global_elevation_choice]
-        elevation = jnp.where(elevation_count > 0, pixel_elevation, global_elevation)
-        elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
-        elevation_enhancement = 1.0 + elevation_amp * (1.0 - jnp.cos(elevation_delta_rad))
-        systematics_flux = systematics_flux * elevation_enhancement
+            global_elevation_choice = jax.random.randint(
+                key_global_elevation,
+                pixel_indices.shape,
+                minval=0,
+                maxval=global_elevation_values.shape[0],
+                dtype=jnp.int32,
+            )
+            global_elevation = global_elevation_values[global_elevation_choice]
+            elevation = jnp.where(
+                elevation_count > 0,
+                pixel_elevation,
+                global_elevation,
+            )
+            elevation_delta_rad = jnp.deg2rad(elevation - elevation_trough)
+            elevation_enhancement = 1.0 + elevation_amp * (
+                1.0 - jnp.cos(elevation_delta_rad)
+            )
+            systematics_flux = systematics_flux * elevation_enhancement
 
         error_count = error_counts[pixel_indices]
         safe_error_count = jnp.maximum(error_count, 1)
@@ -863,6 +876,7 @@ def _simulate_one_jax_with_flux_summaries(
         "cluster_r0_arcsec",
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
+        "use_elevation",
     ),
 )
 def _simulate_batch_jax(
@@ -891,6 +905,7 @@ def _simulate_batch_jax(
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
+    use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array]:
     return jax.vmap(
         partial(
@@ -906,6 +921,7 @@ def _simulate_batch_jax(
             cluster_r0_arcsec=cluster_r0_arcsec,
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
+            use_elevation=use_elevation,
         )
     )(
         keys,
@@ -939,6 +955,7 @@ def _simulate_batch_jax(
         "n_flux_bins",
         "include_temperature",
         "include_elevation",
+        "use_elevation",
     ),
 )
 def _simulate_batch_jax_with_flux_summaries(
@@ -975,6 +992,7 @@ def _simulate_batch_jax_with_flux_summaries(
     n_flux_bins: int,
     include_temperature: bool,
     include_elevation: bool,
+    use_elevation: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     return jax.vmap(
         partial(
@@ -997,6 +1015,7 @@ def _simulate_batch_jax_with_flux_summaries(
             n_flux_bins=n_flux_bins,
             include_temperature=include_temperature,
             include_elevation=include_elevation,
+            use_elevation=use_elevation,
         )
     )(
         keys,
@@ -1033,6 +1052,7 @@ class RacsJax:
         self._tile_index_from_sbid: dict[int, int] = {}
         self.tile_temperature_by_index: Optional[NDArray[np.float32]] = None
         self.elevation_lookup_values: Optional[NDArray[np.float32]] = None
+        self.elevation_is_available = False
         self.flux_summary_flux_max_mjy: Optional[float] = None
         self.flux_temperature_summary_flux_max_mjy: Optional[float] = None
 
@@ -1069,17 +1089,30 @@ class RacsJax:
             fill_value=0.0,
             dtype=np.float32,
         )
-        elevation_counts = reference.elevation_lookup_pixel_counts.astype(
-            np.int32,
-            copy=False,
-        )
-        elevation_values_by_pixel = _pad_flat_lookup(
-            elevation_counts,
-            reference.elevation_lookup_pixel_starts,
-            reference.elevation_lookup_values,
-            fill_value=0.0,
-            dtype=np.float32,
-        )
+        self.elevation_is_available = self.product.columns.elevation is not None
+        if self.elevation_is_available:
+            elevation_counts = reference.elevation_lookup_pixel_counts.astype(
+                np.int32,
+                copy=False,
+            )
+            elevation_values_by_pixel = _pad_flat_lookup(
+                elevation_counts,
+                reference.elevation_lookup_pixel_starts,
+                reference.elevation_lookup_values,
+                fill_value=0.0,
+                dtype=np.float32,
+            )
+            global_elevation_values = reference.elevation_lookup_values.astype(
+                np.float32,
+                copy=False,
+            )
+        else:
+            elevation_counts = np.zeros(self.mask_map.shape, dtype=np.int32)
+            elevation_values_by_pixel = np.zeros(
+                (self.mask_map.size, 1),
+                dtype=np.float32,
+            )
+            global_elevation_values = np.zeros(1, dtype=np.float32)
 
         if reference.tile_temperature_by_index is None:
             tile_temperature_by_index = np.full(
@@ -1093,9 +1126,8 @@ class RacsJax:
                 copy=False,
             )
         self.tile_temperature_by_index = tile_temperature_by_index
-        self.elevation_lookup_values = reference.elevation_lookup_values.astype(
-            np.float32,
-            copy=False,
+        self.elevation_lookup_values = (
+            global_elevation_values if self.elevation_is_available else None
         )
 
         flux_quantile_bin = int(
@@ -1132,7 +1164,7 @@ class RacsJax:
                 dtype=jnp.float32,
             ),
             global_elevation_values=jnp.asarray(
-                reference.elevation_lookup_values,
+                global_elevation_values,
                 dtype=jnp.float32,
             ),
             tile_temperature_by_index=jnp.asarray(
@@ -1220,6 +1252,12 @@ class RacsJax:
 
         parameters = self._normalise_theta(theta)
         self._validate_parameters(parameters)
+        use_elevation = bool(np.any(parameters["elevation_amp"] > 0.0))
+        if use_elevation and not self.elevation_is_available:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "source-elevation systematics require catalogue ALT data."
+            )
         self._warn_if_cluster_cap_overfills(parameters)
 
         n_sims = parameters["log10_n_initial_samples"].shape[0]
@@ -1290,6 +1328,7 @@ class RacsJax:
                 cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
                 cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                 paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
+                use_elevation=use_elevation,
             )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
@@ -1404,6 +1443,14 @@ class RacsJax:
 
         parameters = self._normalise_theta(theta)
         self._validate_parameters(parameters)
+        use_elevation = include_elevation or bool(
+            np.any(parameters["elevation_amp"] > 0.0)
+        )
+        if use_elevation and not self.elevation_is_available:
+            raise ValueError(
+                f"{self.product.label} does not define an elevation column; "
+                "source-elevation systematics require catalogue ALT data."
+            )
         self._warn_if_cluster_cap_overfills(parameters)
 
         resolved_flux_max = (
@@ -1516,6 +1563,7 @@ class RacsJax:
                     n_flux_bins=int(n_flux_bins),
                     include_temperature=include_temperature,
                     include_elevation=include_elevation,
+                    use_elevation=use_elevation,
                 )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))

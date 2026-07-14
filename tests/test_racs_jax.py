@@ -176,6 +176,54 @@ class RacsJaxTests(unittest.TestCase):
         np.testing.assert_array_equal(first_map, second_map)
         np.testing.assert_array_equal(first_mask, second_mask)
 
+    def test_low3_initialises_without_elevation_and_rejects_nonzero_amplitude(self):
+        from catsim import RacsJax
+
+        sim = RacsJax(
+            RacsConfig(
+                flux_min=15.0,
+                chunk_size=4,
+                store_final_samples=False,
+            )
+        )
+        sim.initialise_data()
+
+        self.assertFalse(sim.elevation_is_available)
+        self.assertIsNone(sim.elevation_lookup_values)
+        density_map, mask = sim.generate_dipole(
+            np.log10(8.0),
+            key=jax.random.PRNGKey(321),
+        )
+        self.assertEqual(density_map.shape, mask.shape)
+
+        with self.assertRaisesRegex(ValueError, "does not define an elevation column"):
+            sim.generate_dipole(
+                np.log10(8.0),
+                elevation_amp=0.1,
+                key=jax.random.PRNGKey(322),
+            )
+
+    def test_low3_rejects_elevation_flux_summary(self):
+        from catsim import RacsJax
+
+        sim = RacsJax(
+            RacsConfig(
+                flux_min=15.0,
+                chunk_size=4,
+                store_final_samples=False,
+            )
+        )
+        sim.initialise_data()
+
+        with self.assertRaisesRegex(ValueError, "does not define an elevation column"):
+            sim.batch_generate_dipole_with_flux_summaries(
+                theta={"log10_n_initial_samples": np.asarray([np.log10(8.0)])},
+                key=jax.random.PRNGKey(323),
+                batch_size=1,
+                elevation_edges=np.asarray([0.0, 90.0], dtype=np.float32),
+                elevation_quantiles=(0.5,),
+            )
+
     def test_batch_generate_dipole_returns_stacked_maps_and_masks(self):
         theta = {
             "log10_n_initial_samples": np.log10(np.array([4.0, 8.0])),

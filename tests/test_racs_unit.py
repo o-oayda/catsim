@@ -303,10 +303,7 @@ class RacsFluxErrorTests(unittest.TestCase):
         expected_effective = np.full(n_samples, 0.2, dtype=np.float32)
         np.testing.assert_allclose(sim.final_base_fractional_error_samples, base_fractional_error)
         np.testing.assert_allclose(sim.final_fractional_error_samples, expected_effective)
-        np.testing.assert_allclose(
-            sim.final_elevation_samples,
-            np.full(n_samples, 60.0, dtype=np.float32),
-        )
+        self.assertIsNone(sim.final_elevation_samples)
 
         sampled_map = sim.sampled_fractional_error_map
         self.assertIsNotNone(sampled_map)
@@ -412,6 +409,7 @@ class RacsFluxErrorTests(unittest.TestCase):
 
     def test_generate_dipole_applies_elevation_enhancement(self):
         sim = self.sim
+        sim.product = RACS_MID1
         n_samples = 6
         self._configure_minimal_generate_dipole_sim(n_samples=n_samples)
         sim.sample_elevations = lambda pixel_indices, rng=None: np.full(
@@ -822,6 +820,37 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unknown RACS product"):
             resolve_racs_product("not-a-product")
+
+    def test_initialise_data_skips_elevation_lookup_for_low3(self):
+        sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+
+        with (
+            patch.object(sim, "load_flux_distribution", return_value=True),
+            patch.object(sim, "load_tile_metadata", return_value=True),
+            patch.object(sim, "load_tile_lookup", return_value=True),
+            patch.object(sim, "load_sbid_mixture_lookup", return_value=True),
+            patch.object(sim, "load_fractional_error_lookup", return_value=True),
+            patch.object(
+                sim,
+                "load_elevation_lookup",
+                side_effect=AssertionError("LOW3 must not load elevation data"),
+            ),
+            patch.object(sim, "load_mask_map"),
+            patch.object(sim, "load_temperature_table"),
+        ):
+            sim.initialise_data()
+
+        self.assertTrue(sim.lookups_are_initialised)
+
+    def test_low3_rejects_nonzero_elevation_model_at_simulation_time(self):
+        sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
+        sim.lookups_are_initialised = True
+
+        with self.assertRaisesRegex(ValueError, "does not define an elevation column"):
+            sim.generate_dipole(
+                log10_n_initial_samples=1.0,
+                elevation_amp=0.1,
+            )
 
     def test_lookup_builders_use_product_column_mapping(self):
         product = RacsProductSpec(
