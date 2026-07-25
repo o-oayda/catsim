@@ -1,6 +1,6 @@
-# RACS-low3 JAX Usage Guide
+# RACS MID1 JAX Usage Guide
 
-This guide explains how the JAX RACS-low3 simulator is generated and executed
+This guide explains how the JAX RACS MID1 simulator is generated and executed
 in the current implementation. The NumPy simulator in `src/catsim/racs.py`
 remains the reference implementation.
 
@@ -10,16 +10,17 @@ remains the reference implementation.
 import jax
 import numpy as np
 
-from catsim import RacsLow3Config, RacsLow3Jax
+from catsim import RACS_MID1, RacsConfig, RacsJax
 
-cfg = RacsLow3Config(
+cfg = RacsConfig(
+    product=RACS_MID1,
     flux_min=15.0,
     chunk_size=50_000,
     store_final_samples=False,
     max_cluster_children_per_parent=16,
 )
 
-sim = RacsLow3Jax(cfg)
+sim = RacsJax(cfg)
 sim.initialise_data()
 
 maps, masks = sim.batch_generate_dipole(
@@ -27,6 +28,8 @@ maps, masks = sim.batch_generate_dipole(
         "log10_n_initial_samples": np.full(8, 5.0),
         "p_clus": np.zeros(8),
         "clus_stop_prob": np.ones(8),
+        "elevation_amp": np.zeros(8),
+        "elevation_trough": np.zeros(8),
     },
     key=jax.random.PRNGKey(123),
     batch_size=4,
@@ -38,7 +41,7 @@ For `nside=64`, `maps.shape == (8, 49152)` and
 
 ## Generation Flow
 
-`RacsLow3Jax.initialise_data()` reuses the existing NumPy `RacsLow3` lookup
+`RacsJax.initialise_data()` reuses the existing NumPy `Racs` lookup
 initialization, then converts the final lookup products into JAX-friendly
 arrays:
 
@@ -47,6 +50,7 @@ arrays:
 - per-pixel SBID/tile mixture tables;
 - tile temperature table;
 - per-pixel fractional-error lookup tables.
+- per-pixel source-elevation lookup tables.
 
 Simulation then runs through a stateless JAX path:
 
@@ -66,8 +70,8 @@ Simulation then runs through a stateless JAX path:
    - sample spectral indices;
    - apply aberration and Doppler flux boosting;
    - compute HEALPix NESTED pixels with a JAX implementation;
-   - sample tile assignment and fractional flux error;
-   - apply temperature suppression and Gaussian flux noise;
+   - sample tile assignment, source elevation, and fractional flux error;
+   - apply temperature suppression, elevation enhancement, and Gaussian flux noise;
    - apply mask, tile validity, and flux threshold;
    - scatter-add kept sources into the density map.
 9. Return `(maps, masks)` as NumPy arrays on the host.
@@ -79,7 +83,8 @@ Both clustering models are supported.
 Geometric clustering:
 
 ```python
-cfg = RacsLow3Config(
+cfg = RacsConfig(
+    product=RACS_MID1,
     flux_min=15.0,
     store_final_samples=False,
     cluster_count_model="geometric",
@@ -95,7 +100,8 @@ theta = {
 Poisson clustering:
 
 ```python
-cfg = RacsLow3Config(
+cfg = RacsConfig(
+    product=RACS_MID1,
     flux_min=15.0,
     store_final_samples=False,
     cluster_count_model="poisson",
@@ -177,15 +183,14 @@ batch shape changes.
 
 The NumPy simulator behavior is intended to remain unchanged.
 
-The only shared NumPy-side change is the new config field in
-`RacsLow3Config`:
+The shared NumPy-side clustering cap is configured through `RacsConfig`:
 
 ```python
 max_cluster_children_per_parent: int = 16
 ```
 
-This field is used by `RacsLow3Jax` for fixed-shape clustering. The existing
-`RacsLow3.generate_dipole` path does not use the cap and still performs dynamic
+This field is used by `RacsJax` for fixed-shape clustering. The existing
+`Racs.generate_dipole` path does not use the cap and still performs dynamic
 NumPy clustering as before.
 
 JAX is now an optional dependency extra in `pyproject.toml`:
@@ -197,4 +202,4 @@ jax = [
 ]
 ```
 
-`from catsim import RacsLow3` remains JAX-free. `RacsLow3Jax` is loaded lazily.
+`from catsim import Racs` remains JAX-free. `RacsJax` is loaded lazily.

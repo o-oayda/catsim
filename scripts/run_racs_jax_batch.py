@@ -1,4 +1,4 @@
-"""Run small batched RACS-low3 JAX simulations for performance checks."""
+"""Run small batched RACS-mid1 JAX simulations for performance checks."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import warnings
 import jax
 import numpy as np
 
-from catsim import RacsLow3Config, RacsLow3Jax
+from catsim import RACS_MID1, RacsConfig, RacsJax
 
 
 def _positive_int(value: str) -> int:
@@ -21,7 +21,7 @@ def _positive_int(value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run batched RACS-low3 JAX map simulations and print timings."
+        description="Run batched RACS-mid1 JAX map simulations and print timings."
     )
     parser.add_argument("--n-sims", type=_positive_int, default=8)
     parser.add_argument("--batch-size", type=_positive_int, default=4)
@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-clus", type=float, default=0.0)
     parser.add_argument("--observer-speed", type=float, default=1.0)
     parser.add_argument("--temp-beta", type=float, default=0.0)
+    parser.add_argument("--elevation-amp", type=float, default=0.0)
+    parser.add_argument("--elevation-trough", type=float, default=0.0)
     parser.add_argument("--fractional-error-eta", type=float, default=0.0)
     parser.add_argument(
         "--skip-warmup",
@@ -63,14 +65,15 @@ def main() -> None:
     args = parse_args()
     print("JAX devices:", ", ".join(str(device) for device in jax.devices()))
 
-    cfg = RacsLow3Config(
+    cfg = RacsConfig(
+        product=RACS_MID1,
         flux_min=args.flux_min,
         chunk_size=args.chunk_size,
         store_final_samples=False,
         cluster_count_model=args.cluster_model,
         max_cluster_children_per_parent=args.max_children,
     )
-    sim = RacsLow3Jax(cfg)
+    sim = RacsJax(cfg)
 
     t0 = perf_counter()
     sim.initialise_data()
@@ -80,6 +83,12 @@ def main() -> None:
         "log10_n_initial_samples": np.full(args.n_sims, args.log10_n, dtype=np.float32),
         "observer_speed": np.full(args.n_sims, args.observer_speed, dtype=np.float32),
         "temp_beta": np.full(args.n_sims, args.temp_beta, dtype=np.float32),
+        "elevation_amp": np.full(args.n_sims, args.elevation_amp, dtype=np.float32),
+        "elevation_trough": np.full(
+            args.n_sims,
+            args.elevation_trough,
+            dtype=np.float32,
+        ),
         "fractional_error_eta": np.full(
             args.n_sims,
             args.fractional_error_eta,

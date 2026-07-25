@@ -13,7 +13,7 @@ import numpy as np
 import healpy as hp
 import matplotlib.pyplot as plt
 
-from catsim import RACS_MID1, RacsConfig, RacsJax
+from catsim import RACS_MID1, RacsConfig, RacsJax, smooth_map
 
 
 def main() -> None:
@@ -22,10 +22,10 @@ def main() -> None:
 
     cfg = RacsConfig(
         product=RACS_MID1,
-        flux_min=0.015,
+        flux_min=15,
         chunk_size=100_000,
         store_final_samples=False,
-        fractional_error_flux_min_mjy=0.01,
+        fractional_error_flux_min_mjy=10,
         temperature_fallback="open_meteo",
     )
     sim = RacsJax(cfg)
@@ -34,7 +34,12 @@ def main() -> None:
     density_map, mask = sim.batch_generate_dipole(
         theta={
             'log10_n_initial_samples': 6.5 * np.ones((NSIMS,)),
-            'temp_beta': 0.02 * np.ones((NSIMS,))
+            'temp_beta': 0.01 * np.ones((NSIMS,)),
+            'dipole_longitude': 260. * np.ones((NSIMS,)),
+            'dipole_latitude': 45. * np.ones((NSIMS,)),
+            'observer_speed': 3. * np.ones((NSIMS,)),
+            'elevation_amp': 0.1 * np.ones((NSIMS,)),
+            'elevation_trough': 50 * np.ones((NSIMS,)),
         },
         batch_size=5,
         key=jax.random.PRNGKey(0),

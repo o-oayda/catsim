@@ -4,18 +4,19 @@ import healpy as hp
 import matplotlib.pyplot as plt
 import numpy as np
 
-from catsim import RacsLow3, RacsLow3Config, smooth_map
+from catsim import RACS_MID1, Racs, RacsConfig, smooth_map
 from catsim.utils.constants import CMB_B, CMB_L
 from dipoleutils.utils.plotting import plot_log_log_histogram
 
 
-config = RacsLow3Config(
+config = RacsConfig(
+    product=RACS_MID1,
     flux_min=15.0,
     chunk_size=100_000,
     store_final_samples=True,
     paf_reference_temp_c=27.1,
 )
-sim = RacsLow3(config)
+sim = Racs(config)
 
 init_t0 = time()
 sim.initialise_data()
@@ -27,6 +28,8 @@ dmap, mask = sim.generate_dipole(
     dipole_longitude=308,
     dipole_latitude=-1,
     temp_beta=0.015,
+    elevation_amp=0.0,
+    elevation_trough=0.0,
     # fractional_error_eta=40.
 )
 t1 = time()
@@ -51,6 +54,16 @@ if temperature_map is not None:
         print(f"Temperature range (C): {temperature_map[finite_temperatures].min():.2f} to {temperature_map[finite_temperatures].max():.2f}")
 fractional_error_map = sim.fractional_error_map
 sampled_fractional_error_map = sim.sampled_fractional_error_map
+elevation_map = sim.elevation_map
+if elevation_map is not None:
+    finite_elevations = np.isfinite(elevation_map)
+    print(f"Elevation-covered pixels: {finite_elevations.sum()}")
+    if np.any(finite_elevations):
+        print(
+            "Elevation range (deg): "
+            f"{elevation_map[finite_elevations].min():.2f} to "
+            f"{elevation_map[finite_elevations].max():.2f}"
+        )
 if fractional_error_map is not None:
     finite_fractional_errors = np.isfinite(fractional_error_map)
     print(f"Fractional-error-covered pixels: {finite_fractional_errors.sum()}")
@@ -71,15 +84,15 @@ if sampled_fractional_error_map is not None:
         )
 
 print(f"n sources: {np.nansum(dmap)}")
-# hp.projview(dmap, nest=True, title="RACS-low3 Simulated Count Map")
-# hp.projview(sbid_map, nest=True, title="RACS-low3 SBID Map")
+# hp.projview(dmap, nest=True, title="RACS-mid1 Simulated Count Map")
+# hp.projview(sbid_map, nest=True, title="RACS-mid1 SBID Map")
 # if temperature_map is not None:
-#     hp.projview(temperature_map, nest=True, title="RACS-low3 Temperature Map (C)")
+#     hp.projview(temperature_map, nest=True, title="RACS-mid1 Temperature Map (C)")
 if sampled_fractional_error_map is not None:
     hp.projview(
         sampled_fractional_error_map,
         nest=True,
-        title="RACS-low3 Sampled Fractional Error Map",
+        title="RACS-mid1 Sampled Fractional Error Map",
     )
 smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True, min=13.02, max=14.41)
 plt.show()
