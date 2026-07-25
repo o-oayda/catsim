@@ -74,7 +74,7 @@ jax = [
 requires-dist = [
     { name = "astropy", specifier = ">=7.1.1,<8.0.0" },
     { name = "dill", specifier = ">=0.4.0,<0.5.0" },
-    { name = "dipole-utils", git = "https://github.com/o-oayda/dipole-utils.git?rev=racs-paf" },
+    { name = "dipole-utils", git = "https://github.com/o-oayda/dipole-utils.git?rev=main" },
     { name = "healpy", specifier = ">=1.18.1,<2.0.0" },
     { name = "ipython", specifier = ">=9.7.0,<10.0.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'jax'", specifier = ">=0.10.1,<0.11.0" },
@@ -243,7 +243,7 @@ wheels = [
 [[package]]
 name = "dipole-utils"
 version = "0.1.0"
-source = { git = "https://github.com/o-oayda/dipole-utils.git?rev=racs-paf#2f3f6c1eced1c4adfdae0c7a26e3eea881760438" }
+source = { git = "https://github.com/o-oayda/dipole-utils.git?rev=main#c019cce829d9a034bf77364d94cbe362cf0dc66f" }
 dependencies = [
     { name = "astropy" },
     { name = "corner" },
@@ -254,6 +254,7 @@ dependencies = [
     { name = "ipython" },
     { name = "matplotlib" },
     { name = "numpy" },
+    { name = "pyyaml" },
     { name = "scipy" },
     { name = "ultranest" },
 ]
