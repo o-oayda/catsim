@@ -79,10 +79,31 @@ RACS_MID1 = RacsProductSpec(
     ),
 )
 
+RACS_LOW2 = RacsProductSpec(
+    key="lo22",
+    label="RACS LOW2",
+    data_loader_catalogue="racs",
+    data_loader_variant="low2",
+    data_dir_name="racs_low2",
+    columns=RacsCatalogueColumns(
+        ra="RA",
+        dec="Dec",
+        tile_id="SBID",
+        total_flux="Total_flux",
+        total_flux_error="E_Total_flux",
+        scan_start_mjd="Scan_start_MJD",
+        scan_length="Scan_length",
+        field_id="Field_ID",
+        source_name="Name",
+        elevation=None,
+    ),
+)
+
 
 RACS_PRODUCTS: Mapping[str, RacsProductSpec] = {
     RACS_LOW3.key: RACS_LOW3,
     RACS_MID1.key: RACS_MID1,
+    RACS_LOW2.key: RACS_LOW2
 }
 
 
@@ -97,6 +118,8 @@ def resolve_racs_product(product: str | RacsProductSpec) -> RacsProductSpec:
         "racs_low3": "low3",
         "racs-mid1": "mid1",
         "racs_mid1": "mid1",
+        "racs-low2": "low2",
+        "racs_low2": "low1",
     }
     key = aliases.get(key, key)
     if key not in RACS_PRODUCTS:
