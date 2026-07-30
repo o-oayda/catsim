@@ -80,7 +80,7 @@ RACS_MID1 = RacsProductSpec(
 )
 
 RACS_LOW2 = RacsProductSpec(
-    key="lo22",
+    key="low2",
     label="RACS LOW2",
     data_loader_catalogue="racs",
     data_loader_variant="low2",
@@ -119,7 +119,7 @@ def resolve_racs_product(product: str | RacsProductSpec) -> RacsProductSpec:
         "racs-mid1": "mid1",
         "racs_mid1": "mid1",
         "racs-low2": "low2",
-        "racs_low2": "low1",
+        "racs_low2": "low2",
     }
     key = aliases.get(key, key)
     if key not in RACS_PRODUCTS:
