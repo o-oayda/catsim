@@ -44,6 +44,7 @@ from .racs_temperature import (
 
 LOW3_TEMPERATURE_EPSILON_FLOOR = RACS_TEMPERATURE_EPSILON_FLOOR
 LOGGER = logging.getLogger(__name__)
+TemperatureSource = Literal["mean_paf", "open_meteo", "hybrid"]
 
 
 @dataclass
@@ -235,6 +236,9 @@ class Racs:
 
     def _open_meteo_temperature_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"temperature_lookup_nside{self.nside}_open_meteo.npz"
+
+    def _hybrid_temperature_lookup_cache_path(self) -> Path:
+        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_hybrid.npz"
 
     def _elevation_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"elevation_lookup_nside{self.nside}.npz"
@@ -640,16 +644,16 @@ class Racs:
 
         self.temperature_map = temperature_map
 
-    def save_temperature_lookup(self, source: Literal["mean_paf", "open_meteo"] = "mean_paf") -> None:
+    def save_temperature_lookup(
+        self,
+        source: TemperatureSource = "mean_paf",
+        tile_temperature_sources: NDArray[np.str_] | None = None,
+    ) -> None:
         """Persist the per-tile and per-pixel temperature lookup."""
         if self.tile_temperature_by_index is None:
             return
 
-        cache_path = (
-            self._temperature_lookup_cache_path()
-            if source == "mean_paf"
-            else self._open_meteo_temperature_lookup_cache_path()
-        )
+        cache_path = self._temperature_lookup_cache_path_for_source(source)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "nside": np.asarray(self.nside, dtype=np.int64),
@@ -660,7 +664,14 @@ class Racs:
             ),
             "temperature_source": np.asarray(source),
         }
-        if source == "mean_paf":
+        if tile_temperature_sources is not None:
+            per_tile_sources = np.asarray(tile_temperature_sources, dtype=np.str_)
+            if per_tile_sources.shape != self.tile_temperature_by_index.shape:
+                raise ValueError(
+                    "tile_temperature_sources must match tile_temperature_by_index."
+                )
+            payload["tile_temperature_sources"] = per_tile_sources
+        if source in {"mean_paf", "hybrid"}:
             paf_data_dir: Path | None
             try:
                 paf_data_dir = self._resolve_paf_temperature_data_dir()
@@ -677,7 +688,7 @@ class Racs:
                         ),
                     }
                 )
-        if source == "open_meteo":
+        if source in {"open_meteo", "hybrid"}:
             payload.update(
                 {
                     "open_meteo_latitude_deg": np.asarray(
@@ -700,8 +711,13 @@ class Racs:
             )
         np.savez_compressed(cache_path, **payload)
         if self.temperature_map is not None:
-            source_label = "Mean PAF" if source == "mean_paf" else "Open-Meteo"
-            png_token = "paf" if source == "mean_paf" else "open_meteo"
+            source_labels = {
+                "mean_paf": "Mean PAF",
+                "open_meteo": "Open-Meteo",
+                "hybrid": "Mean PAF + Open-Meteo",
+            }
+            source_label = source_labels[source]
+            png_token = "paf" if source == "mean_paf" else source
             self._save_lookup_map_png(
                 self.temperature_map,
                 cache_path.with_suffix(".png"),
@@ -719,13 +735,9 @@ class Racs:
                     coord=coord
                 )
 
-    def load_temperature_lookup(self, source: Literal["mean_paf", "open_meteo"] = "mean_paf") -> bool:
+    def load_temperature_lookup(self, source: TemperatureSource = "mean_paf") -> bool:
         """Load a cached per-tile temperature lookup if it matches the tile metadata."""
-        cache_path = (
-            self._temperature_lookup_cache_path()
-            if source == "mean_paf"
-            else self._open_meteo_temperature_lookup_cache_path()
-        )
+        cache_path = self._temperature_lookup_cache_path_for_source(source)
         if not cache_path.exists():
             return False
 
@@ -740,13 +752,38 @@ class Racs:
             if not np.array_equal(cache_tile_sbids, self.tile_sbids):
                 return False
 
+            if "temperature_source" in data.files:
+                if str(data["temperature_source"]) != source:
+                    return False
+            elif source == "hybrid":
+                return False
+
             if (
-                source == "mean_paf"
+                source in {"mean_paf", "hybrid"}
                 and not self._temperature_lookup_cache_matches_paf_config(data)
             ):
                 return False
+            if (
+                source in {"open_meteo", "hybrid"}
+                and not self._temperature_lookup_cache_matches_open_meteo_config(data)
+            ):
+                return False
 
-            self.tile_temperature_by_index = data["tile_temperature_by_index"].astype(
+            cached_temperatures = data["tile_temperature_by_index"]
+            if source == "hybrid":
+                if "tile_temperature_sources" not in data.files:
+                    return False
+                cached_sources = data["tile_temperature_sources"]
+                if cached_sources.shape != cached_temperatures.shape:
+                    return False
+                if cached_sources.shape != cache_tile_sbids.shape:
+                    return False
+                if not np.all(
+                    np.isin(cached_sources, np.asarray(["mean_paf", "open_meteo"]))
+                ):
+                    return False
+
+            self.tile_temperature_by_index = cached_temperatures.astype(
                 np.float64,
                 copy=False,
             )
@@ -754,6 +791,16 @@ class Racs:
         self._validate_tile_temperatures(source=source)
         self.build_temperature_map()
         return True
+
+    def _temperature_lookup_cache_path_for_source(
+        self,
+        source: TemperatureSource,
+    ) -> Path:
+        if source == "mean_paf":
+            return self._temperature_lookup_cache_path()
+        if source == "open_meteo":
+            return self._open_meteo_temperature_lookup_cache_path()
+        return self._hybrid_temperature_lookup_cache_path()
 
     def build_elevation_lookup(self) -> None:
         """Build a per-pixel empirical lookup of source elevations in degrees."""
@@ -906,6 +953,34 @@ class Racs:
         return str(data["paf_temperature_data_dir"]) == str(
             self._resolve_paf_temperature_data_dir()
         )
+
+    def _temperature_lookup_cache_matches_open_meteo_config(
+        self,
+        data: np.lib.npyio.NpzFile,
+    ) -> bool:
+        """Return whether a cached lookup matches Open-Meteo request inputs."""
+        required_fields = {
+            "open_meteo_latitude_deg",
+            "open_meteo_longitude_deg",
+            "tile_scan_start_mjd",
+        }
+        if not required_fields.issubset(data.files):
+            return False
+        if not np.isclose(
+            float(data["open_meteo_latitude_deg"]),
+            self.cfg.open_meteo_latitude_deg,
+        ):
+            return False
+        if not np.isclose(
+            float(data["open_meteo_longitude_deg"]),
+            self.cfg.open_meteo_longitude_deg,
+        ):
+            return False
+        cached_scan_start_mjd = data["tile_scan_start_mjd"].astype(
+            np.float64,
+            copy=False,
+        )
+        return np.array_equal(cached_scan_start_mjd, self.tile_scan_start_mjd)
 
     def build_fractional_error_lookup(self) -> None:
         """Build a per-pixel empirical lookup of fractional flux errors."""
@@ -1145,14 +1220,13 @@ class Racs:
                 raise
         if (
             self.cfg.temperature_fallback == "open_meteo"
-            and self.load_temperature_lookup(source="open_meteo")
+            and self.load_temperature_lookup(source="hybrid")
         ):
             LOGGER.warning(
-                "%s using cached Open-Meteo ambient temperature fallback lookup.",
+                "%s using cached hybrid PAF and Open-Meteo temperature lookup.",
                 self.product.label,
             )
             return
-
         try:
             paf_data_dir = self._resolve_paf_temperature_data_dir()
             self.tile_temperature_by_index = np.asarray(
@@ -1163,15 +1237,70 @@ class Racs:
                 ),
                 dtype=np.float64,
             )
-            self._validate_tile_temperatures(source="mean_paf")
         except Exception as exc:
             paf_failure = exc
             self.tile_temperature_by_index = None
             if self.cfg.temperature_fallback != "open_meteo":
                 raise
         else:
-            self.build_temperature_map()
-            self.save_temperature_lookup(source="mean_paf")
+            invalid_paf = ~np.isfinite(self.tile_temperature_by_index)
+            if np.any(invalid_paf):
+                if self.cfg.temperature_fallback != "open_meteo":
+                    self._validate_tile_temperatures(source="mean_paf")
+                if np.all(invalid_paf):
+                    paf_failure = ValueError(
+                        "PAF lookup contains no finite temperatures."
+                    )
+                    self.tile_temperature_by_index = None
+                else:
+                    invalid_sbids = self.tile_sbids[invalid_paf]
+                    LOGGER.warning(
+                        "%s PAF temperature lookup is missing %d SBID(s); filling "
+                        "only those temperatures from Open-Meteo: %s",
+                        self.product.label,
+                        invalid_sbids.size,
+                        ", ".join(str(int(sbid)) for sbid in invalid_sbids[:10]),
+                    )
+                    open_meteo_temperatures = np.asarray(
+                        get_open_meteo_temperatures_for_mjd(
+                            self.tile_scan_start_mjd[invalid_paf],
+                            latitude_deg=self.cfg.open_meteo_latitude_deg,
+                            longitude_deg=self.cfg.open_meteo_longitude_deg,
+                            timeout=self.cfg.open_meteo_timeout_seconds,
+                            cache_dir=self.cfg.open_meteo_cache_dir,
+                        ),
+                        dtype=np.float64,
+                    )
+                    self.tile_temperature_by_index[invalid_paf] = open_meteo_temperatures
+                    self._validate_tile_temperatures(source="hybrid")
+                    tile_temperature_sources = np.full(
+                        self.tile_temperature_by_index.shape,
+                        "mean_paf",
+                        dtype="<U10",
+                    )
+                    tile_temperature_sources[invalid_paf] = "open_meteo"
+                    self.build_temperature_map()
+                    self.save_temperature_lookup(
+                        source="hybrid",
+                        tile_temperature_sources=tile_temperature_sources,
+                    )
+                    return
+            else:
+                self._validate_tile_temperatures(source="mean_paf")
+                self.build_temperature_map()
+                self.save_temperature_lookup(source="mean_paf")
+                return
+
+        if (
+            self.cfg.temperature_fallback == "open_meteo"
+            and self.load_temperature_lookup(source="open_meteo")
+        ):
+            LOGGER.warning(
+                "%s PAF temperature lookup failed; using cached Open-Meteo "
+                "ambient temperature fallback lookup: %s",
+                self.product.label,
+                paf_failure,
+            )
             return
 
         LOGGER.warning(
@@ -1196,7 +1325,7 @@ class Racs:
 
     def _validate_tile_temperatures(
         self,
-        source: Literal["mean_paf", "open_meteo"] = "mean_paf",
+        source: TemperatureSource = "mean_paf",
     ) -> None:
         """Fail initialisation if any SBID has no finite PAF temperature."""
         if self.tile_temperature_by_index is None:
@@ -1212,7 +1341,11 @@ class Racs:
         preview = ", ".join(str(int(sbid)) for sbid in invalid_sbids[:10])
         if invalid_sbids.size > 10:
             preview += ", ..."
-        source_label = "PAF" if source == "mean_paf" else "Open-Meteo"
+        source_label = {
+            "mean_paf": "PAF",
+            "open_meteo": "Open-Meteo",
+            "hybrid": "hybrid PAF and Open-Meteo",
+        }[source]
         raise ValueError(
             f"{self.product.label} {source_label} temperature lookup contains non-finite "
             f"temperatures for {invalid_sbids.size} SBID(s): {preview}."
