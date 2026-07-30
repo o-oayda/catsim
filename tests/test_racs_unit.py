@@ -1060,8 +1060,17 @@ class RacsInitialiseDataTests(unittest.TestCase):
                     elevation="ALT",
                 ),
             )
-            sim = Racs(RacsConfig(product=product, flux_min=15.0, nside=64, chunk_size=16))
+            sim = Racs(
+                RacsConfig(
+                    product=product,
+                    flux_min=15.0,
+                    nside=64,
+                    chunk_size=16,
+                    paf_temperature_data_dir=tmpdir,
+                )
+            )
             cache_dir = Path(tmpdir)
+            _write_paf_csv(cache_dir / "ak01.csv", [])
             n_pix = hp.nside2npix(sim.nside)
 
             sim._cache_dir = lambda: cache_dir
@@ -1109,7 +1118,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.temperature_map = np.full(n_pix, np.nan, dtype=np.float32)
             sim.temperature_map[:2] = np.array([20.0, 21.0], dtype=np.float32)
             sim.save_temperature_lookup()
-            self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.png").exists())
+            self.assertTrue((cache_dir / "temperature_lookup_nside64.png").exists())
 
             sim.elevation_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
             sim.elevation_lookup_pixel_counts[:2] = 1
@@ -1213,8 +1222,8 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 sim.temperature_map[:2],
                 np.full(2, expected_temperature, dtype=np.float32),
             )
-            self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
-            self.assertTrue((cache_dir / "temperature_lookup_nside64_mean_paf.png").exists())
+            self.assertTrue((cache_dir / "temperature_lookup_nside64.npz").exists())
+            self.assertTrue((cache_dir / "temperature_lookup_nside64.png").exists())
             self.assertTrue(
                 any("legacy flat directory" in message for message in logs.output)
             )
@@ -1266,8 +1275,8 @@ class RacsInitialiseDataTests(unittest.TestCase):
             )
             self.assertTrue(any(str(mid1_paf_dir) in message for message in logs.output))
             self.assertFalse(any(str(low3_paf_dir) in message for message in logs.output))
-            with np.load(cache_dir / "temperature_lookup_nside64_mean_paf.npz") as data:
-                self.assertEqual(str(data["paf_product_key"]), "mid1")
+            with np.load(cache_dir / "temperature_lookup_nside64.npz") as data:
+                self.assertEqual(str(data["product_key"]), "mid1")
                 self.assertEqual(str(data["paf_temperature_data_dir"]), str(mid1_paf_dir))
 
     def test_configured_paf_root_ignores_legacy_cache_without_source_metadata(self):
@@ -1349,7 +1358,207 @@ class RacsInitialiseDataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "non-finite temperatures.*101, 202"):
                 sim.load_temperature_table()
 
-            self.assertFalse((cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists())
+            self.assertFalse((cache_dir / "temperature_lookup_nside64.npz").exists())
+
+    def test_reference_fallback_requires_explicit_positive_tile_limit(self):
+        for value in (None, 0, -1, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "max_reference_fallback_tiles.*positive integer"
+                ):
+                    RacsConfig(
+                        flux_min=15.0,
+                        temperature_fallback="reference",
+                        max_reference_fallback_tiles=value,
+                    )
+
+    def test_reference_fallback_fills_only_missing_paf_temperature(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_dir = tmp_path / "paf"
+            cache_dir = tmp_path / "cache"
+            paf_dir.mkdir()
+            _write_paf_csv(paf_dir / "ak01.csv", [])
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    paf_temperature_data_dir=str(paf_dir),
+                    paf_reference_temp_c=25.0,
+                    temperature_fallback="reference",
+                    max_reference_fallback_tiles=1,
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202, 303], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0, 60002.0])
+
+            with (
+                self.assertLogs("catsim.racs", level="WARNING") as logs,
+                patch(
+                    "catsim.racs.get_mean_paf_temperatures_for_observations",
+                    return_value=np.array([10.0, np.nan, 30.0]),
+                ),
+                patch.object(sim, "build_temperature_map"),
+            ):
+                sim.load_temperature_table()
+
+            np.testing.assert_allclose(
+                sim.tile_temperature_by_index, np.array([10.0, 25.0, 30.0])
+            )
+            self.assertTrue(
+                any(
+                    "reference temperature 25.000 C" in message
+                    for message in logs.output
+                )
+            )
+            self.assertTrue(any("202" in message for message in logs.output))
+            with np.load(cache_dir / "temperature_lookup_nside64.npz") as data:
+                np.testing.assert_array_equal(
+                    data["tile_temperature_sources"],
+                    np.array(["mean_paf", "reference", "mean_paf"]),
+                )
+
+    def test_reference_fallback_rejects_missing_count_above_limit(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_dir = tmp_path / "paf"
+            paf_dir.mkdir()
+            _write_paf_csv(paf_dir / "ak01.csv", [])
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    paf_temperature_data_dir=str(paf_dir),
+                    temperature_fallback="reference",
+                    max_reference_fallback_tiles=1,
+                )
+            )
+            sim._cache_dir = lambda: tmp_path / "cache"
+            sim.tile_sbids = np.array([101, 202, 303], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0, 60002.0])
+
+            with (
+                patch(
+                    "catsim.racs.get_mean_paf_temperatures_for_observations",
+                    return_value=np.array([10.0, np.nan, np.nan]),
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "exceeding max_reference_fallback_tiles=1.*202, 303"
+                ),
+            ):
+                sim.load_temperature_table()
+
+    def test_reference_fallback_does_not_mask_complete_paf_failure(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            missing_paf_dir = tmp_path / "missing"
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    paf_temperature_data_dir=str(missing_paf_dir),
+                    temperature_fallback="reference",
+                    max_reference_fallback_tiles=1,
+                )
+            )
+            sim._cache_dir = lambda: tmp_path / "cache"
+            sim.tile_sbids = np.array([101], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0])
+
+            with self.assertRaisesRegex(FileNotFoundError, "missing directory"):
+                sim.load_temperature_table()
+
+    def test_reference_fallback_rejects_all_nonfinite_paf_lookup(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_dir = tmp_path / "paf"
+            paf_dir.mkdir()
+            _write_paf_csv(paf_dir / "ak01.csv", [])
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    paf_temperature_data_dir=str(paf_dir),
+                    temperature_fallback="reference",
+                    max_reference_fallback_tiles=2,
+                )
+            )
+            sim._cache_dir = lambda: tmp_path / "cache"
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0])
+
+            with (
+                patch(
+                    "catsim.racs.get_mean_paf_temperatures_for_observations",
+                    return_value=np.array([np.nan, np.nan]),
+                ),
+                self.assertRaisesRegex(ValueError, "no finite temperatures"),
+            ):
+                sim.load_temperature_table()
+
+    def test_reference_cache_reuse_and_config_invalidation(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_dir = tmp_path / "paf"
+            cache_dir = tmp_path / "cache"
+            paf_dir.mkdir()
+            _write_paf_csv(paf_dir / "ak01.csv", [])
+            base_kwargs = {
+                "flux_min": 15.0,
+                "paf_temperature_data_dir": str(paf_dir),
+                "temperature_fallback": "reference",
+                "max_reference_fallback_tiles": 1,
+            }
+            sim = RacsLow3(RacsLow3Config(**base_kwargs, paf_reference_temp_c=25.0))
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0])
+            sim.tile_temperature_by_index = np.array([10.0, 25.0])
+            sim.save_temperature_lookup(
+                tile_temperature_sources=np.array(["mean_paf", "reference"])
+            )
+            with patch.object(sim, "build_temperature_map"):
+                self.assertTrue(sim.load_temperature_lookup())
+
+            changed = RacsLow3(
+                RacsLow3Config(**base_kwargs, paf_reference_temp_c=24.0)
+            )
+            changed._cache_dir = lambda: cache_dir
+            changed.tile_sbids = sim.tile_sbids
+            changed.tile_scan_start_mjd = sim.tile_scan_start_mjd
+            with patch.object(changed, "build_temperature_map"):
+                self.assertFalse(changed.load_temperature_lookup())
+
+            self.assertEqual(
+                sorted(path.name for path in cache_dir.glob("temperature_lookup*.npz")),
+                ["temperature_lookup_nside64.npz"],
+            )
+
+    def test_reference_cache_does_not_mask_unavailable_paf_source(self):
+        with TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            paf_dir = tmp_path / "paf"
+            cache_dir = tmp_path / "cache"
+            paf_dir.mkdir()
+            paf_path = paf_dir / "ak01.csv"
+            _write_paf_csv(paf_path, [])
+            sim = RacsLow3(
+                RacsLow3Config(
+                    flux_min=15.0,
+                    paf_temperature_data_dir=str(paf_dir),
+                    temperature_fallback="reference",
+                    max_reference_fallback_tiles=1,
+                )
+            )
+            sim._cache_dir = lambda: cache_dir
+            sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0])
+            sim.tile_temperature_by_index = np.array([10.0, 25.0])
+            sim.save_temperature_lookup(
+                tile_temperature_sources=np.array(["mean_paf", "reference"])
+            )
+
+            paf_path.unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "temperature files"):
+                sim.load_temperature_table()
 
     def test_load_temperature_table_falls_back_to_open_meteo_when_configured(self):
         with TemporaryDirectory() as tmpdir:
@@ -1398,14 +1607,17 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 np.array([20.0, 21.0], dtype=np.float64),
             )
             self.assertTrue(
-                (cache_dir / "temperature_lookup_nside64_open_meteo.npz").exists()
+                (cache_dir / "temperature_lookup_nside64.npz").exists()
             )
             self.assertFalse(
                 (cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists()
             )
 
-            with np.load(cache_dir / "temperature_lookup_nside64_open_meteo.npz") as data:
-                self.assertEqual(str(data["temperature_source"]), "open_meteo")
+            with np.load(cache_dir / "temperature_lookup_nside64.npz") as data:
+                np.testing.assert_array_equal(
+                    data["tile_temperature_sources"],
+                    np.array(["open_meteo", "open_meteo"]),
+                )
                 np.testing.assert_array_equal(data["tile_sbids"], sim.tile_sbids)
 
     def test_load_temperature_table_fills_only_missing_paf_temperatures(self):
@@ -1462,13 +1674,12 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 sim.tile_temperature_by_index,
                 np.array([10.0, 21.0, 30.0], dtype=np.float64),
             )
-            hybrid_cache = cache_dir / "temperature_lookup_nside64_hybrid.npz"
+            hybrid_cache = cache_dir / "temperature_lookup_nside64.npz"
             self.assertTrue(hybrid_cache.exists())
             self.assertFalse(
                 (cache_dir / "temperature_lookup_nside64_open_meteo.npz").exists()
             )
             with np.load(hybrid_cache) as data:
-                self.assertEqual(str(data["temperature_source"]), "hybrid")
                 np.testing.assert_array_equal(
                     data["tile_temperature_sources"],
                     np.array(["mean_paf", "open_meteo", "mean_paf"]),
@@ -1499,7 +1710,9 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.tile_sbids = np.array([101, 202], dtype=np.int32)
             sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
             sim.tile_temperature_by_index = np.array([90.0, 91.0], dtype=np.float64)
-            sim.save_temperature_lookup(source="open_meteo")
+            sim.save_temperature_lookup(
+                tile_temperature_sources=np.array(["open_meteo", "open_meteo"])
+            )
 
             with (
                 patch(
@@ -1520,7 +1733,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 np.array([10.0, 11.0], dtype=np.float64),
             )
             self.assertTrue(
-                (cache_dir / "temperature_lookup_nside64_mean_paf.npz").exists()
+                (cache_dir / "temperature_lookup_nside64.npz").exists()
             )
 
     def test_load_temperature_table_reuses_matching_hybrid_cache(self):
@@ -1544,7 +1757,6 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
             sim.tile_temperature_by_index = np.array([10.0, 21.0], dtype=np.float64)
             sim.save_temperature_lookup(
-                source="hybrid",
                 tile_temperature_sources=np.array(["mean_paf", "open_meteo"]),
             )
             sim.tile_temperature_by_index = None
@@ -1567,7 +1779,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 np.array([10.0, 21.0], dtype=np.float64),
             )
 
-    def test_load_temperature_lookup_rejects_malformed_hybrid_provenance(self):
+    def test_load_temperature_lookup_rejects_malformed_metadata(self):
         with TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             cache_dir = tmp_path / "cache"
@@ -1587,43 +1799,39 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim._cache_dir = lambda: cache_dir
             sim.tile_sbids = np.array([101, 202], dtype=np.int32)
             sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
-            base_payload = {
-                "nside": np.asarray(64, dtype=np.int64),
-                "tile_sbids": sim.tile_sbids,
-                "tile_temperature_by_index": np.array([10.0, 21.0]),
-                "temperature_source": np.asarray("hybrid"),
-                "paf_product_key": np.asarray("low3"),
-                "paf_temperature_data_dir": np.asarray(str(paf_dir)),
-                "paf_max_interpolation_gap_minutes": np.asarray(20.0),
-                "open_meteo_latitude_deg": np.asarray(
-                    sim.cfg.open_meteo_latitude_deg
+            sim.tile_temperature_by_index = np.array([10.0, 21.0])
+            sim.save_temperature_lookup(
+                tile_temperature_sources=np.array(["mean_paf", "open_meteo"])
+            )
+            cache_path = sim._temperature_lookup_cache_path()
+            with np.load(cache_path) as data:
+                base_payload = {name: data[name] for name in data.files}
+
+            malformed_values = (
+                ("missing format version", "format_version", None),
+                ("wrong format version", "format_version", np.asarray(999)),
+                ("missing provenance", "tile_temperature_sources", None),
+                (
+                    "wrong provenance shape",
+                    "tile_temperature_sources",
+                    np.array(["mean_paf"]),
                 ),
-                "open_meteo_longitude_deg": np.asarray(
-                    sim.cfg.open_meteo_longitude_deg
+                (
+                    "unknown provenance",
+                    "tile_temperature_sources",
+                    np.array(["mean_paf", "unknown"]),
                 ),
-                "tile_scan_start_mjd": sim.tile_scan_start_mjd,
-            }
-            malformed_provenance = (
-                (None, np.array(["mean_paf", "open_meteo"])),
-                ("hybrid", None),
-                ("hybrid", np.array(["mean_paf"])),
-                ("hybrid", np.array(["mean_paf", "unknown"])),
             )
 
-            for source, sources in malformed_provenance:
-                with self.subTest(source=source, sources=sources):
+            for name, field, value in malformed_values:
+                with self.subTest(name=name):
                     payload = dict(base_payload)
-                    if source is None:
-                        payload.pop("temperature_source")
+                    if value is None:
+                        payload.pop(field)
                     else:
-                        payload["temperature_source"] = np.asarray(source)
-                    if sources is not None:
-                        payload["tile_temperature_sources"] = sources
-                    np.savez_compressed(
-                        sim._hybrid_temperature_lookup_cache_path(),
-                        **payload,
-                    )
-                    self.assertFalse(sim.load_temperature_lookup(source="hybrid"))
+                        payload[field] = value
+                    np.savez_compressed(cache_path, **payload)
+                    self.assertFalse(sim.load_temperature_lookup())
 
     def test_load_temperature_table_uses_cached_open_meteo_fallback(self):
         with TemporaryDirectory() as tmpdir:
@@ -1652,7 +1860,9 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
             sim.temperature_map = np.full(n_pix, np.nan, dtype=np.float32)
             sim.temperature_map[:2] = np.array([20.0, 21.0], dtype=np.float32)
-            sim.save_temperature_lookup(source="open_meteo")
+            sim.save_temperature_lookup(
+                tile_temperature_sources=np.array(["open_meteo", "open_meteo"])
+            )
 
             with (
                 patch(
@@ -1699,15 +1909,15 @@ class RacsInitialiseDataTests(unittest.TestCase):
                     sim.load_temperature_table()
 
             self.assertFalse(
-                (cache_dir / "temperature_lookup_nside64_open_meteo.npz").exists()
+                (cache_dir / "temperature_lookup_nside64.npz").exists()
             )
 
     def test_mid1_open_meteo_temperature_lookup_path_is_product_specific(self):
         sim = Racs(RacsConfig(product=RACS_MID1, flux_min=15.0))
 
         self.assertIn(
-            "racs_mid1/lookups/temperature_lookup_nside64_open_meteo.npz",
-            sim._open_meteo_temperature_lookup_cache_path().as_posix(),
+            "racs_mid1/lookups/temperature_lookup_nside64.npz",
+            sim._temperature_lookup_cache_path().as_posix(),
         )
 
     def test_load_temperature_table_uses_cached_paf_lookup_when_present(self):
@@ -1718,6 +1928,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
             sim._cache_dir = lambda: cache_dir
             sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
             sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
             sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
             sim._tile_index_from_sbid = {101: 0, 202: 1}
@@ -1747,6 +1958,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
             sim._cache_dir = lambda: cache_dir
             sim.tile_sbids = np.array([101, 202], dtype=np.int32)
+            sim.tile_scan_start_mjd = np.array([60000.0, 60001.0], dtype=np.float64)
             sim.tile_lookup_map = np.full(n_pix, -1, dtype=np.int32)
             sim.tile_lookup_map[:2] = np.array([101, 202], dtype=np.int32)
             sim._tile_index_from_sbid = {101: 0, 202: 1}
@@ -1756,12 +1968,13 @@ class RacsInitialiseDataTests(unittest.TestCase):
             sim.sbid_mixture_starts[1] = 1
             sim.sbid_mixture_tile_indices = np.array([0, 1], dtype=np.int32)
             sim.sbid_mixture_probabilities = np.array([1.0, 1.0], dtype=np.float64)
-            np.savez_compressed(
-                sim._temperature_lookup_cache_path(),
-                nside=np.asarray(sim.nside, dtype=np.int64),
-                tile_sbids=sim.tile_sbids.astype(np.int32, copy=False),
-                tile_temperature_by_index=np.array([20.0, np.nan], dtype=np.float64),
-            )
+            sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
+            sim.save_temperature_lookup()
+            cache_path = sim._temperature_lookup_cache_path()
+            with np.load(cache_path) as data:
+                payload = {name: data[name] for name in data.files}
+            payload["tile_temperature_by_index"] = np.array([20.0, np.nan])
+            np.savez_compressed(cache_path, **payload)
 
             with self.assertRaisesRegex(ValueError, "non-finite temperatures.*202"):
                 sim.load_temperature_table()

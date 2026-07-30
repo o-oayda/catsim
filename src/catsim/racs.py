@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
+import tempfile
 from typing import Literal, Optional
 
 from astropy.coordinates import SkyCoord
@@ -44,7 +46,8 @@ from .racs_temperature import (
 
 LOW3_TEMPERATURE_EPSILON_FLOOR = RACS_TEMPERATURE_EPSILON_FLOOR
 LOGGER = logging.getLogger(__name__)
-TemperatureSource = Literal["mean_paf", "open_meteo", "hybrid"]
+TemperatureSource = Literal["mean_paf", "open_meteo", "reference"]
+TEMPERATURE_CACHE_FORMAT_VERSION = 2
 
 
 @dataclass
@@ -86,7 +89,8 @@ class RacsConfig:
     paf_reference_temp_c: float = 25.0
     temperature_model: TemperatureModel = "hot_linear"
     paf_max_interpolation_gap_minutes: float = 20.0
-    temperature_fallback: Literal["none", "open_meteo"] = "none"
+    temperature_fallback: Literal["none", "open_meteo", "reference"] = "none"
+    max_reference_fallback_tiles: Optional[int] = None
     open_meteo_cache_dir: Optional[str] = None
     open_meteo_timeout_seconds: float = 60.0
     open_meteo_latitude_deg: float = ASKAP_LATITUDE_DEG
@@ -145,10 +149,20 @@ class RacsConfig:
             )
         if self.paf_max_interpolation_gap_minutes <= 0:
             raise ValueError("paf_max_interpolation_gap_minutes must be positive.")
-        if self.temperature_fallback not in {"none", "open_meteo"}:
+        if self.temperature_fallback not in {"none", "open_meteo", "reference"}:
             raise ValueError(
-                "temperature_fallback must be either 'none' or 'open_meteo'."
+                "temperature_fallback must be 'none', 'open_meteo', or 'reference'."
             )
+        if self.temperature_fallback == "reference":
+            if (
+                isinstance(self.max_reference_fallback_tiles, bool)
+                or not isinstance(self.max_reference_fallback_tiles, int)
+                or self.max_reference_fallback_tiles <= 0
+            ):
+                raise ValueError(
+                    "max_reference_fallback_tiles must be explicitly set to a "
+                    "positive integer when temperature_fallback='reference'."
+                )
         if self.open_meteo_timeout_seconds <= 0:
             raise ValueError("open_meteo_timeout_seconds must be positive.")
         if not np.isfinite(self.open_meteo_latitude_deg):
@@ -232,13 +246,7 @@ class Racs:
         return self._cache_dir() / "tile_metadata.npz"
 
     def _temperature_lookup_cache_path(self) -> Path:
-        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_mean_paf.npz"
-
-    def _open_meteo_temperature_lookup_cache_path(self) -> Path:
-        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_open_meteo.npz"
-
-    def _hybrid_temperature_lookup_cache_path(self) -> Path:
-        return self._cache_dir() / f"temperature_lookup_nside{self.nside}_hybrid.npz"
+        return self._cache_dir() / f"temperature_lookup_nside{self.nside}.npz"
 
     def _elevation_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"elevation_lookup_nside{self.nside}.npz"
@@ -646,140 +654,175 @@ class Racs:
 
     def save_temperature_lookup(
         self,
-        source: TemperatureSource = "mean_paf",
         tile_temperature_sources: NDArray[np.str_] | None = None,
     ) -> None:
         """Persist the per-tile and per-pixel temperature lookup."""
         if self.tile_temperature_by_index is None:
             return
 
-        cache_path = self._temperature_lookup_cache_path_for_source(source)
+        cache_path = self._temperature_lookup_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if tile_temperature_sources is None:
+            tile_temperature_sources = np.full(
+                self.tile_temperature_by_index.shape, "mean_paf", dtype="<U10"
+            )
+        per_tile_sources = np.asarray(tile_temperature_sources, dtype=np.str_)
+        if per_tile_sources.shape != self.tile_temperature_by_index.shape:
+            raise ValueError(
+                "tile_temperature_sources must match tile_temperature_by_index."
+            )
+        allowed_sources = self._allowed_temperature_sources()
+        if not np.all(np.isin(per_tile_sources, np.asarray(allowed_sources))):
+            raise ValueError(
+                "tile_temperature_sources contains values incompatible with "
+                f"temperature_fallback={self.cfg.temperature_fallback!r}."
+            )
+
+        paf_data_dir = self._configured_paf_temperature_data_dir_for_cache()
         payload = {
+            "format_version": np.asarray(TEMPERATURE_CACHE_FORMAT_VERSION, dtype=np.int64),
             "nside": np.asarray(self.nside, dtype=np.int64),
+            "product_key": np.asarray(self.product.key),
+            "temperature_fallback": np.asarray(self.cfg.temperature_fallback),
             "tile_sbids": self.tile_sbids.astype(np.int32, copy=False),
+            "tile_scan_start_mjd": self.tile_scan_start_mjd.astype(np.float64, copy=False),
             "tile_temperature_by_index": self.tile_temperature_by_index.astype(
                 np.float64,
                 copy=False,
             ),
-            "temperature_source": np.asarray(source),
+            "tile_temperature_sources": per_tile_sources,
+            "paf_temperature_data_dir": np.asarray(paf_data_dir),
+            "paf_max_interpolation_gap_minutes": np.asarray(
+                self.cfg.paf_max_interpolation_gap_minutes, dtype=np.float64
+            ),
+            "paf_reference_temp_c": np.asarray(
+                self.cfg.paf_reference_temp_c, dtype=np.float64
+            ),
+            "max_reference_fallback_tiles": np.asarray(
+                -1 if self.cfg.max_reference_fallback_tiles is None
+                else self.cfg.max_reference_fallback_tiles,
+                dtype=np.int64,
+            ),
+            "open_meteo_latitude_deg": np.asarray(
+                self.cfg.open_meteo_latitude_deg, dtype=np.float64
+            ),
+            "open_meteo_longitude_deg": np.asarray(
+                self.cfg.open_meteo_longitude_deg, dtype=np.float64
+            ),
+            "open_meteo_timeout_seconds": np.asarray(
+                self.cfg.open_meteo_timeout_seconds, dtype=np.float64
+            ),
+            "open_meteo_cache_dir": np.asarray(
+                "" if self.cfg.open_meteo_cache_dir is None
+                else str(Path(self.cfg.open_meteo_cache_dir).expanduser().resolve())
+            ),
         }
-        if tile_temperature_sources is not None:
-            per_tile_sources = np.asarray(tile_temperature_sources, dtype=np.str_)
-            if per_tile_sources.shape != self.tile_temperature_by_index.shape:
-                raise ValueError(
-                    "tile_temperature_sources must match tile_temperature_by_index."
-                )
-            payload["tile_temperature_sources"] = per_tile_sources
-        if source in {"mean_paf", "hybrid"}:
-            paf_data_dir: Path | None
-            try:
-                paf_data_dir = self._resolve_paf_temperature_data_dir()
-            except FileNotFoundError:
-                paf_data_dir = None
-            if paf_data_dir is not None:
-                payload.update(
-                    {
-                        "paf_product_key": np.asarray(self.product.key),
-                        "paf_temperature_data_dir": np.asarray(str(paf_data_dir)),
-                        "paf_max_interpolation_gap_minutes": np.asarray(
-                            self.cfg.paf_max_interpolation_gap_minutes,
-                            dtype=np.float64,
-                        ),
-                    }
-                )
-        if source in {"open_meteo", "hybrid"}:
-            payload.update(
-                {
-                    "open_meteo_latitude_deg": np.asarray(
-                        self.cfg.open_meteo_latitude_deg,
-                        dtype=np.float64,
-                    ),
-                    "open_meteo_longitude_deg": np.asarray(
-                        self.cfg.open_meteo_longitude_deg,
-                        dtype=np.float64,
-                    ),
-                    "open_meteo_timeout_seconds": np.asarray(
-                        self.cfg.open_meteo_timeout_seconds,
-                        dtype=np.float64,
-                    ),
-                    "tile_scan_start_mjd": self.tile_scan_start_mjd.astype(
-                        np.float64,
-                        copy=False,
-                    ),
-                }
-            )
-        np.savez_compressed(cache_path, **payload)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=cache_path.parent,
+                prefix=f".{cache_path.stem}.",
+                suffix=".npz",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+            np.savez_compressed(temporary_path, **payload)
+            os.replace(temporary_path, cache_path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
         if self.temperature_map is not None:
-            source_labels = {
-                "mean_paf": "Mean PAF",
-                "open_meteo": "Open-Meteo",
-                "hybrid": "Mean PAF + Open-Meteo",
-            }
-            source_label = source_labels[source]
-            png_token = "paf" if source == "mean_paf" else source
+            unique_sources = set(per_tile_sources.tolist())
+            source_label = " + ".join(
+                label
+                for source, label in (
+                    ("mean_paf", "Mean PAF"),
+                    ("open_meteo", "Open-Meteo"),
+                    ("reference", "Reference"),
+                )
+                if source in unique_sources
+            )
             self._save_lookup_map_png(
                 self.temperature_map,
                 cache_path.with_suffix(".png"),
-                title=f"{self.product.label} {source_label} Temperature Lookup (nside={self.nside})",
+                title=(
+                    f"{self.product.label} {source_label} Temperature Lookup "
+                    f"(nside={self.nside})"
+                ),
                 unit="deg C",
                 cmap="coolwarm",
             )
             for coord, coord_str in zip([['C'], ['C', 'G']], ['eq', 'gal']):
                 self._save_lookup_map_png(
                     self.temperature_map,
-                    f'{str(self._cache_dir())}/temperature_lookup_{png_token}_{coord_str}.png',
-                    title=f"{self.product.label} {source_label} Temperature Lookup (nside={self.nside})",
+                    self._cache_dir() / f"temperature_lookup_nside{self.nside}_{coord_str}.png",
+                    title=(
+                        f"{self.product.label} {source_label} Temperature Lookup "
+                        f"(nside={self.nside})"
+                    ),
                     unit="deg C",
                     cmap="coolwarm",
                     coord=coord
                 )
 
-    def load_temperature_lookup(self, source: TemperatureSource = "mean_paf") -> bool:
+    def load_temperature_lookup(self, *, allow_complete_open_meteo: bool = True) -> bool:
         """Load a cached per-tile temperature lookup if it matches the tile metadata."""
-        cache_path = self._temperature_lookup_cache_path_for_source(source)
+        cache_path = self._temperature_lookup_cache_path()
         if not cache_path.exists():
             return False
 
         with np.load(cache_path) as data:
-            cache_nside = int(data["nside"])
-            if cache_nside != self.nside:
+            required_fields = {
+                "format_version", "nside", "product_key", "temperature_fallback",
+                "tile_sbids", "tile_scan_start_mjd", "tile_temperature_by_index",
+                "tile_temperature_sources", "paf_temperature_data_dir",
+                "paf_max_interpolation_gap_minutes", "paf_reference_temp_c",
+                "max_reference_fallback_tiles", "open_meteo_latitude_deg",
+                "open_meteo_longitude_deg", "open_meteo_timeout_seconds",
+                "open_meteo_cache_dir",
+            }
+            if not required_fields.issubset(data.files):
+                return False
+            if int(data["format_version"]) != TEMPERATURE_CACHE_FORMAT_VERSION:
+                return False
+            if int(data["nside"]) != self.nside or str(data["product_key"]) != self.product.key:
+                return False
+            if str(data["temperature_fallback"]) != self.cfg.temperature_fallback:
                 return False
 
             cache_tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
-            if cache_tile_sbids.shape != self.tile_sbids.shape:
-                return False
+            cached_scan_start_mjd = data["tile_scan_start_mjd"].astype(np.float64, copy=False)
             if not np.array_equal(cache_tile_sbids, self.tile_sbids):
                 return False
-
-            if "temperature_source" in data.files:
-                if str(data["temperature_source"]) != source:
-                    return False
-            elif source == "hybrid":
+            if not np.array_equal(cached_scan_start_mjd, self.tile_scan_start_mjd):
                 return False
-
-            if (
-                source in {"mean_paf", "hybrid"}
-                and not self._temperature_lookup_cache_matches_paf_config(data)
-            ):
+            if not self._temperature_lookup_cache_matches_config(data):
                 return False
-            if (
-                source in {"open_meteo", "hybrid"}
-                and not self._temperature_lookup_cache_matches_open_meteo_config(data)
-            ):
-                return False
-
             cached_temperatures = data["tile_temperature_by_index"]
-            if source == "hybrid":
-                if "tile_temperature_sources" not in data.files:
+            cached_sources = data["tile_temperature_sources"]
+            if cached_temperatures.shape != cache_tile_sbids.shape:
+                return False
+            if cached_sources.shape != cached_temperatures.shape:
+                return False
+            if not np.all(np.isin(cached_sources, np.asarray(self._allowed_temperature_sources()))):
+                return False
+            if not allow_complete_open_meteo and np.all(cached_sources == "open_meteo"):
+                return False
+            if np.any(cached_sources != "open_meteo"):
+                try:
+                    self._resolve_paf_temperature_data_dir()
+                except FileNotFoundError:
                     return False
-                cached_sources = data["tile_temperature_sources"]
-                if cached_sources.shape != cached_temperatures.shape:
+            if self.cfg.temperature_fallback == "reference":
+                reference_mask = cached_sources == "reference"
+                assert self.cfg.max_reference_fallback_tiles is not None
+                if np.count_nonzero(reference_mask) > self.cfg.max_reference_fallback_tiles:
                     return False
-                if cached_sources.shape != cache_tile_sbids.shape:
+                if np.all(reference_mask):
                     return False
-                if not np.all(
-                    np.isin(cached_sources, np.asarray(["mean_paf", "open_meteo"]))
+                if not np.allclose(
+                    cached_temperatures[reference_mask],
+                    self.cfg.paf_reference_temp_c,
                 ):
                     return False
 
@@ -788,19 +831,49 @@ class Racs:
                 copy=False,
             )
 
-        self._validate_tile_temperatures(source=source)
+        self._validate_tile_temperatures(
+            source=self._temperature_source_for_validation(cached_sources)
+        )
+        fallback_mask = cached_sources != "mean_paf"
+        if np.any(fallback_mask):
+            fallback_sbids = self.tile_sbids[fallback_mask]
+            preview = ", ".join(str(int(sbid)) for sbid in fallback_sbids[:10])
+            if fallback_sbids.size > 10:
+                preview += ", ..."
+            if np.any(cached_sources == "reference"):
+                LOGGER.warning(
+                    "%s using cached temperatures with reference fallback %.3f C "
+                    "for %d SBID(s): %s",
+                    self.product.label,
+                    self.cfg.paf_reference_temp_c,
+                    fallback_sbids.size,
+                    preview,
+                )
+            else:
+                LOGGER.warning(
+                    "%s using cached temperatures with Open-Meteo fallback for "
+                    "%d SBID(s): %s",
+                    self.product.label,
+                    fallback_sbids.size,
+                    preview,
+                )
         self.build_temperature_map()
         return True
 
-    def _temperature_lookup_cache_path_for_source(
-        self,
-        source: TemperatureSource,
-    ) -> Path:
-        if source == "mean_paf":
-            return self._temperature_lookup_cache_path()
-        if source == "open_meteo":
-            return self._open_meteo_temperature_lookup_cache_path()
-        return self._hybrid_temperature_lookup_cache_path()
+    def _allowed_temperature_sources(self) -> tuple[str, ...]:
+        if self.cfg.temperature_fallback == "open_meteo":
+            return ("mean_paf", "open_meteo")
+        if self.cfg.temperature_fallback == "reference":
+            return ("mean_paf", "reference")
+        return ("mean_paf",)
+
+    @staticmethod
+    def _temperature_source_for_validation(sources: NDArray[np.str_]) -> TemperatureSource:
+        if np.any(sources == "open_meteo"):
+            return "open_meteo"
+        if np.any(sources == "reference"):
+            return "reference"
+        return "mean_paf"
 
     def build_elevation_lookup(self) -> None:
         """Build a per-pixel empirical lookup of source elevations in degrees."""
@@ -927,60 +1000,63 @@ class Racs:
         self.elevation_map = elevation_map
         return True
 
-    def _temperature_lookup_cache_matches_paf_config(
+    def _configured_paf_temperature_data_dir_for_cache(self) -> str:
+        """Return a stable representation of the configured PAF source."""
+        try:
+            return str(self._resolve_paf_temperature_data_dir())
+        except FileNotFoundError:
+            if self.cfg.paf_temperature_data_dir is None:
+                return ""
+            return str(Path(self.cfg.paf_temperature_data_dir).expanduser().resolve())
+
+    def _temperature_lookup_cache_matches_config(
         self,
         data: np.lib.npyio.NpzFile,
     ) -> bool:
-        """Return whether a cached PAF lookup matches the configured raw data source."""
-        required_fields = {
-            "paf_product_key",
-            "paf_temperature_data_dir",
-            "paf_max_interpolation_gap_minutes",
-        }
-        if not required_fields.issubset(data.files):
-            return self.cfg.paf_temperature_data_dir is None
-
-        if str(data["paf_product_key"]) != self.product.key:
+        """Return whether cached temperature inputs match the current config."""
+        if str(data["paf_temperature_data_dir"]) != (
+            self._configured_paf_temperature_data_dir_for_cache()
+        ):
             return False
         if not np.isclose(
             float(data["paf_max_interpolation_gap_minutes"]),
             self.cfg.paf_max_interpolation_gap_minutes,
         ):
             return False
-        if self.cfg.paf_temperature_data_dir is None:
-            return True
-
-        return str(data["paf_temperature_data_dir"]) == str(
-            self._resolve_paf_temperature_data_dir()
-        )
-
-    def _temperature_lookup_cache_matches_open_meteo_config(
-        self,
-        data: np.lib.npyio.NpzFile,
-    ) -> bool:
-        """Return whether a cached lookup matches Open-Meteo request inputs."""
-        required_fields = {
-            "open_meteo_latitude_deg",
-            "open_meteo_longitude_deg",
-            "tile_scan_start_mjd",
-        }
-        if not required_fields.issubset(data.files):
-            return False
-        if not np.isclose(
-            float(data["open_meteo_latitude_deg"]),
-            self.cfg.open_meteo_latitude_deg,
-        ):
-            return False
-        if not np.isclose(
-            float(data["open_meteo_longitude_deg"]),
-            self.cfg.open_meteo_longitude_deg,
-        ):
-            return False
-        cached_scan_start_mjd = data["tile_scan_start_mjd"].astype(
-            np.float64,
-            copy=False,
-        )
-        return np.array_equal(cached_scan_start_mjd, self.tile_scan_start_mjd)
+        if self.cfg.temperature_fallback == "reference":
+            if not np.isclose(
+                float(data["paf_reference_temp_c"]), self.cfg.paf_reference_temp_c
+            ):
+                return False
+            assert self.cfg.max_reference_fallback_tiles is not None
+            if (
+                int(data["max_reference_fallback_tiles"])
+                != self.cfg.max_reference_fallback_tiles
+            ):
+                return False
+        if self.cfg.temperature_fallback == "open_meteo":
+            if not np.isclose(
+                float(data["open_meteo_latitude_deg"]),
+                self.cfg.open_meteo_latitude_deg,
+            ):
+                return False
+            if not np.isclose(
+                float(data["open_meteo_longitude_deg"]),
+                self.cfg.open_meteo_longitude_deg,
+            ):
+                return False
+            if not np.isclose(
+                float(data["open_meteo_timeout_seconds"]),
+                self.cfg.open_meteo_timeout_seconds,
+            ):
+                return False
+            expected_cache_dir = (
+                "" if self.cfg.open_meteo_cache_dir is None
+                else str(Path(self.cfg.open_meteo_cache_dir).expanduser().resolve())
+            )
+            if str(data["open_meteo_cache_dir"]) != expected_cache_dir:
+                return False
+        return True
 
     def build_fractional_error_lookup(self) -> None:
         """Build a per-pixel empirical lookup of fractional flux errors."""
@@ -1209,24 +1285,10 @@ class Racs:
         """Load or derive per-SBID temperatures and project them onto the sky."""
         self.tile_temperature_by_index = None
 
-        paf_failure: Exception | None = None
-        try:
-            if self.load_temperature_lookup():
-                return
-        except Exception as exc:
-            paf_failure = exc
-            self.tile_temperature_by_index = None
-            if self.cfg.temperature_fallback != "open_meteo":
-                raise
-        if (
-            self.cfg.temperature_fallback == "open_meteo"
-            and self.load_temperature_lookup(source="hybrid")
-        ):
-            LOGGER.warning(
-                "%s using cached hybrid PAF and Open-Meteo temperature lookup.",
-                self.product.label,
-            )
+        if self.load_temperature_lookup(allow_complete_open_meteo=False):
             return
+
+        paf_failure: Exception | None = None
         try:
             paf_data_dir = self._resolve_paf_temperature_data_dir()
             self.tile_temperature_by_index = np.asarray(
@@ -1240,60 +1302,95 @@ class Racs:
         except Exception as exc:
             paf_failure = exc
             self.tile_temperature_by_index = None
-            if self.cfg.temperature_fallback != "open_meteo":
+            if self.cfg.temperature_fallback in {"none", "reference"}:
                 raise
         else:
+            if self.tile_temperature_by_index.shape != self.tile_sbids.shape:
+                raise ValueError(
+                    "PAF temperature lookup shape does not match the tile SBID list."
+                )
             invalid_paf = ~np.isfinite(self.tile_temperature_by_index)
             if np.any(invalid_paf):
-                if self.cfg.temperature_fallback != "open_meteo":
+                invalid_sbids = self.tile_sbids[invalid_paf]
+                if self.cfg.temperature_fallback == "none":
                     self._validate_tile_temperatures(source="mean_paf")
                 if np.all(invalid_paf):
                     paf_failure = ValueError(
                         "PAF lookup contains no finite temperatures."
                     )
                     self.tile_temperature_by_index = None
+                    if self.cfg.temperature_fallback == "reference":
+                        raise paf_failure
                 else:
-                    invalid_sbids = self.tile_sbids[invalid_paf]
-                    LOGGER.warning(
-                        "%s PAF temperature lookup is missing %d SBID(s); filling "
-                        "only those temperatures from Open-Meteo: %s",
-                        self.product.label,
-                        invalid_sbids.size,
-                        ", ".join(str(int(sbid)) for sbid in invalid_sbids[:10]),
-                    )
-                    open_meteo_temperatures = np.asarray(
-                        get_open_meteo_temperatures_for_mjd(
-                            self.tile_scan_start_mjd[invalid_paf],
-                            latitude_deg=self.cfg.open_meteo_latitude_deg,
-                            longitude_deg=self.cfg.open_meteo_longitude_deg,
-                            timeout=self.cfg.open_meteo_timeout_seconds,
-                            cache_dir=self.cfg.open_meteo_cache_dir,
-                        ),
-                        dtype=np.float64,
-                    )
-                    self.tile_temperature_by_index[invalid_paf] = open_meteo_temperatures
-                    self._validate_tile_temperatures(source="hybrid")
                     tile_temperature_sources = np.full(
                         self.tile_temperature_by_index.shape,
                         "mean_paf",
                         dtype="<U10",
                     )
-                    tile_temperature_sources[invalid_paf] = "open_meteo"
+                    sbid_preview = ", ".join(
+                        str(int(sbid)) for sbid in invalid_sbids[:10]
+                    )
+                    if invalid_sbids.size > 10:
+                        sbid_preview += ", ..."
+                    if self.cfg.temperature_fallback == "reference":
+                        assert self.cfg.max_reference_fallback_tiles is not None
+                        if invalid_sbids.size > self.cfg.max_reference_fallback_tiles:
+                            raise ValueError(
+                                f"{self.product.label} PAF temperature lookup is missing "
+                                f"{invalid_sbids.size} SBID(s), exceeding "
+                                "max_reference_fallback_tiles="
+                                f"{self.cfg.max_reference_fallback_tiles}: {sbid_preview}."
+                            )
+                        LOGGER.warning(
+                            "%s PAF temperature lookup is missing %d SBID(s); "
+                            "explicitly filling only those with reference temperature "
+                            "%.3f C: %s",
+                            self.product.label,
+                            invalid_sbids.size,
+                            self.cfg.paf_reference_temp_c,
+                            sbid_preview,
+                        )
+                        self.tile_temperature_by_index[invalid_paf] = (
+                            self.cfg.paf_reference_temp_c
+                        )
+                        tile_temperature_sources[invalid_paf] = "reference"
+                        validation_source: TemperatureSource = "reference"
+                    else:
+                        LOGGER.warning(
+                            "%s PAF temperature lookup is missing %d SBID(s); filling "
+                            "only those temperatures from Open-Meteo: %s",
+                            self.product.label,
+                            invalid_sbids.size,
+                            sbid_preview,
+                        )
+                        open_meteo_temperatures = np.asarray(
+                            get_open_meteo_temperatures_for_mjd(
+                                self.tile_scan_start_mjd[invalid_paf],
+                                latitude_deg=self.cfg.open_meteo_latitude_deg,
+                                longitude_deg=self.cfg.open_meteo_longitude_deg,
+                                timeout=self.cfg.open_meteo_timeout_seconds,
+                                cache_dir=self.cfg.open_meteo_cache_dir,
+                            ),
+                            dtype=np.float64,
+                        )
+                        self.tile_temperature_by_index[invalid_paf] = open_meteo_temperatures
+                        tile_temperature_sources[invalid_paf] = "open_meteo"
+                        validation_source = "open_meteo"
+                    self._validate_tile_temperatures(source=validation_source)
                     self.build_temperature_map()
                     self.save_temperature_lookup(
-                        source="hybrid",
                         tile_temperature_sources=tile_temperature_sources,
                     )
                     return
             else:
                 self._validate_tile_temperatures(source="mean_paf")
                 self.build_temperature_map()
-                self.save_temperature_lookup(source="mean_paf")
+                self.save_temperature_lookup()
                 return
 
         if (
             self.cfg.temperature_fallback == "open_meteo"
-            and self.load_temperature_lookup(source="open_meteo")
+            and self.load_temperature_lookup(allow_complete_open_meteo=True)
         ):
             LOGGER.warning(
                 "%s PAF temperature lookup failed; using cached Open-Meteo "
@@ -1305,8 +1402,11 @@ class Racs:
 
         LOGGER.warning(
             "%s PAF temperature lookup failed; falling back to Open-Meteo "
-            "ambient temperature lookup: %s",
+            "ambient temperatures for %d SBID(s) (%s): %s",
             self.product.label,
+            self.tile_sbids.size,
+            ", ".join(str(int(sbid)) for sbid in self.tile_sbids[:10])
+            + (", ..." if self.tile_sbids.size > 10 else ""),
             paf_failure,
         )
         self.tile_temperature_by_index = np.asarray(
@@ -1321,7 +1421,13 @@ class Racs:
         )
         self._validate_tile_temperatures(source="open_meteo")
         self.build_temperature_map()
-        self.save_temperature_lookup(source="open_meteo")
+        self.save_temperature_lookup(
+            tile_temperature_sources=np.full(
+                self.tile_temperature_by_index.shape,
+                "open_meteo",
+                dtype="<U10",
+            )
+        )
 
     def _validate_tile_temperatures(
         self,
@@ -1344,7 +1450,7 @@ class Racs:
         source_label = {
             "mean_paf": "PAF",
             "open_meteo": "Open-Meteo",
-            "hybrid": "hybrid PAF and Open-Meteo",
+            "reference": "hybrid PAF and reference",
         }[source]
         raise ValueError(
             f"{self.product.label} {source_label} temperature lookup contains non-finite "
