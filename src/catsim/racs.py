@@ -32,6 +32,15 @@ from .utils.weather import (
     get_open_meteo_temperatures_for_mjd,
 )
 from .racs_products import RACS_LOW3, RacsProductSpec, resolve_racs_product
+from .racs_noise import (
+    RacsCacheValidationError,
+    build_conditional_error_lookup,
+    build_noise_map_cache,
+    load_conditional_error_lookup,
+    load_noise_map_cache,
+    save_conditional_error_lookup,
+    save_noise_map_cache,
+)
 from .racs_summaries import (
     binned_flux_quantiles_exact,
     validate_bin_edges,
@@ -83,7 +92,11 @@ class RacsConfig:
     max_cluster_children_per_parent: int = 16
     cluster_r0_arcsec: float = 100.0
     cluster_r_cut_arcsec: float = 20.0
-    fractional_error_flux_min_mjy: float = 10.0
+    noisemap_data_dir: Optional[str] = None
+    noise_map_nside: int = 256
+    flux_error_noise_bins: int = 400
+    flux_error_flux_bins: int = 400
+    flux_error_min_cell_count: int = 10
     flux_temperature_min_mjy: Optional[float] = None
     paf_temperature_data_dir: Optional[str] = None
     paf_reference_temp_c: float = 25.0
@@ -134,8 +147,22 @@ class RacsConfig:
             raise ValueError("cluster_r0_arcsec must be positive.")
         if self.cluster_r_cut_arcsec < 0:
             raise ValueError("cluster_r_cut_arcsec must be non-negative.")
-        if self.fractional_error_flux_min_mjy <= 0:
-            raise ValueError("fractional_error_flux_min_mjy must be positive.")
+        if (
+            isinstance(self.noise_map_nside, bool)
+            or not isinstance(self.noise_map_nside, (int, np.integer))
+            or self.noise_map_nside <= 0
+            or (int(self.noise_map_nside) & (int(self.noise_map_nside) - 1)) != 0
+        ):
+            raise ValueError("noise_map_nside must be a positive power of two.")
+        for field_name, value, minimum in (
+            ("flux_error_noise_bins", self.flux_error_noise_bins, 2),
+            ("flux_error_flux_bins", self.flux_error_flux_bins, 2),
+            ("flux_error_min_cell_count", self.flux_error_min_cell_count, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"{field_name} must be an integer of at least {minimum}.")
+            if value < minimum:
+                raise ValueError(f"{field_name} must be at least {minimum}.")
         if self.flux_temperature_min_mjy is not None and (
             not np.isfinite(self.flux_temperature_min_mjy)
             or self.flux_temperature_min_mjy <= 0
@@ -214,12 +241,22 @@ class Racs:
         self._coarse_mask: Optional[NDArray[np.bool_]] = None
         self.temperature_map: Optional[NDArray[np.float32]] = None
         self.elevation_map: Optional[NDArray[np.float32]] = None
-        self.fractional_error_map: Optional[NDArray[np.float32]] = None
+        self.sampled_flux_error_map: Optional[NDArray[np.float32]] = None
         self.sampled_fractional_error_map: Optional[NDArray[np.float32]] = None
+        # All-sky source counts at the simulator nside. These diagnostics are
+        # intentionally not survey-masked so exterior no-map coverage remains
+        # visible; the second map isolates sources otherwise in the footprint.
+        self.invalid_noise_rejection_map: Optional[NDArray[np.float32]] = None
+        self.invalid_noise_rejection_in_footprint_map: Optional[
+            NDArray[np.float32]
+        ] = None
+        self.invalid_noise_rejection_count = 0
+        self.invalid_noise_rejection_in_footprint_count = 0
 
         self.final_intrinsic_flux_samples: Optional[NDArray[np.float32]] = None
         self.final_observed_flux_samples: Optional[NDArray[np.float32]] = None
         self.final_alpha_samples: Optional[NDArray[np.float32]] = None
+        self.final_base_flux_error_samples: Optional[NDArray[np.float32]] = None
         self.final_flux_error_samples: Optional[NDArray[np.float32]] = None
         self.final_fractional_error_samples: Optional[NDArray[np.float32]] = None
         self.final_base_fractional_error_samples: Optional[NDArray[np.float32]] = None
@@ -251,10 +288,164 @@ class Racs:
     def _elevation_lookup_cache_path(self) -> Path:
         return self._cache_dir() / f"elevation_lookup_nside{self.nside}.npz"
 
-    def _fractional_error_lookup_cache_path(self) -> Path:
-        flux_token = str(self.cfg.fractional_error_flux_min_mjy).replace(".", "p")
+    def _noise_map_cache_path(self) -> Path:
         return self._cache_dir() / (
-            f"fractional_error_lookup_nside{self.nside}_fluxmin{flux_token}mjy.npz"
+            f"noise_map_nside{self.cfg.noise_map_nside}_nested_v1.npz"
+        )
+
+    def _absolute_error_lookup_cache_path(self) -> Path:
+        return self._cache_dir() / (
+            "absolute_error_lookup_"
+            f"noise{self.cfg.noise_map_nside}_"
+            f"grid{self.cfg.flux_error_noise_bins}x{self.cfg.flux_error_flux_bins}_"
+            f"min{self.cfg.flux_error_min_cell_count}_v1.npz"
+        )
+
+    def _source_noisemap_path(self) -> Path:
+        filename = self.product.source_noisemap_filename
+        if filename is None:
+            raise ValueError(
+                f"{self.product.label} does not support the noise/flux error lookup."
+            )
+        if self.cfg.noisemap_data_dir is None:
+            raise FileNotFoundError(
+                "RacsConfig.noisemap_data_dir is required to build a missing "
+                f"{self.product.label} noise-map cache."
+            )
+        directory = Path(self.cfg.noisemap_data_dir).expanduser()
+        source = directory / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"RACS source noisemap does not exist: {source}")
+        return source
+
+    def build_cached_noise_map(self) -> None:
+        """Build the configured NESTED noise-map cache in memory."""
+        self.noise_map_cache = build_noise_map_cache(
+            self._source_noisemap_path(),
+            product_key=self.product.key,
+            target_nside=self.cfg.noise_map_nside,
+        )
+        self.noise_map = self.noise_map_cache.values
+
+    def save_cached_noise_map(self, *, diagnostics: bool = True) -> None:
+        if not hasattr(self, "noise_map_cache"):
+            raise RuntimeError("Build or load the cached noise map before saving it.")
+        save_noise_map_cache(
+            self.noise_map_cache,
+            self._noise_map_cache_path(),
+            diagnostics=diagnostics,
+        )
+
+    def load_cached_noise_map(self) -> bool:
+        """Load a compatible cached map without consulting its external source."""
+        filename = self.product.source_noisemap_filename
+        if filename is None:
+            raise ValueError(
+                f"{self.product.label} does not support the noise/flux error lookup."
+            )
+        path = self._noise_map_cache_path()
+        if not path.exists():
+            return False
+        try:
+            cache = load_noise_map_cache(
+                path,
+                product_key=self.product.key,
+                target_nside=self.cfg.noise_map_nside,
+                source_filename=filename,
+            )
+        except RacsCacheValidationError as exc:
+            LOGGER.warning("Ignoring incompatible noise-map cache %s: %s", path, exc)
+            return False
+        self.noise_map_cache = cache
+        self.noise_map = cache.values
+        return True
+
+    def query_local_noise(
+        self,
+        ra_deg: NDArray[np.floating],
+        dec_deg: NDArray[np.floating],
+    ) -> NDArray[np.float32]:
+        if not hasattr(self, "noise_map_cache"):
+            raise RuntimeError("Build or load the cached noise map before querying it.")
+        return self.noise_map_cache.query(ra_deg, dec_deg)
+
+    def build_absolute_error_lookup(self) -> None:
+        """Build the catalogue noise/flux-conditioned absolute-error grid."""
+        if not self.catalogue_is_loaded:
+            raise RuntimeError("Load the catalogue before building the error lookup.")
+        if not hasattr(self, "noise_map_cache"):
+            raise RuntimeError("Build or load the cached noise map before the error lookup.")
+        columns = self.product.columns
+        ra = np.asarray(self.catalogue[columns.ra], dtype=np.float64)
+        dec = np.asarray(self.catalogue[columns.dec], dtype=np.float64)
+        noise = self.query_local_noise(ra, dec)
+        flux = np.asarray(self.catalogue[columns.total_flux], dtype=np.float64)
+        error = np.asarray(self.catalogue[columns.total_flux_error], dtype=np.float64)
+        self.absolute_error_lookup = build_conditional_error_lookup(
+            noise,
+            flux,
+            error,
+            product_key=self.product.key,
+            noise_map_identity=self.noise_map_cache.identity,
+            noise_bins=self.cfg.flux_error_noise_bins,
+            flux_bins=self.cfg.flux_error_flux_bins,
+            min_cell_count=self.cfg.flux_error_min_cell_count,
+            catalogue_columns={
+                "ra": columns.ra,
+                "dec": columns.dec,
+                "total_flux": columns.total_flux,
+                "total_flux_error": columns.total_flux_error,
+            },
+        )
+
+    def save_absolute_error_lookup(self, *, diagnostics: bool = True) -> None:
+        if not hasattr(self, "absolute_error_lookup"):
+            raise RuntimeError("Build or load the absolute-error lookup before saving it.")
+        save_conditional_error_lookup(
+            self.absolute_error_lookup,
+            self._absolute_error_lookup_cache_path(),
+            diagnostics=diagnostics,
+        )
+
+    def load_absolute_error_lookup(self) -> bool:
+        if not hasattr(self, "noise_map_cache"):
+            raise RuntimeError("Load the cached noise map before the error lookup.")
+        path = self._absolute_error_lookup_cache_path()
+        if not path.exists():
+            return False
+        try:
+            lookup = load_conditional_error_lookup(
+                path,
+                product_key=self.product.key,
+                noise_map_identity=self.noise_map_cache.identity,
+                noise_bins=self.cfg.flux_error_noise_bins,
+                flux_bins=self.cfg.flux_error_flux_bins,
+                min_cell_count=self.cfg.flux_error_min_cell_count,
+                catalogue_columns={
+                    "ra": self.product.columns.ra,
+                    "dec": self.product.columns.dec,
+                    "total_flux": self.product.columns.total_flux,
+                    "total_flux_error": self.product.columns.total_flux_error,
+                },
+            )
+        except RacsCacheValidationError as exc:
+            LOGGER.warning("Ignoring incompatible absolute-error cache %s: %s", path, exc)
+            return False
+        self.absolute_error_lookup = lookup
+        return True
+
+    def sample_absolute_flux_errors(
+        self,
+        noise_ujy_beam: NDArray[np.floating],
+        pre_noise_flux_mjy: NDArray[np.floating],
+        rng: Optional[np.random.Generator] = None,
+    ) -> NDArray[np.float32]:
+        if not hasattr(self, "absolute_error_lookup"):
+            raise RuntimeError("Build or load the absolute-error lookup before sampling it.")
+        return self.absolute_error_lookup.sample(
+            noise_ujy_beam,
+            pre_noise_flux_mjy,
+            rng=rng,
         )
 
     def _save_lookup_map_png(
@@ -1058,145 +1249,6 @@ class Racs:
                 return False
         return True
 
-    def build_fractional_error_lookup(self) -> None:
-        """Build a per-pixel empirical lookup of fractional flux errors."""
-        assert self.catalogue_is_loaded, "Load the catalogue before building error lookups."
-
-        flux = np.asarray(self.catalogue[self.product.columns.total_flux], dtype=np.float64)
-        flux_error = np.asarray(
-            self.catalogue[self.product.columns.total_flux_error],
-            dtype=np.float64,
-        )
-        ra = np.asarray(self.catalogue[self.product.columns.ra], dtype=np.float64)
-        dec = np.asarray(self.catalogue[self.product.columns.dec], dtype=np.float64)
-
-        valid = (
-            np.isfinite(flux)
-            & np.isfinite(flux_error)
-            & (flux > 0)
-            & (flux >= self.cfg.fractional_error_flux_min_mjy)
-        )
-        if not np.any(valid):
-            raise ValueError("No valid sources available to build fractional-error lookup.")
-
-        pixel_indices = hp.ang2pix(
-            self.nside,
-            ra[valid],
-            dec[valid],
-            lonlat=True,
-            nest=True,
-        ).astype(np.int64, copy=False)
-        fractional_error = (flux_error[valid] / flux[valid]).astype(np.float32, copy=False)
-
-        order = np.argsort(pixel_indices, kind="stable")
-        pix_sorted = pixel_indices[order]
-        frac_sorted = fractional_error[order]
-
-        n_pix = hp.nside2npix(self.nside)
-        counts = np.bincount(pix_sorted, minlength=n_pix).astype(np.int64)
-        starts = np.cumsum(counts, dtype=np.int64) - counts
-
-        self.error_lookup_pixel_counts = counts
-        self.error_lookup_pixel_starts = starts
-        self.error_lookup_fractional_values = frac_sorted
-
-        fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
-        populated = counts > 0
-        if np.any(populated):
-            populated_pixels = np.flatnonzero(populated)
-            for pix in populated_pixels:
-                start = starts[pix]
-                count = counts[pix]
-                fractional_error_map[pix] = np.median(frac_sorted[start:start + count])
-        self.fractional_error_map = fractional_error_map
-
-    def save_fractional_error_lookup(self) -> None:
-        """Persist the per-pixel fractional-error lookup."""
-        cache_path = self._fractional_error_lookup_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            cache_path,
-            nside=np.asarray(self.nside, dtype=np.int64),
-            flux_min_mjy=np.asarray(self.cfg.fractional_error_flux_min_mjy, dtype=np.float64),
-            counts=self.error_lookup_pixel_counts.astype(np.int64, copy=False),
-            starts=self.error_lookup_pixel_starts.astype(np.int64, copy=False),
-            fractional_error=self.error_lookup_fractional_values.astype(np.float32, copy=False),
-        )
-        if self.fractional_error_map is not None:
-            self._save_lookup_map_png(
-                self.fractional_error_map,
-                cache_path.with_suffix(".png"),
-                title=(
-                    f"{self.product.label} Fractional Flux Error Lookup "
-                    f"(nside={self.nside}, flux>={self.cfg.fractional_error_flux_min_mjy:g} mJy)"
-                ),
-                unit="fractional error",
-                cmap="magma"
-            )
-
-    def load_fractional_error_lookup(self) -> bool:
-        """Load the cached per-pixel fractional-error lookup if available."""
-        cache_path = self._fractional_error_lookup_cache_path()
-        if not cache_path.exists():
-            return False
-
-        with np.load(cache_path) as data:
-            cache_nside = int(data["nside"])
-            if cache_nside != self.nside:
-                return False
-            self.error_lookup_pixel_counts = data["counts"].astype(np.int64, copy=False)
-            self.error_lookup_pixel_starts = data["starts"].astype(np.int64, copy=False)
-            self.error_lookup_fractional_values = data["fractional_error"].astype(
-                np.float32,
-                copy=False,
-            )
-
-        n_pix = hp.nside2npix(self.nside)
-        fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
-        populated = self.error_lookup_pixel_counts > 0
-        if np.any(populated):
-            populated_pixels = np.flatnonzero(populated)
-            for pix in populated_pixels:
-                start = self.error_lookup_pixel_starts[pix]
-                count = self.error_lookup_pixel_counts[pix]
-                fractional_error_map[pix] = np.median(
-                    self.error_lookup_fractional_values[start:start + count]
-                )
-        self.fractional_error_map = fractional_error_map
-        return True
-
-    def sample_fractional_errors(
-        self,
-        pixel_indices: NDArray[np.int_],
-        rng: Optional[np.random.Generator] = None,
-    ) -> NDArray[np.float32]:
-        """Sample fractional flux errors from the empirical distribution of each pixel."""
-        assert hasattr(self, "error_lookup_pixel_counts"), "Run initialise_data() first."
-        if rng is None:
-            rng = np.random.default_rng()
-
-        pix = np.asarray(pixel_indices, dtype=np.int64)
-        counts = self.error_lookup_pixel_counts[pix]
-        starts = self.error_lookup_pixel_starts[pix]
-
-        out = np.empty(pix.shape[0], dtype=np.float32)
-        valid = counts > 0
-        if np.any(valid):
-            rand_offsets = rng.integers(0, counts[valid], dtype=np.int64)
-            pick = starts[valid] + rand_offsets
-            out[valid] = self.error_lookup_fractional_values[pick]
-
-        if np.any(~valid):
-            pick = rng.integers(
-                0,
-                self.error_lookup_fractional_values.size,
-                size=np.count_nonzero(~valid),
-                dtype=np.int64,
-            )
-            out[~valid] = self.error_lookup_fractional_values[pick]
-
-        return out
-
     def sample_elevations(
         self,
         pixel_indices: NDArray[np.int_],
@@ -1248,21 +1300,22 @@ class Racs:
         enhancement = 1.0 + elevation_amp * (1.0 - np.cos(delta_rad))
         return enhancement.astype(self.dtype, copy=False)
 
-    def compute_total_flux_error(
+    def scale_absolute_flux_error(
         self,
-        flux_density: NDArray[np.floating],
-        fractional_error: NDArray[np.floating],
+        base_flux_error: NDArray[np.floating],
         fractional_error_eta: float = 0.0,
         dtype: type = np.float64,
     ) -> NDArray[np.floating]:
-        """Convert sampled fractional errors into raw flux-error sigmas."""
+        """Apply eta variance scaling to sampled absolute error sigmas.
+
+        ``base_flux_error`` is already an absolute total-flux error in mJy.
+        It must not be multiplied by source flux.
+        """
         if fractional_error_eta < 0:
             raise ValueError("fractional_error_eta must be non-negative.")
 
-        flux = np.asarray(flux_density, dtype=np.float64)
-        frac = np.asarray(fractional_error, dtype=np.float64)
-        sigma = frac * flux
-        sigma *= np.sqrt(1.0 + fractional_error_eta)
+        sigma = np.asarray(base_flux_error, dtype=np.float64)
+        sigma = sigma * np.sqrt(1.0 + fractional_error_eta)
         return sigma.astype(dtype, copy=False)
 
     def add_flux_error(
@@ -1504,11 +1557,18 @@ class Racs:
 
     def initialise_data(self) -> None:
         """Initialise the catalogue-derived lookup tables used during simulation."""
+        # The external source noisemap is needed only when its compact runtime
+        # cache is absent or incompatible. Load/build it before deciding
+        # whether the catalogue-conditioned absolute-error cache is usable.
+        if not self.load_cached_noise_map():
+            self.build_cached_noise_map()
+            self.save_cached_noise_map()
+
+        need_absolute_error_lookup = not self.load_absolute_error_lookup()
         need_flux_distribution = not self.load_flux_distribution()
         need_tile_metadata = not self.load_tile_metadata()
         need_tile_lookup = not self.load_tile_lookup()
         need_sbid_mixture_lookup = False
-        need_fractional_error_lookup = not self.load_fractional_error_lookup()
         need_elevation_lookup = (
             self.product.columns.elevation is not None
             and not self.load_elevation_lookup()
@@ -1522,7 +1582,7 @@ class Racs:
             or need_tile_metadata
             or need_tile_lookup
             or need_sbid_mixture_lookup
-            or need_fractional_error_lookup
+            or need_absolute_error_lookup
             or need_elevation_lookup
         ):
             if not self.catalogue_is_loaded:
@@ -1542,9 +1602,9 @@ class Racs:
                 elif need_sbid_mixture_lookup:
                     self.build_tile_lookup()
                     self.save_sbid_mixture_lookup()
-                if need_fractional_error_lookup:
-                    self.build_fractional_error_lookup()
-                    self.save_fractional_error_lookup()
+                if need_absolute_error_lookup:
+                    self.build_absolute_error_lookup()
+                    self.save_absolute_error_lookup()
                 if need_elevation_lookup:
                     self.build_elevation_lookup()
                     self.save_elevation_lookup()
@@ -2064,12 +2124,19 @@ class Racs:
 
         n_pix = hp.nside2npix(self.nside)
         density_accumulator = np.zeros(n_pix, dtype=np.float64)
+        flux_error_sum = np.zeros(n_pix, dtype=np.float64)
         fractional_error_sum = np.zeros(n_pix, dtype=np.float64)
-        fractional_error_count = np.zeros(n_pix, dtype=np.int64)
+        error_sample_count = np.zeros(n_pix, dtype=np.int64)
+        invalid_noise_accumulator = np.zeros(n_pix, dtype=np.float64)
+        invalid_noise_in_footprint_accumulator = np.zeros(n_pix, dtype=np.float64)
+        noise_query_count = 0
+        invalid_noise_count = 0
+        invalid_noise_in_footprint_count = 0
 
         final_intrinsic_flux: list[NDArray[np.float32]] = []
         final_observed_flux: list[NDArray[np.float32]] = []
         final_alpha: list[NDArray[np.float32]] = []
+        final_base_flux_error: list[NDArray[np.float32]] = []
         final_flux_error: list[NDArray[np.float32]] = []
         final_base_fractional_error: list[NDArray[np.float32]] = []
         final_fractional_error: list[NDArray[np.float32]] = []
@@ -2176,29 +2243,67 @@ class Racs:
                     np.asarray(systematics_flux, dtype=np.float64)
                     * np.asarray(elevation_enhancement, dtype=np.float64)
                 ).astype(self.dtype, copy=False)
-            base_fractional_error = self.sample_fractional_errors(pixel_indices, rng=rng)
-            flux_error = self.compute_total_flux_error(
-                systematics_flux,
-                base_fractional_error,
-                fractional_error_eta=fractional_error_eta,
-                dtype=self.dtype,
+
+            # Local survey noise is queried at the aberrated source position.
+            # Invalid-noise sources are removed from every downstream product;
+            # they are not sent through the conditional lookup or Gaussian draw.
+            local_noise = self.query_local_noise(boosted_ra_deg, boosted_dec_deg)
+            valid_noise = np.isfinite(local_noise) & (local_noise > 0)
+            noise_query_count += int(local_noise.size)
+            invalid_noise_count += int(np.count_nonzero(~valid_noise))
+            invalid_noise_in_footprint_count += int(
+                np.count_nonzero(mask_slice & (tile_indices >= 0) & ~valid_noise)
             )
-            safe_flux = np.clip(
+            if np.any(~valid_noise):
+                np.add.at(
+                    invalid_noise_accumulator,
+                    pixel_indices[~valid_noise],
+                    1,
+                )
+            invalid_in_footprint = (
+                mask_slice & (tile_indices >= 0) & ~valid_noise
+            )
+            if np.any(invalid_in_footprint):
+                np.add.at(
+                    invalid_noise_in_footprint_accumulator,
+                    pixel_indices[invalid_in_footprint],
+                    1,
+                )
+
+            base_flux_error = np.full(systematics_flux.shape, np.nan, dtype=self.dtype)
+            flux_error = np.full(systematics_flux.shape, np.nan, dtype=self.dtype)
+            observed_flux = np.full(systematics_flux.shape, np.nan, dtype=self.dtype)
+            if np.any(valid_noise):
+                sampled_base_error = self.sample_absolute_flux_errors(
+                    local_noise[valid_noise],
+                    systematics_flux[valid_noise],
+                    rng=rng,
+                )
+                base_flux_error[valid_noise] = sampled_base_error
+                flux_error[valid_noise] = self.scale_absolute_flux_error(
+                    sampled_base_error,
+                    fractional_error_eta=fractional_error_eta,
+                    dtype=self.dtype,
+                )
+                observed_flux[valid_noise] = self.add_flux_error(
+                    systematics_flux[valid_noise],
+                    flux_error[valid_noise],
+                    rng=rng,
+                    dtype=self.dtype,
+                )
+
+            safe_flux = np.maximum(
                 np.asarray(systematics_flux, dtype=np.float64),
                 np.finfo(np.float64).tiny,
-                None,
             )
+            base_fractional_error = (
+                np.asarray(base_flux_error, dtype=np.float64) / safe_flux
+            ).astype(np.float32, copy=False)
             fractional_error = (
                 np.asarray(flux_error, dtype=np.float64) / safe_flux
             ).astype(np.float32, copy=False)
-            observed_flux = self.add_flux_error(
-                systematics_flux,
-                flux_error,
-                rng=rng,
-                dtype=self.dtype,
-            )
 
-            base_keep = mask_slice & (tile_indices >= 0)
+            base_keep = mask_slice & (tile_indices >= 0) & valid_noise
             if include_temperature_summary:
                 temperature_keep = (
                     base_keep
@@ -2229,8 +2334,9 @@ class Racs:
 
             kept_pixels = pixel_indices[keep]
             np.add.at(density_accumulator, kept_pixels, 1)
+            np.add.at(flux_error_sum, kept_pixels, flux_error[keep].astype(np.float64))
             np.add.at(fractional_error_sum, kept_pixels, fractional_error[keep].astype(np.float64))
-            np.add.at(fractional_error_count, kept_pixels, 1)
+            np.add.at(error_sample_count, kept_pixels, 1)
 
             if self.store_final_samples:
                 final_intrinsic_flux.append(
@@ -2240,6 +2346,9 @@ class Racs:
                     observed_flux[keep].astype(np.float32, copy=False)
                 )
                 final_alpha.append(alpha[keep].astype(np.float32, copy=False))
+                final_base_flux_error.append(
+                    base_flux_error[keep].astype(np.float32, copy=False)
+                )
                 final_flux_error.append(
                     flux_error[keep].astype(np.float32, copy=False)
                 )
@@ -2259,15 +2368,51 @@ class Racs:
                         elevations[keep].astype(np.float32, copy=False)
                     )
 
+        if invalid_noise_in_footprint_count:
+            LOGGER.warning(
+                "%s removed %d source(s) with invalid local noise inside the "
+                "survey/tile footprint (%d invalid of %d noise queries overall).",
+                self.product.label,
+                invalid_noise_in_footprint_count,
+                invalid_noise_count,
+                noise_query_count,
+            )
+        else:
+            LOGGER.info(
+                "%s noise-map coverage: %d valid of %d generated source queries.",
+                self.product.label,
+                noise_query_count - invalid_noise_count,
+                noise_query_count,
+            )
+
         self._density_map = density_accumulator.astype(np.float32, copy=False)
+        self.invalid_noise_rejection_map = invalid_noise_accumulator.astype(
+            np.float32,
+            copy=False,
+        )
+        self.invalid_noise_rejection_in_footprint_map = (
+            invalid_noise_in_footprint_accumulator.astype(np.float32, copy=False)
+        )
+        self.invalid_noise_rejection_count = invalid_noise_count
+        self.invalid_noise_rejection_in_footprint_count = (
+            invalid_noise_in_footprint_count
+        )
+        sampled_flux_error_map = np.full(n_pix, np.nan, dtype=np.float32)
         sampled_fractional_error_map = np.full(n_pix, np.nan, dtype=np.float32)
-        valid_error_pixels = fractional_error_count > 0
+        valid_error_pixels = error_sample_count > 0
         if np.any(valid_error_pixels):
+            sampled_flux_error_map[valid_error_pixels] = (
+                flux_error_sum[valid_error_pixels]
+                / error_sample_count[valid_error_pixels]
+            ).astype(np.float32, copy=False)
             sampled_fractional_error_map[valid_error_pixels] = (
                 fractional_error_sum[valid_error_pixels]
-                / fractional_error_count[valid_error_pixels]
+                / error_sample_count[valid_error_pixels]
             ).astype(np.float32, copy=False)
-        sampled_fractional_error_map[~self.mask_map.astype(bool)] = np.nan
+        outside_mask = ~self.mask_map.astype(bool)
+        sampled_flux_error_map[outside_mask] = np.nan
+        sampled_fractional_error_map[outside_mask] = np.nan
+        self.sampled_flux_error_map = sampled_flux_error_map
         self.sampled_fractional_error_map = sampled_fractional_error_map
         output_map, output_mask = self._prepare_map_output(self._density_map)
 
@@ -2280,6 +2425,10 @@ class Racs:
             )
             self.final_alpha_samples = (
                 np.concatenate(final_alpha) if final_alpha else np.empty(0, dtype=np.float32)
+            )
+            self.final_base_flux_error_samples = (
+                np.concatenate(final_base_flux_error)
+                if final_base_flux_error else np.empty(0, dtype=np.float32)
             )
             self.final_flux_error_samples = (
                 np.concatenate(final_flux_error)
@@ -2320,6 +2469,7 @@ class Racs:
             self.final_intrinsic_flux_samples = None
             self.final_observed_flux_samples = None
             self.final_alpha_samples = None
+            self.final_base_flux_error_samples = None
             self.final_flux_error_samples = None
             self.final_base_fractional_error_samples = None
             self.final_fractional_error_samples = None

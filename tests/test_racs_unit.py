@@ -35,6 +35,12 @@ if "dipoleutils.utils.data_loader" not in sys.modules:
 
 from catsim import RACS_MID1, Racs, RacsConfig, RacsLow3, RacsLow3Config
 from catsim.racs import LOW3_TEMPERATURE_EPSILON_FLOOR
+from catsim.racs_noise import (
+    build_conditional_error_lookup,
+    build_noise_map_cache,
+    save_conditional_error_lookup,
+    save_noise_map_cache,
+)
 from catsim.racs_products import RacsCatalogueColumns, RacsProductSpec, resolve_racs_product
 from catsim.utils import weather
 
@@ -130,53 +136,35 @@ class RacsFluxErrorTests(unittest.TestCase):
         sim.add_flux_error = lambda flux, flux_error, rng=None, dtype=np.float64: (
             np.asarray(flux, dtype=dtype)
         )
-        sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.full(
-            pixel_indices.shape[0],
-            0.1,
+        sim.query_local_noise = lambda ra, dec: np.full(
+            np.asarray(ra).shape[0],
+            100.0,
+            dtype=np.float32,
+        )
+        sim.sample_absolute_flux_errors = lambda noise, flux, rng=None: np.full(
+            np.asarray(flux).shape[0],
+            10.0,
             dtype=np.float32,
         )
         sim.sample_fluxes = lambda n, rng=None: np.full(n, 100.0, dtype=np.float64)
         return sim
 
-    def test_sample_fractional_errors_draws_from_pixel_lookup(self):
-        # Pixel 0 has one possible value; pixel 1 has two values; pixel 2 is empty.
-        self.sim.error_lookup_pixel_counts = np.array([1, 2, 0], dtype=np.int64)
-        self.sim.error_lookup_pixel_starts = np.array([0, 1, 3], dtype=np.int64)
-        self.sim.error_lookup_fractional_values = np.array(
-            [0.1, 0.2, 0.3],
-            dtype=np.float32,
-        )
+    def test_scale_absolute_flux_error_does_not_multiply_by_flux(self):
+        absolute_error = np.full(8, 0.1, dtype=np.float64)
 
-        rng = np.random.default_rng(123)
-        samples = self.sim.sample_fractional_errors(
-            np.array([0, 1, 1, 2], dtype=np.int64),
-            rng=rng,
-        )
-
-        self.assertEqual(samples[0], np.float32(0.1))
-        self.assertIn(samples[1], (np.float32(0.2), np.float32(0.3)))
-        self.assertIn(samples[2], (np.float32(0.2), np.float32(0.3)))
-        self.assertIn(samples[3], (np.float32(0.1), np.float32(0.2), np.float32(0.3)))
-
-    def test_compute_total_flux_error_eta_scales_raw_sigma_by_sqrt_one_plus_eta(self):
-        flux = np.full(8, 100.0, dtype=np.float64)
-        fractional_error = np.full(8, 0.1, dtype=np.float64)
-
-        sigma_base = self.sim.compute_total_flux_error(
-            flux,
-            fractional_error,
+        sigma_base = self.sim.scale_absolute_flux_error(
+            absolute_error,
             fractional_error_eta=0.0,
             dtype=np.float64,
         )
-        sigma_eta = self.sim.compute_total_flux_error(
-            flux,
-            fractional_error,
+        sigma_eta = self.sim.scale_absolute_flux_error(
+            absolute_error,
             fractional_error_eta=3.0,
             dtype=np.float64,
         )
 
-        np.testing.assert_allclose(sigma_base, np.full(8, 10.0))
-        np.testing.assert_allclose(sigma_eta, np.full(8, 20.0))
+        np.testing.assert_allclose(sigma_base, np.full(8, 0.1))
+        np.testing.assert_allclose(sigma_eta, np.full(8, 0.2))
 
     def test_temperature_flux_summary_uses_independent_cut_without_changing_map(self):
         self._configure_minimal_generate_dipole_sim(n_samples=4)
@@ -202,10 +190,9 @@ class RacsFluxErrorTests(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
 
-    def test_compute_total_flux_error_rejects_negative_eta(self):
+    def test_scale_absolute_flux_error_rejects_negative_eta(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
-            self.sim.compute_total_flux_error(
-                np.array([100.0]),
+            self.sim.scale_absolute_flux_error(
                 np.array([0.1]),
                 fractional_error_eta=-0.1,
             )
@@ -307,15 +294,15 @@ class RacsFluxErrorTests(unittest.TestCase):
 
         np.testing.assert_allclose(noisy_double_sigma - flux, 2.0 * (noisy_base - flux))
 
-    def test_generate_dipole_stores_effective_fractional_errors_after_eta_scaling(self):
+    def test_generate_dipole_stores_absolute_and_derived_errors_after_eta_scaling(self):
         sim = self.sim
         self._configure_minimal_generate_dipole_sim(n_samples=10)
 
         n_samples = 10
-        base_fractional_error = np.full(n_samples, 0.1, dtype=np.float32)
+        base_flux_error = np.full(n_samples, 10.0, dtype=np.float32)
 
-        sim.sample_fractional_errors = lambda pixel_indices, rng=None: base_fractional_error[
-            : pixel_indices.shape[0]
+        sim.sample_absolute_flux_errors = lambda noise, flux, rng=None: base_flux_error[
+            : np.asarray(flux).shape[0]
         ]
 
         dmap, mask = sim.generate_dipole(
@@ -324,17 +311,87 @@ class RacsFluxErrorTests(unittest.TestCase):
             temp_beta=0.0,
         )
 
-        expected_effective = np.full(n_samples, 0.2, dtype=np.float32)
-        np.testing.assert_allclose(sim.final_base_fractional_error_samples, base_fractional_error)
-        np.testing.assert_allclose(sim.final_fractional_error_samples, expected_effective)
+        np.testing.assert_allclose(sim.final_base_flux_error_samples, 10.0)
+        np.testing.assert_allclose(sim.final_flux_error_samples, 20.0)
+        np.testing.assert_allclose(sim.final_base_fractional_error_samples, 0.1)
+        np.testing.assert_allclose(sim.final_fractional_error_samples, 0.2)
         self.assertIsNone(sim.final_elevation_samples)
 
-        sampled_map = sim.sampled_fractional_error_map
-        self.assertIsNotNone(sampled_map)
-        finite = np.isfinite(sampled_map)
+        sampled_flux_map = sim.sampled_flux_error_map
+        self.assertIsNotNone(sampled_flux_map)
+        finite = np.isfinite(sampled_flux_map)
         self.assertTrue(np.any(finite))
-        np.testing.assert_allclose(sampled_map[finite], np.full(np.count_nonzero(finite), 0.2))
+        np.testing.assert_allclose(sampled_flux_map[finite], 20.0)
+        np.testing.assert_allclose(sim.sampled_fractional_error_map[finite], 0.2)
         self.assertEqual(dmap.shape, mask.shape)
+
+    def test_generate_dipole_queries_aberrated_coordinates_and_excludes_invalid_noise(self):
+        sim = self.sim
+        sim.product = RACS_MID1
+        self._configure_minimal_generate_dipole_sim(n_samples=4)
+        sim.sample_fluxes = lambda n, rng=None: np.asarray(
+            [100.0, 200.0, 300.0, 400.0],
+            dtype=np.float64,
+        )[:n]
+        sim.sample_points = lambda n, dtype=np.float64, rng=None: (
+            np.arange(n, dtype=dtype),
+            np.arange(n, dtype=dtype) + 20.0,
+        )
+        sim.aberrate_points = lambda ra, dec, dtype=np.float64: (
+            np.asarray(ra, dtype=dtype) + 10.0,
+            np.asarray(dec, dtype=dtype) - 5.0,
+            np.zeros_like(ra, dtype=dtype),
+        )
+        sim.evaluate_temperature_enhancement = lambda tile_indices, temp_beta: (
+            np.full(tile_indices.shape, 0.5, dtype=np.float64),
+            np.asarray([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+        )
+        sim.apply_temperature_enhancement = lambda flux, enhancement, dtype=np.float64: (
+            np.asarray(flux, dtype=dtype) * np.asarray(enhancement, dtype=dtype)
+        )
+        sim.evaluate_elevation_enhancement = lambda elevations, elevation_amp, elevation_trough: (
+            np.full(elevations.shape, 3.0, dtype=np.float64)
+        )
+
+        queried: dict[str, np.ndarray] = {}
+
+        def query_noise(ra, dec):
+            queried["ra"] = np.asarray(ra).copy()
+            queried["dec"] = np.asarray(dec).copy()
+            return np.asarray([100.0, np.nan, 300.0, 400.0], dtype=np.float32)
+
+        def sample_errors(noise, flux, rng=None):
+            queried["noise"] = np.asarray(noise).copy()
+            queried["flux"] = np.asarray(flux).copy()
+            return np.full(np.asarray(flux).shape, 5.0, dtype=np.float32)
+
+        sim.query_local_noise = query_noise
+        sim.sample_absolute_flux_errors = sample_errors
+
+        density_map, mask, summaries = sim.generate_dipole_with_flux_summaries(
+            log10_n_initial_samples=np.log10(4.0),
+            elevation_amp=1.0,
+            temperature_edges=np.asarray([0.0, 200.0]),
+            temperature_quantiles=(0.5,),
+            elevation_edges=np.asarray([0.0, 200.0]),
+            elevation_quantiles=(0.5,),
+        )
+
+        np.testing.assert_allclose(queried["ra"], [10.0, 11.0, 12.0, 13.0])
+        np.testing.assert_allclose(queried["dec"], [15.0, 16.0, 17.0, 18.0])
+        np.testing.assert_allclose(queried["noise"], [100.0, 300.0, 400.0])
+        # Temperature response (x0.5) and elevation response (x3) precede lookup.
+        np.testing.assert_allclose(queried["flux"], [150.0, 450.0, 600.0])
+        self.assertEqual(float(np.nansum(density_map[mask])), 3.0)
+        self.assertEqual(sim.invalid_noise_rejection_count, 1)
+        self.assertEqual(float(np.sum(sim.invalid_noise_rejection_map)), 1.0)
+        self.assertEqual(sim.invalid_noise_rejection_in_footprint_count, 1)
+        self.assertEqual(sim.final_observed_flux_samples.size, 3)
+        np.testing.assert_allclose(sim.final_longitudes, [10.0, 12.0, 13.0])
+        np.testing.assert_allclose(sim.final_base_flux_error_samples, 5.0)
+        # The invalid-noise 300 mJy source is absent, so the retained median is 450.
+        np.testing.assert_allclose(summaries["temperature"], [450.0])
+        np.testing.assert_allclose(summaries["elevation"], [450.0])
 
     def test_evaluate_temperature_enhancement_uses_hot_paf_suppression(self):
         self.sim.tile_temperature_by_index = np.array([24.0, 25.0, 30.0], dtype=np.float64)
@@ -431,8 +488,8 @@ class RacsFluxErrorTests(unittest.TestCase):
         sim.tile_temperature_by_index = np.array([60.0], dtype=np.float64)
 
         n_samples = 8
-        sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.full(
-            pixel_indices.shape[0],
+        sim.sample_absolute_flux_errors = lambda noise, flux, rng=None: np.full(
+            np.asarray(flux).shape[0],
             0.1,
             dtype=np.float32,
         )
@@ -462,8 +519,8 @@ class RacsFluxErrorTests(unittest.TestCase):
             sim,
             Racs,
         )
-        sim.sample_fractional_errors = lambda pixel_indices, rng=None: np.zeros(
-            pixel_indices.shape[0],
+        sim.sample_absolute_flux_errors = lambda noise, flux, rng=None: np.zeros(
+            np.asarray(flux).shape[0],
             dtype=np.float32,
         )
 
@@ -866,11 +923,12 @@ class RacsInitialiseDataTests(unittest.TestCase):
         sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
 
         with (
+            patch.object(sim, "load_cached_noise_map", return_value=True),
+            patch.object(sim, "load_absolute_error_lookup", return_value=True),
             patch.object(sim, "load_flux_distribution", return_value=True),
             patch.object(sim, "load_tile_metadata", return_value=True),
             patch.object(sim, "load_tile_lookup", return_value=True),
             patch.object(sim, "load_sbid_mixture_lookup", return_value=True),
-            patch.object(sim, "load_fractional_error_lookup", return_value=True),
             patch.object(
                 sim,
                 "load_elevation_lookup",
@@ -900,6 +958,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
             data_loader_catalogue="racs",
             data_loader_variant="synthetic",
             data_dir_name="racs_synthetic",
+            source_noisemap_filename="synthetic-noise.hpx",
             columns=RacsCatalogueColumns(
                 ra="source_ra",
                 dec="source_dec",
@@ -919,7 +978,10 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 product=product,
                 nside=1,
                 chunk_size=16,
-                fractional_error_flux_min_mjy=1.0,
+                noise_map_nside=1,
+                flux_error_noise_bins=2,
+                flux_error_flux_bins=2,
+                flux_error_min_cell_count=1,
             )
         )
         sim.catalogue = Table(
@@ -936,17 +998,22 @@ class RacsInitialiseDataTests(unittest.TestCase):
             }
         )
         sim.catalogue_is_loaded = True
+        sim.noise_map_cache = types.SimpleNamespace(identity="synthetic-noise")
+        sim.query_local_noise = lambda ra, dec: np.asarray(
+            [1.0, 2.0, 3.0, 4.0],
+            dtype=np.float32,
+        )
 
         sim.build_flux_distribution()
         sim.build_tile_metadata()
         sim.build_tile_lookup()
-        sim.build_fractional_error_lookup()
+        sim.build_absolute_error_lookup()
         sim.build_elevation_lookup()
         sim.load_mask_map()
 
         np.testing.assert_array_equal(sim.tile_sbids, np.array([101, 202, 303], dtype=np.int32))
         self.assertEqual(sim.log_flux_bin_cdf[-1], 1.0)
-        self.assertGreater(sim.error_lookup_fractional_values.size, 0)
+        self.assertGreater(sim.absolute_error_lookup.absolute_error_values.size, 0)
         self.assertGreater(sim.elevation_lookup_values.size, 0)
         np.testing.assert_array_equal(sim.mask_map, sim.tile_lookup_map >= 0)
 
@@ -1047,6 +1114,7 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 data_loader_variant="synthetic",
                 data_dir_name="racs_synthetic",
                 default_mask_filename="mask.npy",
+                source_noisemap_filename="synthetic-noise.hpx",
                 columns=RacsCatalogueColumns(
                     ra="RA",
                     dec="Dec",
@@ -1066,6 +1134,10 @@ class RacsInitialiseDataTests(unittest.TestCase):
                     flux_min=15.0,
                     nside=64,
                     chunk_size=16,
+                    noise_map_nside=1,
+                    flux_error_noise_bins=2,
+                    flux_error_flux_bins=2,
+                    flux_error_min_cell_count=1,
                     paf_temperature_data_dir=tmpdir,
                 )
             )
@@ -1102,17 +1174,47 @@ class RacsInitialiseDataTests(unittest.TestCase):
             self.assertTrue((cache_dir / "sbid_lookup_nside64.png").exists())
             self.assertTrue((cache_dir / "sbid_mixture_lookup_nside64.npz").exists())
 
-            sim.error_lookup_pixel_counts = np.zeros(n_pix, dtype=np.int64)
-            sim.error_lookup_pixel_starts = np.zeros(n_pix, dtype=np.int64)
-            sim.error_lookup_fractional_values = np.array([0.1], dtype=np.float32)
-            sim.fractional_error_map = np.full(n_pix, 0.1, dtype=np.float32)
-            sim.save_fractional_error_lookup()
-            self.assertTrue(
-                (
-                    cache_dir
-                    / "fractional_error_lookup_nside64_fluxmin10p0mjy.png"
-                ).exists()
+            source_noisemap = cache_dir / product.source_noisemap_filename
+            hp.write_map(
+                source_noisemap,
+                np.ones(hp.nside2npix(1), dtype=np.float32),
+                nest=False,
+                coord="C",
+                dtype=np.float32,
+                overwrite=True,
             )
+            noise_cache = build_noise_map_cache(
+                source_noisemap,
+                product_key=product.key,
+                target_nside=1,
+            )
+            save_noise_map_cache(
+                noise_cache,
+                sim._noise_map_cache_path(),
+                diagnostics=False,
+            )
+            absolute_lookup = build_conditional_error_lookup(
+                np.asarray([1.0, 1.0, 2.0, 2.0]),
+                np.asarray([1.0, 2.0, 1.0, 2.0]),
+                np.asarray([0.1, 0.2, 0.3, 0.4]),
+                product_key=product.key,
+                noise_map_identity=noise_cache.identity,
+                noise_bins=2,
+                flux_bins=2,
+                min_cell_count=1,
+                catalogue_columns={
+                    "ra": product.columns.ra,
+                    "dec": product.columns.dec,
+                    "total_flux": product.columns.total_flux,
+                    "total_flux_error": product.columns.total_flux_error,
+                },
+            )
+            save_conditional_error_lookup(
+                absolute_lookup,
+                sim._absolute_error_lookup_cache_path(),
+                diagnostics=False,
+            )
+            source_noisemap.unlink()
 
             sim.tile_temperature_by_index = np.array([20.0, 21.0], dtype=np.float64)
             sim.temperature_map = np.full(n_pix, np.nan, dtype=np.float32)
@@ -1141,6 +1243,8 @@ class RacsInitialiseDataTests(unittest.TestCase):
             self.assertTrue(sim.lookups_are_initialised)
             self.assertFalse(sim.catalogue_is_loaded)
             self.assertFalse(hasattr(sim, "catalogue"))
+            self.assertIsNotNone(sim.noise_map_cache)
+            self.assertIsNotNone(sim.absolute_error_lookup)
             np.testing.assert_array_equal(sim.tile_sbids, np.array([101, 202], dtype=np.int32))
             np.testing.assert_allclose(
                 sim.temperature_map[:2],

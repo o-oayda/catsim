@@ -22,6 +22,15 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _racs_config(**kwargs) -> RacsConfig:
+    """Use external noisemaps only when a test needs to build missing caches."""
+    configured = os.environ.get("RACS_NOISEMAP_DATA_DIR")
+    default = Path.home() / "catalogue_data" / "racs" / "noisemaps"
+    if configured is None and default.is_dir():
+        configured = str(default)
+    return RacsConfig(noisemap_data_dir=configured, **kwargs)
+
+
 def _coarsen_nested_count_maps(
     maps: np.ndarray,
     *,
@@ -137,12 +146,227 @@ except ImportError as exc:
 
 
 @unittest.skipIf(jax is None, "RacsLow3Jax requires the optional JAX dependencies.")
+class RacsJaxNoiseLookupTests(unittest.TestCase):
+    @staticmethod
+    def _lookup_components():
+        return (
+            jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float32),
+            jnp.asarray([0.0, 1.0, 2.0], dtype=jnp.float32),
+            jnp.asarray([2, 0, 0, 3], dtype=jnp.int32),
+            jnp.asarray([0, 2, 2, 2], dtype=jnp.int32),
+            jnp.asarray([0, 0, 3, 3], dtype=jnp.int32),
+            jnp.asarray([1.25, 1.5, 7.0, 8.0, 9.0], dtype=jnp.float32),
+        )
+
+    @staticmethod
+    def _minimal_kernel_lookup(noise_map: np.ndarray) -> tuple:
+        n_pix = hp.nside2npix(1)
+        return (
+            jnp.asarray([-1.0, 1.0], dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+            jnp.ones(n_pix, dtype=jnp.bool_),
+            jnp.ones(n_pix, dtype=jnp.int32),
+            jnp.zeros((n_pix, 1), dtype=jnp.int32),
+            jnp.ones((n_pix, 1), dtype=jnp.float32),
+            jnp.asarray(noise_map, dtype=jnp.float32),
+            jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32),
+            jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32),
+            jnp.asarray([1, 0, 0, 0], dtype=jnp.int32),
+            jnp.zeros(4, dtype=jnp.int32),
+            jnp.zeros(4, dtype=jnp.int32),
+            jnp.asarray([0.25], dtype=jnp.float32),
+            jnp.zeros(n_pix, dtype=jnp.int32),
+            jnp.zeros((n_pix, 1), dtype=jnp.float32),
+            jnp.asarray([45.0], dtype=jnp.float32),
+            jnp.asarray([25.0], dtype=jnp.float32),
+        )
+
+    def test_healpix_ang2pix_matches_configured_noise_nside_at_boundaries_and_random(self):
+        from catsim.racs_jax import jax_ang2pix_nest_lonlat
+
+        rng = np.random.default_rng(42)
+        transition = np.rad2deg(np.arcsin(2.0 / 3.0))
+        boundary_lon, boundary_lat = np.meshgrid(
+            np.asarray(
+                [0.001, 89.999, 90.001, 179.999, 180.001, 269.999, 270.001, 359.999],
+                dtype=np.float32,
+            ),
+            np.asarray(
+                [
+                    -89.999,
+                    -transition - 0.01,
+                    -transition + 0.01,
+                    -0.001,
+                    0.001,
+                    transition - 0.01,
+                    transition + 0.01,
+                    89.999,
+                ],
+                dtype=np.float32,
+            ),
+        )
+        lon = np.concatenate(
+            [
+                boundary_lon.reshape(-1),
+                rng.uniform(0.0, 360.0, 256),
+            ]
+        ).astype(np.float32)
+        lat = np.concatenate(
+            [
+                boundary_lat.reshape(-1),
+                np.rad2deg(np.arcsin(rng.uniform(-1.0, 1.0, 256))),
+            ]
+        ).astype(np.float32)
+        nside = 256
+        expected = hp.ang2pix(nside, lon, lat, lonlat=True, nest=True)
+        actual = jax.jit(
+            lambda query_lon, query_lat: jax_ang2pix_nest_lonlat(
+                nside,
+                query_lon,
+                query_lat,
+            )
+        )(jnp.asarray(lon), jnp.asarray(lat))
+
+        np.testing.assert_array_equal(np.asarray(actual), expected)
+
+    def test_flat_ragged_absolute_error_sampling_is_jittable_and_vmappable(self):
+        from catsim.racs_jax import _sample_absolute_flux_errors_jax
+
+        lookup = self._lookup_components()
+        noise = jnp.asarray([1.0, 2.0, 100.0, 1000.0], dtype=jnp.float32)
+        flux = jnp.asarray([1.0, 2.0, 1.0, 10.0], dtype=jnp.float32)
+        sample, cells, valid = jax.jit(_sample_absolute_flux_errors_jax)(
+            jax.random.PRNGKey(8),
+            noise,
+            flux,
+            *lookup,
+        )
+
+        np.testing.assert_array_equal(np.asarray(cells), [0, 0, 3, 3])
+        self.assertTrue(np.all(np.asarray(valid)))
+        self.assertTrue(set(np.asarray(sample[:2])).issubset({1.25, 1.5}))
+        self.assertTrue(set(np.asarray(sample[2:])).issubset({7.0, 8.0, 9.0}))
+
+        keys = jax.random.split(jax.random.PRNGKey(9), noise.size)
+        vmapped = jax.jit(
+            jax.vmap(
+                lambda one_key, one_noise, one_flux: _sample_absolute_flux_errors_jax(
+                    one_key,
+                    one_noise,
+                    one_flux,
+                    *lookup,
+                )[0]
+            )
+        )(keys, noise, flux)
+        self.assertEqual(vmapped.shape, noise.shape)
+        self.assertTrue(set(np.asarray(vmapped[:2])).issubset({1.25, 1.5}))
+        self.assertTrue(set(np.asarray(vmapped[2:])).issubset({7.0, 8.0, 9.0}))
+
+    def test_cell_resolution_absolute_eta_and_invalid_queries_match_numpy_semantics(self):
+        from catsim.racs_jax import (
+            _sample_absolute_flux_errors_jax,
+            _scale_absolute_flux_errors_jax,
+        )
+
+        lookup = self._lookup_components()
+        noise = jnp.asarray(
+            [1.0, 1000.0, np.nan, hp.UNSEEN, 0.0, -1.0],
+            dtype=jnp.float32,
+        )
+        flux = jnp.asarray([1.0, 10.0, 2.0, 2.0, 2.0, 2.0], dtype=jnp.float32)
+        base_sigma, cells, valid = _sample_absolute_flux_errors_jax(
+            jax.random.PRNGKey(10),
+            noise,
+            flux,
+            *lookup,
+        )
+        effective_sigma = _scale_absolute_flux_errors_jax(
+            base_sigma,
+            jnp.asarray(3.0, dtype=jnp.float32),
+        )
+
+        np.testing.assert_array_equal(np.asarray(cells[:2]), [0, 3])
+        np.testing.assert_array_equal(
+            np.asarray(valid),
+            [True, True, False, False, False, False],
+        )
+        np.testing.assert_allclose(
+            np.asarray(effective_sigma[:2]),
+            2.0 * np.asarray(base_sigma[:2]),
+        )
+        self.assertTrue(np.all(np.isnan(np.asarray(base_sigma[2:]))))
+        # The absolute lookup sigma is independent of the queried flux scale.
+        self.assertLessEqual(float(base_sigma[1]), 9.0)
+
+    def test_invalid_noise_is_excluded_from_ordinary_and_summary_kernels(self):
+        from catsim.racs_jax import (
+            _simulate_one_jax,
+            _simulate_one_jax_with_flux_summaries,
+        )
+
+        n_pix = hp.nside2npix(1)
+        lookup = self._minimal_kernel_lookup(np.full(n_pix, np.nan, dtype=np.float32))
+        common = dict(
+            key=jax.random.PRNGKey(11),
+            parent_count=jnp.asarray(4, dtype=jnp.int32),
+            flux_min=jnp.asarray(0.01, dtype=jnp.float32),
+            p_clus=jnp.asarray(0.0, dtype=jnp.float32),
+            clus_stop_prob=jnp.asarray(1.0, dtype=jnp.float32),
+            lambda_clus=jnp.asarray(0.0, dtype=jnp.float32),
+            observer_beta=jnp.asarray(0.0, dtype=jnp.float32),
+            forward_matrix=jnp.eye(3, dtype=jnp.float32),
+            inverse_matrix=jnp.eye(3, dtype=jnp.float32),
+            temp_beta=jnp.asarray(0.0, dtype=jnp.float32),
+            elevation_amp=jnp.asarray(0.0, dtype=jnp.float32),
+            elevation_trough=jnp.asarray(45.0, dtype=jnp.float32),
+            fractional_error_eta=jnp.asarray(0.0, dtype=jnp.float32),
+            lookup_tuple=lookup,
+            cluster_model_code=0,
+            nside=1,
+            noise_map_nside=1,
+            n_chunks=jnp.asarray(1, dtype=jnp.int32),
+            chunk_size=4,
+            max_children=0,
+            alpha_mean=0.8,
+            alpha_sigma=0.2,
+            cluster_r0_arcsec=100.0,
+            cluster_r_cut_arcsec=20.0,
+            paf_reference_temp_c=25.0,
+            temperature_model="hot_linear",
+            use_elevation=False,
+        )
+        density, mask, rejected = _simulate_one_jax(**common)
+        np.testing.assert_array_equal(np.asarray(density[mask]), 0.0)
+        self.assertEqual(float(np.sum(np.asarray(rejected))), 4.0)
+
+        summary_common = dict(common)
+        summary_common.update(
+            temperature_flux_min=jnp.asarray(0.01, dtype=jnp.float32),
+            flux_max=jnp.asarray(10.0, dtype=jnp.float32),
+            temperature_edges=jnp.asarray([0.0, 50.0], dtype=jnp.float32),
+            temperature_quantiles=jnp.asarray([0.5], dtype=jnp.float32),
+            elevation_edges=jnp.asarray([0.0, 90.0], dtype=jnp.float32),
+            elevation_quantiles=jnp.asarray([0.5], dtype=jnp.float32),
+            n_flux_bins=4,
+            include_temperature=True,
+            include_elevation=True,
+        )
+        density, mask, temperature_summary, elevation_summary, rejected = (
+            _simulate_one_jax_with_flux_summaries(**summary_common)
+        )
+        np.testing.assert_array_equal(np.asarray(density[mask]), 0.0)
+        np.testing.assert_array_equal(np.asarray(temperature_summary), 0.0)
+        np.testing.assert_array_equal(np.asarray(elevation_summary), 0.0)
+        self.assertEqual(float(np.sum(np.asarray(rejected))), 4.0)
+
+
+@unittest.skipIf(jax is None, "RacsLow3Jax requires the optional JAX dependencies.")
 class RacsJaxTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from catsim import RacsJax
 
-        cfg = RacsConfig(
+        cfg = _racs_config(
             product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
@@ -164,6 +388,23 @@ class RacsJaxTests(unittest.TestCase):
 
         np.testing.assert_array_equal(actual, expected)
 
+    def test_initialisation_transfers_compact_shared_noise_error_cache(self):
+        lookup = self.sim._lookup_arrays
+        self.assertIsNotNone(lookup)
+        self.assertEqual(
+            lookup.noise_map.shape,
+            (hp.nside2npix(self.sim.cfg.noise_map_nside),),
+        )
+        self.assertEqual(lookup.absolute_error_values.ndim, 1)
+        self.assertEqual(lookup.error_cell_counts.ndim, 1)
+        self.assertEqual(lookup.error_cell_counts.shape, lookup.error_cell_starts.shape)
+        self.assertEqual(
+            lookup.error_cell_counts.shape,
+            lookup.error_resolved_cell_ids.shape,
+        )
+        self.assertFalse(hasattr(lookup, "error_values_by_pixel"))
+        self.assertFalse(hasattr(lookup, "global_error_values"))
+
     def test_generate_dipole_returns_expected_shapes_and_is_deterministic(self):
         key = jax.random.PRNGKey(123)
         first_map, first_mask = self.sim.generate_dipole(np.log10(8.0), key=key)
@@ -175,12 +416,24 @@ class RacsJaxTests(unittest.TestCase):
         self.assertEqual(first_mask.dtype, np.bool_)
         np.testing.assert_array_equal(first_map, second_map)
         np.testing.assert_array_equal(first_mask, second_mask)
+        self.assertEqual(
+            self.sim.last_invalid_noise_rejection_maps.shape,
+            (1, hp.nside2npix(64)),
+        )
+        np.testing.assert_array_equal(
+            self.sim.last_invalid_noise_rejection_counts,
+            np.sum(
+                self.sim.last_invalid_noise_rejection_maps,
+                axis=1,
+                dtype=np.float64,
+            ).astype(np.int64),
+        )
 
     def test_low3_initialises_without_elevation_and_rejects_nonzero_amplitude(self):
         from catsim import RacsJax
 
         sim = RacsJax(
-            RacsConfig(
+            _racs_config(
                 flux_min=15.0,
                 chunk_size=4,
                 store_final_samples=False,
@@ -207,7 +460,7 @@ class RacsJaxTests(unittest.TestCase):
         from catsim import RacsJax
 
         sim = RacsJax(
-            RacsConfig(
+            _racs_config(
                 flux_min=15.0,
                 chunk_size=4,
                 store_final_samples=False,
@@ -463,7 +716,7 @@ class RacsJaxTests(unittest.TestCase):
     def test_poisson_clustering_path_runs(self):
         from catsim import RacsJax
 
-        cfg = RacsConfig(
+        cfg = _racs_config(
             product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
@@ -486,7 +739,7 @@ class RacsJaxTests(unittest.TestCase):
     def test_overfill_probability_warning_is_explicit(self):
         from catsim import RacsJax
 
-        cfg = RacsConfig(
+        cfg = _racs_config(
             product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
@@ -510,7 +763,7 @@ class RacsJaxTests(unittest.TestCase):
     def test_store_final_samples_is_not_supported(self):
         from catsim import RacsJax
 
-        cfg = RacsConfig(
+        cfg = _racs_config(
             product=RACS_MID1,
             flux_min=0.001,
             chunk_size=4,
@@ -544,7 +797,7 @@ class RacsJaxTests(unittest.TestCase):
         n_jax = 100
         log10_n = 6.0
 
-        cfg = RacsConfig(
+        cfg = _racs_config(
             product=RACS_MID1,
             flux_min=15,
             chunk_size=1_000,

@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import platform
+from pathlib import Path
+import subprocess
+import sys
 from time import perf_counter
 import warnings
 
@@ -29,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log10-n", type=float, default=4.0)
     parser.add_argument("--flux-min", type=float, default=15.0)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--noisemap-data-dir")
+    parser.add_argument(
+        "--output",
+        help="Optional pinned ensemble .npz for compare_racs_noise_ensembles.py.",
+    )
     parser.add_argument("--max-children", type=int, default=16)
     parser.add_argument(
         "--cluster-model",
@@ -56,6 +66,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _commit() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _block_until_ready(arrays: tuple[np.ndarray, np.ndarray]) -> None:
     for array in arrays:
         jax.block_until_ready(array)
@@ -72,12 +94,14 @@ def main() -> None:
         store_final_samples=False,
         cluster_count_model=args.cluster_model,
         max_cluster_children_per_parent=args.max_children,
+        noisemap_data_dir=args.noisemap_data_dir,
     )
     sim = RacsJax(cfg)
 
     t0 = perf_counter()
     sim.initialise_data()
-    print(f"initialise_data: {perf_counter() - t0:.3f} s")
+    initialise_elapsed = perf_counter() - t0
+    print(f"initialise_data: {initialise_elapsed:.3f} s")
 
     theta = {
         "log10_n_initial_samples": np.full(args.n_sims, args.log10_n, dtype=np.float32),
@@ -139,6 +163,82 @@ def main() -> None:
     print(f"mean kept sources/map: {float(np.nanmean(np.nansum(maps, axis=1))):.3f}")
     print(f"simulations/sec: {args.n_sims / elapsed:.3f}")
     print(f"requested parent-source slots/sec: {total_requested / elapsed:.3e}")
+    device_memory_stats: dict[str, object] = {}
+    for device in jax.devices():
+        try:
+            stats = device.memory_stats()
+            device_memory_stats[str(device)] = stats
+            print(f"device memory stats ({device}): {stats}")
+        except (AttributeError, RuntimeError, TypeError):
+            device_memory_stats[str(device)] = None
+            print(f"device memory stats ({device}): unavailable")
+
+    if args.output is not None:
+        if sim.last_invalid_noise_rejection_maps is None:
+            raise RuntimeError("JAX simulator did not expose invalid-noise diagnostics.")
+        metadata = {
+            "commit": _commit(),
+            "config": {
+                "product": sim.product.key,
+                "nside": sim.nside,
+                "chunk_size": sim.chunk_size,
+                "batch_size": args.batch_size,
+                "flux_min": args.flux_min,
+                "log10_n_initial_samples": args.log10_n,
+                "cluster_count_model": args.cluster_model,
+                "max_cluster_children_per_parent": args.max_children,
+                "p_clus": args.p_clus,
+                "clus_stop_prob": args.clus_stop_prob,
+                "lambda_clus": args.lambda_clus,
+                "observer_speed": args.observer_speed,
+                "temp_beta": args.temp_beta,
+                "elevation_amp": args.elevation_amp,
+                "elevation_trough": args.elevation_trough,
+                "fractional_error_eta": args.fractional_error_eta,
+                "alpha_mean": cfg.alpha_mean,
+                "alpha_sigma": cfg.alpha_sigma,
+                "cluster_r0_arcsec": cfg.cluster_r0_arcsec,
+                "cluster_r_cut_arcsec": cfg.cluster_r_cut_arcsec,
+                "temperature_model": cfg.temperature_model,
+                "paf_reference_temp_c": cfg.paf_reference_temp_c,
+                "noise_map_nside": cfg.noise_map_nside,
+                "flux_error_noise_bins": cfg.flux_error_noise_bins,
+                "flux_error_flux_bins": cfg.flux_error_flux_bins,
+                "flux_error_min_cell_count": cfg.flux_error_min_cell_count,
+                "warmup_enabled": not args.skip_warmup,
+            },
+            "seeds": {"root_prng_key_seed": args.seed, "n_simulations": args.n_sims},
+            "cache_identities": {
+                "noise_map": sim.noise_map_cache_identity,
+                "absolute_error_lookup": sim.absolute_error_lookup_identity,
+            },
+            "environment": {
+                "python": sys.version,
+                "platform": platform.platform(),
+                "jax": jax.__version__,
+                "devices": [str(device) for device in jax.devices()],
+            },
+            "performance": {
+                "initialise_seconds": initialise_elapsed,
+                "simulation_seconds": elapsed,
+                "simulations_per_second": args.n_sims / elapsed,
+                "requested_parent_source_slots_per_second": (
+                    total_requested / elapsed
+                ),
+                "device_memory_stats": device_memory_stats,
+            },
+            # Root seeds alone do not verify source-level pairing.
+            "pairing_verified": False,
+        }
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            output,
+            maps=maps,
+            rejected_invalid_noise_maps=sim.last_invalid_noise_rejection_maps,
+            metadata_json=np.asarray(json.dumps(metadata, sort_keys=True, default=str)),
+        )
+        print(f"ensemble artifact: {output}")
 
 
 if __name__ == "__main__":

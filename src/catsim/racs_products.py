@@ -31,6 +31,7 @@ class RacsProductSpec:
     data_dir_name: str
     columns: RacsCatalogueColumns
     default_mask_filename: str | None = None
+    source_noisemap_filename: str | None = None
     supports_paf_temperature: bool = True
 
     @property
@@ -45,6 +46,7 @@ RACS_LOW3 = RacsProductSpec(
     data_loader_variant="low3",
     data_dir_name="racs_low3",
     default_mask_filename="racs-low3_mask_nside64_ring.npy",
+    source_noisemap_filename="RACS-low3.iqr.hpx",
     columns=RacsCatalogueColumns(
         ra="RA",
         dec="Dec",
@@ -65,6 +67,7 @@ RACS_MID1 = RacsProductSpec(
     data_loader_catalogue="racs",
     data_loader_variant="mid1",
     data_dir_name="racs_mid1",
+    source_noisemap_filename="RACS-mid1.iqr.hpx",
     columns=RacsCatalogueColumns(
         ra="RA",
         dec="DEC",

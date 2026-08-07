@@ -1,3 +1,4 @@
+from pathlib import Path
 from time import time
 
 import healpy as hp
@@ -9,12 +10,22 @@ from catsim.utils.constants import CMB_B, CMB_L
 from dipoleutils.utils.plotting import plot_log_log_histogram
 
 
+reference_mask_path = (
+    Path.home()
+    / "Documents/sbi/derived/observations/racs_mid1_flux15_ds4"
+    / "reference_observation_native.npz"
+)
+with np.load(reference_mask_path, allow_pickle=False) as reference_observation:
+    reference_mask = reference_observation["mask"].astype(np.bool_, copy=False)
+
 config = RacsConfig(
     product=RACS_MID1,
     flux_min=15.0,
+    mask_map=reference_mask,
     chunk_size=100_000,
     store_final_samples=True,
     paf_reference_temp_c=27.1,
+    cluster_count_model='poisson'
 )
 sim = Racs(config)
 
@@ -23,14 +34,13 @@ sim.initialise_data()
 init_t1 = time()
 t0 = time()
 dmap, mask = sim.generate_dipole(
-    log10_n_initial_samples=6.664,
-    observer_speed=2.72,
-    dipole_longitude=308,
-    dipole_latitude=-1,
-    temp_beta=0.015,
-    elevation_amp=0.0,
-    elevation_trough=0.0,
-    # fractional_error_eta=40.
+    log10_n_initial_samples=6.554,
+    observer_speed=4.96,
+    dipole_longitude=169,
+    dipole_latitude=43,
+    temp_beta=0.0067,
+    lambda_clus=0.58,
+    fractional_error_eta=4.
 )
 t1 = time()
 
@@ -52,7 +62,7 @@ if temperature_map is not None:
     print(f"Temperature-covered pixels: {finite_temperatures.sum()}")
     if np.any(finite_temperatures):
         print(f"Temperature range (C): {temperature_map[finite_temperatures].min():.2f} to {temperature_map[finite_temperatures].max():.2f}")
-fractional_error_map = sim.fractional_error_map
+sampled_flux_error_map = sim.sampled_flux_error_map
 sampled_fractional_error_map = sim.sampled_fractional_error_map
 elevation_map = sim.elevation_map
 if elevation_map is not None:
@@ -64,14 +74,14 @@ if elevation_map is not None:
             f"{elevation_map[finite_elevations].min():.2f} to "
             f"{elevation_map[finite_elevations].max():.2f}"
         )
-if fractional_error_map is not None:
-    finite_fractional_errors = np.isfinite(fractional_error_map)
-    print(f"Fractional-error-covered pixels: {finite_fractional_errors.sum()}")
-    if np.any(finite_fractional_errors):
+if sampled_flux_error_map is not None:
+    finite_flux_errors = np.isfinite(sampled_flux_error_map)
+    print(f"Sampled flux-error-covered pixels: {finite_flux_errors.sum()}")
+    if np.any(finite_flux_errors):
         print(
-            "Fractional error range: "
-            f"{fractional_error_map[finite_fractional_errors].min():.4f} to "
-            f"{fractional_error_map[finite_fractional_errors].max():.4f}"
+            "Sampled absolute flux error range (mJy): "
+            f"{sampled_flux_error_map[finite_flux_errors].min():.4f} to "
+            f"{sampled_flux_error_map[finite_flux_errors].max():.4f}"
         )
 if sampled_fractional_error_map is not None:
     finite_sampled_fractional_errors = np.isfinite(sampled_fractional_error_map)
@@ -94,7 +104,7 @@ if sampled_fractional_error_map is not None:
         nest=True,
         title="RACS-mid1 Sampled Fractional Error Map",
     )
-smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True, min=13.02, max=14.41)
+smooth_map(dmap, coord=['C'], graticule=True, graticule_labels=True)
 plt.show()
 
 # plot_log_log_histogram(sim.final_observed_flux_samples, bins=100)

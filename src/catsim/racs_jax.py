@@ -44,9 +44,13 @@ class _LookupArrays:
     tile_counts: jax.Array
     tile_indices: jax.Array
     tile_cdf: jax.Array
-    error_counts: jax.Array
-    error_values_by_pixel: jax.Array
-    global_error_values: jax.Array
+    noise_map: jax.Array
+    error_log_noise_edges: jax.Array
+    error_log_flux_edges: jax.Array
+    error_cell_counts: jax.Array
+    error_cell_starts: jax.Array
+    error_resolved_cell_ids: jax.Array
+    absolute_error_values: jax.Array
     elevation_counts: jax.Array
     elevation_values_by_pixel: jax.Array
     global_elevation_values: jax.Array
@@ -60,9 +64,13 @@ class _LookupArrays:
             self.tile_counts,
             self.tile_indices,
             self.tile_cdf,
-            self.error_counts,
-            self.error_values_by_pixel,
-            self.global_error_values,
+            self.noise_map,
+            self.error_log_noise_edges,
+            self.error_log_flux_edges,
+            self.error_cell_counts,
+            self.error_cell_starts,
+            self.error_resolved_cell_ids,
+            self.absolute_error_values,
             self.elevation_counts,
             self.elevation_values_by_pixel,
             self.global_elevation_values,
@@ -165,6 +173,66 @@ def _sample_fluxes_jax(
     low = log_flux_edges[bin_idx]
     high = log_flux_edges[bin_idx + 1]
     return jnp.power(10.0, low + (high - low) * u_pos)
+
+
+def _sample_absolute_flux_errors_jax(
+    key: jax.Array,
+    noise_ujy_beam: jax.Array,
+    pre_noise_flux_mjy: jax.Array,
+    log_noise_edges: jax.Array,
+    log_flux_edges: jax.Array,
+    cell_counts: jax.Array,
+    cell_starts: jax.Array,
+    resolved_cell_ids: jax.Array,
+    absolute_error_values: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Sample the compact noise/flux-conditioned absolute-error lookup.
+
+    Invalid queries are still routed through an eligible cell so every
+    vectorized ``randint`` bound remains positive, then masked to NaN in the
+    returned samples.  The final boolean is the source-level validity mask.
+    """
+    noise, flux = jnp.broadcast_arrays(noise_ujy_beam, pre_noise_flux_mjy)
+    valid = (
+        jnp.isfinite(noise)
+        & (noise > 0.0)
+        & jnp.isfinite(flux)
+        & (flux > 0.0)
+    )
+    safe_noise = jnp.where(valid, noise, 1.0)
+    safe_flux = jnp.where(valid, flux, 1.0)
+    noise_bin = jnp.searchsorted(
+        log_noise_edges,
+        jnp.log10(safe_noise),
+        side="right",
+    ) - 1
+    flux_bin = jnp.searchsorted(
+        log_flux_edges,
+        jnp.log10(safe_flux),
+        side="right",
+    ) - 1
+    noise_bin = jnp.clip(noise_bin, 0, log_noise_edges.shape[0] - 2)
+    flux_bin = jnp.clip(flux_bin, 0, log_flux_edges.shape[0] - 2)
+    raw_cell = noise_bin * (log_flux_edges.shape[0] - 1) + flux_bin
+    resolved_cell = resolved_cell_ids[raw_cell]
+    count = cell_counts[resolved_cell]
+    offset = jax.random.randint(
+        key,
+        noise.shape,
+        minval=0,
+        maxval=count,
+        dtype=jnp.int32,
+    )
+    sample = absolute_error_values[cell_starts[resolved_cell] + offset]
+    return jnp.where(valid, sample, jnp.nan), resolved_cell, valid
+
+
+def _scale_absolute_flux_errors_jax(
+    base_absolute_sigma_mjy: jax.Array,
+    fractional_error_eta: jax.Array,
+) -> jax.Array:
+    """Apply the retained eta variance scaling to an absolute sigma."""
+    return base_absolute_sigma_mjy * jnp.sqrt(1.0 + fractional_error_eta)
 
 
 def _aberrate_points_jax(
@@ -356,6 +424,7 @@ def _simulate_one_jax(
     *,
     cluster_model_code: int,
     nside: int,
+    noise_map_nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
@@ -366,7 +435,7 @@ def _simulate_one_jax(
     paf_reference_temp_c: float,
     temperature_model: str,
     use_elevation: bool,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     (
         log_flux_edges,
         log_flux_cdf,
@@ -374,9 +443,13 @@ def _simulate_one_jax(
         tile_counts,
         tile_indices,
         tile_cdf,
-        error_counts,
-        error_values_by_pixel,
-        global_error_values,
+        noise_map,
+        error_log_noise_edges,
+        error_log_flux_edges,
+        error_cell_counts,
+        error_cell_starts,
+        error_resolved_cell_ids,
+        absolute_error_values,
         elevation_counts,
         elevation_values_by_pixel,
         global_elevation_values,
@@ -386,10 +459,13 @@ def _simulate_one_jax(
     n_pix = mask_map.shape[0]
     source_slots = 1 + max_children
     child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
-    error_max_count = error_values_by_pixel.shape[1]
     elevation_max_count = elevation_values_by_pixel.shape[1]
 
-    def chunk_body(accumulator: jax.Array, chunk_index: jax.Array) -> tuple[jax.Array, None]:
+    def chunk_body(
+        state: tuple[jax.Array, jax.Array],
+        chunk_index: jax.Array,
+    ) -> tuple[tuple[jax.Array, jax.Array], None]:
+        accumulator, invalid_noise_accumulator = state
         chunk_key = jax.random.fold_in(key, chunk_index)
         (
             key_parent_pos,
@@ -400,7 +476,7 @@ def _simulate_one_jax(
             key_tile,
             key_elevation,
             key_error,
-            key_global_error,
+            _key_legacy_global_error,
             key_global_elevation,
             key_noise,
         ) = jax.random.split(chunk_key, 11)
@@ -516,30 +592,27 @@ def _simulate_one_jax(
             )
             systematics_flux = systematics_flux * elevation_enhancement
 
-        error_count = error_counts[pixel_indices]
-        safe_error_count = jnp.maximum(error_count, 1)
-        error_u = jax.random.uniform(key_error, pixel_indices.shape, dtype=jnp.float32)
-        error_choice = jnp.floor(error_u * safe_error_count.astype(jnp.float32)).astype(jnp.int32)
-        error_choice = jnp.minimum(error_choice, error_max_count - 1)
-        pixel_fractional_error = error_values_by_pixel[pixel_indices, error_choice]
-
-        global_choice = jax.random.randint(
-            key_global_error,
-            pixel_indices.shape,
-            minval=0,
-            maxval=global_error_values.shape[0],
-            dtype=jnp.int32,
+        noise_pixel_indices = jax_ang2pix_nest_lonlat(
+            noise_map_nside,
+            boosted_ra,
+            boosted_dec,
         )
-        global_fractional_error = global_error_values[global_choice]
-        base_fractional_error = jnp.where(
-            error_count > 0,
-            pixel_fractional_error,
-            global_fractional_error,
+        local_noise = noise_map[noise_pixel_indices]
+        valid_noise = jnp.isfinite(local_noise) & (local_noise > 0.0)
+        base_flux_sigma, _, valid_error_query = _sample_absolute_flux_errors_jax(
+            key_error,
+            local_noise,
+            systematics_flux,
+            error_log_noise_edges,
+            error_log_flux_edges,
+            error_cell_counts,
+            error_cell_starts,
+            error_resolved_cell_ids,
+            absolute_error_values,
         )
-        flux_sigma = (
-            base_fractional_error
-            * systematics_flux
-            * jnp.sqrt(1.0 + fractional_error_eta)
+        flux_sigma = _scale_absolute_flux_errors_jax(
+            base_flux_sigma,
+            fractional_error_eta,
         )
         observed_flux = systematics_flux + jax.random.normal(
             key_noise,
@@ -547,23 +620,42 @@ def _simulate_one_jax(
             dtype=jnp.float32,
         ) * flux_sigma
 
-        keep = source_valid & in_mask & (sampled_tile >= 0) & (observed_flux >= flux_min)
+        keep = (
+            source_valid
+            & in_mask
+            & (sampled_tile >= 0)
+            & valid_noise
+            & valid_error_query
+            & (observed_flux >= flux_min)
+        )
         accumulator = accumulator.at[pixel_indices].add(keep.astype(jnp.float32))
-        return accumulator, None
+        rejected_invalid_noise = source_valid & ~valid_noise
+        invalid_noise_accumulator = invalid_noise_accumulator.at[pixel_indices].add(
+            rejected_invalid_noise.astype(jnp.float32)
+        )
+        return (accumulator, invalid_noise_accumulator), None
 
     density = jnp.zeros((n_pix,), dtype=jnp.float32)
+    invalid_noise_rejections = jnp.zeros((n_pix,), dtype=jnp.float32)
 
-    def fori_body(chunk_index: jax.Array, current_density: jax.Array) -> jax.Array:
-        current_density, _ = chunk_body(current_density, chunk_index)
-        return current_density
+    def fori_body(
+        chunk_index: jax.Array,
+        state: tuple[jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        state, _ = chunk_body(state, chunk_index)
+        return state
 
-    density = jax.lax.fori_loop(
+    density, invalid_noise_rejections = jax.lax.fori_loop(
         jnp.asarray(0, dtype=jnp.int32),
         n_chunks,
         fori_body,
-        density,
+        (density, invalid_noise_rejections),
     )
-    return jnp.where(mask_map, density, jnp.nan), mask_map
+    return (
+        jnp.where(mask_map, density, jnp.nan),
+        mask_map,
+        invalid_noise_rejections,
+    )
 
 
 def _simulate_one_jax_with_flux_summaries(
@@ -590,6 +682,7 @@ def _simulate_one_jax_with_flux_summaries(
     *,
     cluster_model_code: int,
     nside: int,
+    noise_map_nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
@@ -603,7 +696,7 @@ def _simulate_one_jax_with_flux_summaries(
     include_temperature: bool,
     include_elevation: bool,
     use_elevation: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     (
         log_flux_edges,
         log_flux_cdf,
@@ -611,9 +704,13 @@ def _simulate_one_jax_with_flux_summaries(
         tile_counts,
         tile_indices,
         tile_cdf,
-        error_counts,
-        error_values_by_pixel,
-        global_error_values,
+        noise_map,
+        error_log_noise_edges,
+        error_log_flux_edges,
+        error_cell_counts,
+        error_cell_starts,
+        error_resolved_cell_ids,
+        absolute_error_values,
         elevation_counts,
         elevation_values_by_pixel,
         global_elevation_values,
@@ -623,7 +720,6 @@ def _simulate_one_jax_with_flux_summaries(
     n_pix = mask_map.shape[0]
     source_slots = 1 + max_children
     child_ordinals = jnp.arange(max_children, dtype=jnp.int32)
-    error_max_count = error_values_by_pixel.shape[1]
     elevation_max_count = elevation_values_by_pixel.shape[1]
     n_temp_bins = temperature_edges.shape[0] - 1
     n_elevation_bins = elevation_edges.shape[0] - 1
@@ -637,10 +733,15 @@ def _simulate_one_jax_with_flux_summaries(
     )
 
     def chunk_body(
-        state: tuple[jax.Array, jax.Array, jax.Array],
+        state: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
         chunk_index: jax.Array,
-    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
-        density_accumulator, flux_temperature_hist, flux_elevation_hist = state
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], None]:
+        (
+            density_accumulator,
+            flux_temperature_hist,
+            flux_elevation_hist,
+            invalid_noise_accumulator,
+        ) = state
         chunk_key = jax.random.fold_in(key, chunk_index)
         (
             key_parent_pos,
@@ -651,7 +752,7 @@ def _simulate_one_jax_with_flux_summaries(
             key_tile,
             key_elevation,
             key_error,
-            key_global_error,
+            _key_legacy_global_error,
             key_global_elevation,
             key_noise,
         ) = jax.random.split(chunk_key, 11)
@@ -772,30 +873,27 @@ def _simulate_one_jax_with_flux_summaries(
             )
             systematics_flux = systematics_flux * elevation_enhancement
 
-        error_count = error_counts[pixel_indices]
-        safe_error_count = jnp.maximum(error_count, 1)
-        error_u = jax.random.uniform(key_error, pixel_indices.shape, dtype=jnp.float32)
-        error_choice = jnp.floor(error_u * safe_error_count.astype(jnp.float32)).astype(jnp.int32)
-        error_choice = jnp.minimum(error_choice, error_max_count - 1)
-        pixel_fractional_error = error_values_by_pixel[pixel_indices, error_choice]
-
-        global_choice = jax.random.randint(
-            key_global_error,
-            pixel_indices.shape,
-            minval=0,
-            maxval=global_error_values.shape[0],
-            dtype=jnp.int32,
+        noise_pixel_indices = jax_ang2pix_nest_lonlat(
+            noise_map_nside,
+            boosted_ra,
+            boosted_dec,
         )
-        global_fractional_error = global_error_values[global_choice]
-        base_fractional_error = jnp.where(
-            error_count > 0,
-            pixel_fractional_error,
-            global_fractional_error,
+        local_noise = noise_map[noise_pixel_indices]
+        valid_noise = jnp.isfinite(local_noise) & (local_noise > 0.0)
+        base_flux_sigma, _, valid_error_query = _sample_absolute_flux_errors_jax(
+            key_error,
+            local_noise,
+            systematics_flux,
+            error_log_noise_edges,
+            error_log_flux_edges,
+            error_cell_counts,
+            error_cell_starts,
+            error_resolved_cell_ids,
+            absolute_error_values,
         )
-        flux_sigma = (
-            base_fractional_error
-            * systematics_flux
-            * jnp.sqrt(1.0 + fractional_error_eta)
+        flux_sigma = _scale_absolute_flux_errors_jax(
+            base_flux_sigma,
+            fractional_error_eta,
         )
         observed_flux = systematics_flux + jax.random.normal(
             key_noise,
@@ -803,10 +901,20 @@ def _simulate_one_jax_with_flux_summaries(
             dtype=jnp.float32,
         ) * flux_sigma
 
-        base_keep = source_valid & in_mask & (sampled_tile >= 0)
+        base_keep = (
+            source_valid
+            & in_mask
+            & (sampled_tile >= 0)
+            & valid_noise
+            & valid_error_query
+        )
         keep = base_keep & (observed_flux >= flux_min)
         density_accumulator = density_accumulator.at[pixel_indices].add(
             keep.astype(jnp.float32)
+        )
+        rejected_invalid_noise = source_valid & ~valid_noise
+        invalid_noise_accumulator = invalid_noise_accumulator.at[pixel_indices].add(
+            rejected_invalid_noise.astype(jnp.float32)
         )
 
         if include_temperature:
@@ -869,6 +977,7 @@ def _simulate_one_jax_with_flux_summaries(
             density_accumulator,
             flux_temperature_hist,
             flux_elevation_hist,
+            invalid_noise_accumulator,
         ), None
 
     density = jnp.zeros((n_pix,), dtype=jnp.float32)
@@ -877,19 +986,30 @@ def _simulate_one_jax_with_flux_summaries(
         (n_elevation_bins, n_flux_bins),
         dtype=jnp.float32,
     )
+    invalid_noise_rejections = jnp.zeros((n_pix,), dtype=jnp.float32)
 
     def fori_body(
         chunk_index: jax.Array,
-        state: tuple[jax.Array, jax.Array, jax.Array],
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        state: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         state, _ = chunk_body(state, chunk_index)
         return state
 
-    density, flux_temperature_hist, flux_elevation_hist = jax.lax.fori_loop(
+    (
+        density,
+        flux_temperature_hist,
+        flux_elevation_hist,
+        invalid_noise_rejections,
+    ) = jax.lax.fori_loop(
         jnp.asarray(0, dtype=jnp.int32),
         n_chunks,
         fori_body,
-        (density, flux_temperature_hist, flux_elevation_hist),
+        (
+            density,
+            flux_temperature_hist,
+            flux_elevation_hist,
+            invalid_noise_rejections,
+        ),
     )
     temperature_summary = _histogram_flux_quantiles_jax(
         flux_temperature_hist,
@@ -908,6 +1028,7 @@ def _simulate_one_jax_with_flux_summaries(
         mask_map,
         temperature_summary,
         elevation_summary,
+        invalid_noise_rejections,
     )
 
 
@@ -916,6 +1037,7 @@ def _simulate_one_jax_with_flux_summaries(
     static_argnames=(
         "cluster_model_code",
         "nside",
+        "noise_map_nside",
         "chunk_size",
         "max_children",
         "alpha_mean",
@@ -945,6 +1067,7 @@ def _simulate_batch_jax(
     *,
     cluster_model_code: int,
     nside: int,
+    noise_map_nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
@@ -955,13 +1078,14 @@ def _simulate_batch_jax(
     paf_reference_temp_c: float,
     temperature_model: str,
     use_elevation: bool,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     return jax.vmap(
         partial(
             _simulate_one_jax,
             lookup_tuple=lookup_tuple,
             cluster_model_code=cluster_model_code,
             nside=nside,
+            noise_map_nside=noise_map_nside,
             n_chunks=n_chunks,
             chunk_size=chunk_size,
             max_children=max_children,
@@ -995,6 +1119,7 @@ def _simulate_batch_jax(
     static_argnames=(
         "cluster_model_code",
         "nside",
+        "noise_map_nside",
         "chunk_size",
         "max_children",
         "alpha_mean",
@@ -1033,6 +1158,7 @@ def _simulate_batch_jax_with_flux_summaries(
     *,
     cluster_model_code: int,
     nside: int,
+    noise_map_nside: int,
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
@@ -1046,7 +1172,7 @@ def _simulate_batch_jax_with_flux_summaries(
     include_temperature: bool,
     include_elevation: bool,
     use_elevation: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     return jax.vmap(
         partial(
             _simulate_one_jax_with_flux_summaries,
@@ -1057,6 +1183,7 @@ def _simulate_batch_jax_with_flux_summaries(
             lookup_tuple=lookup_tuple,
             cluster_model_code=cluster_model_code,
             nside=nside,
+            noise_map_nside=noise_map_nside,
             n_chunks=n_chunks,
             chunk_size=chunk_size,
             max_children=max_children,
@@ -1110,6 +1237,10 @@ class RacsJax:
         self.elevation_is_available = False
         self.flux_summary_flux_max_mjy: Optional[float] = None
         self.flux_temperature_summary_flux_max_mjy: Optional[float] = None
+        self.last_invalid_noise_rejection_maps: Optional[NDArray[np.float32]] = None
+        self.last_invalid_noise_rejection_counts: Optional[NDArray[np.int64]] = None
+        self.noise_map_cache_identity: Optional[str] = None
+        self.absolute_error_lookup_identity: Optional[str] = None
 
     def initialise_data(self) -> None:
         reference = Racs(self.cfg)
@@ -1136,14 +1267,9 @@ class RacsJax:
         )
         tile_cdf = np.cumsum(tile_probabilities, axis=1, dtype=np.float32)
 
-        error_counts = reference.error_lookup_pixel_counts.astype(np.int32, copy=False)
-        error_values_by_pixel = _pad_flat_lookup(
-            error_counts,
-            reference.error_lookup_pixel_starts,
-            reference.error_lookup_fractional_values,
-            fill_value=0.0,
-            dtype=np.float32,
-        )
+        error_lookup = reference.absolute_error_lookup
+        self.noise_map_cache_identity = reference.noise_map_cache.identity
+        self.absolute_error_lookup_identity = error_lookup.identity
         self.elevation_is_available = self.product.columns.elevation is not None
         if self.elevation_is_available:
             elevation_counts = reference.elevation_lookup_pixel_counts.astype(
@@ -1207,10 +1333,23 @@ class RacsJax:
             tile_counts=jnp.asarray(tile_counts, dtype=jnp.int32),
             tile_indices=jnp.asarray(tile_indices, dtype=jnp.int32),
             tile_cdf=jnp.asarray(tile_cdf, dtype=jnp.float32),
-            error_counts=jnp.asarray(error_counts, dtype=jnp.int32),
-            error_values_by_pixel=jnp.asarray(error_values_by_pixel, dtype=jnp.float32),
-            global_error_values=jnp.asarray(
-                reference.error_lookup_fractional_values,
+            noise_map=jnp.asarray(reference.noise_map, dtype=jnp.float32),
+            error_log_noise_edges=jnp.asarray(
+                error_lookup.log_noise_edges,
+                dtype=jnp.float32,
+            ),
+            error_log_flux_edges=jnp.asarray(
+                error_lookup.log_flux_edges,
+                dtype=jnp.float32,
+            ),
+            error_cell_counts=jnp.asarray(error_lookup.cell_counts, dtype=jnp.int32),
+            error_cell_starts=jnp.asarray(error_lookup.cell_starts, dtype=jnp.int32),
+            error_resolved_cell_ids=jnp.asarray(
+                error_lookup.resolved_cell_ids,
+                dtype=jnp.int32,
+            ),
+            absolute_error_values=jnp.asarray(
+                error_lookup.absolute_error_values,
                 dtype=jnp.float32,
             ),
             elevation_counts=jnp.asarray(elevation_counts, dtype=jnp.int32),
@@ -1319,6 +1458,7 @@ class RacsJax:
         root_keys = jax.random.split(key, n_sims)
         maps: list[np.ndarray] = []
         masks: list[np.ndarray] = []
+        invalid_noise_maps: list[np.ndarray] = []
 
         batch_starts = range(0, n_sims, batch_size)
         if show_progress:
@@ -1352,7 +1492,7 @@ class RacsJax:
             else:
                 batch_keys = root_keys[start:stop]
 
-            batch_maps, batch_masks = _simulate_batch_jax(
+            batch_maps, batch_masks, batch_invalid_noise_maps = _simulate_batch_jax(
                 keys=jnp.asarray(batch_keys),
                 parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
                 flux_mins=jnp.asarray(chunk["flux_min"], dtype=jnp.float32),
@@ -1375,6 +1515,7 @@ class RacsJax:
                 lookup_tuple=self._lookup_arrays.as_tuple(),
                 cluster_model_code=self._cluster_model_code(),
                 nside=self.nside,
+                noise_map_nside=self.cfg.noise_map_nside,
                 n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                 chunk_size=self.chunk_size,
                 max_children=self.max_cluster_children_per_parent,
@@ -1388,11 +1529,26 @@ class RacsJax:
             )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
+            invalid_noise_maps.append(
+                np.asarray(
+                    batch_invalid_noise_maps[:actual_batch_size],
+                    dtype=np.float32,
+                )
+            )
             if show_progress:
                 batch_starts.set_postfix(completed=stop, total=n_sims)
 
         out_maps = np.concatenate(maps, axis=0)
         out_masks = np.concatenate(masks, axis=0)
+        self.last_invalid_noise_rejection_maps = np.concatenate(
+            invalid_noise_maps,
+            axis=0,
+        )
+        self.last_invalid_noise_rejection_counts = np.sum(
+            self.last_invalid_noise_rejection_maps,
+            axis=1,
+            dtype=np.float64,
+        ).astype(np.int64)
         return self._downscale_batch_output(out_maps, out_masks)
 
     def batch_generate_dipole_with_flux_temperature_summary(
@@ -1540,6 +1696,7 @@ class RacsJax:
         masks: list[np.ndarray] = []
         temperature_summaries: list[np.ndarray] = []
         elevation_summaries: list[np.ndarray] = []
+        invalid_noise_maps: list[np.ndarray] = []
 
         batch_starts = range(0, n_sims, batch_size)
         if show_progress:
@@ -1584,6 +1741,7 @@ class RacsJax:
                 batch_masks,
                 batch_temperature_summaries,
                 batch_elevation_summaries,
+                batch_invalid_noise_maps,
             ) = _simulate_batch_jax_with_flux_summaries(
                     keys=jnp.asarray(batch_keys),
                     parent_counts=jnp.asarray(parent_counts, dtype=jnp.int32),
@@ -1632,6 +1790,7 @@ class RacsJax:
                     lookup_tuple=self._lookup_arrays.as_tuple(),
                     cluster_model_code=self._cluster_model_code(),
                     nside=self.nside,
+                    noise_map_nside=self.cfg.noise_map_nside,
                     n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                     chunk_size=self.chunk_size,
                     max_children=self.max_cluster_children_per_parent,
@@ -1648,6 +1807,12 @@ class RacsJax:
                 )
             maps.append(np.asarray(batch_maps[:actual_batch_size], dtype=np.float32))
             masks.append(np.asarray(batch_masks[:actual_batch_size], dtype=np.bool_))
+            invalid_noise_maps.append(
+                np.asarray(
+                    batch_invalid_noise_maps[:actual_batch_size],
+                    dtype=np.float32,
+                )
+            )
             if include_temperature:
                 temperature_summaries.append(
                     np.asarray(
@@ -1667,6 +1832,15 @@ class RacsJax:
 
         out_maps = np.concatenate(maps, axis=0)
         out_masks = np.concatenate(masks, axis=0)
+        self.last_invalid_noise_rejection_maps = np.concatenate(
+            invalid_noise_maps,
+            axis=0,
+        )
+        self.last_invalid_noise_rejection_counts = np.sum(
+            self.last_invalid_noise_rejection_maps,
+            axis=1,
+            dtype=np.float64,
+        ).astype(np.int64)
         out_maps, out_masks = self._downscale_batch_output(out_maps, out_masks)
         out_summaries: dict[str, np.ndarray] = {}
         if include_temperature:

@@ -25,7 +25,6 @@ def main() -> None:
         flux_min=15,
         chunk_size=100_000,
         store_final_samples=False,
-        fractional_error_flux_min_mjy=10,
         temperature_fallback="open_meteo",
     )
     sim = RacsJax(cfg)
