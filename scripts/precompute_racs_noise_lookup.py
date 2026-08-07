@@ -48,9 +48,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--catalogue-path", help="Product catalogue used to rebuild the grid")
     parser.add_argument("--noise-map-nside", type=_positive_int, default=256)
-    parser.add_argument("--noise-bins", type=_positive_int, default=400)
-    parser.add_argument("--flux-bins", type=_positive_int, default=400)
+    parser.add_argument(
+        "--noise-bins",
+        type=_positive_int,
+        help="Override the selected product's conditional-lookup default.",
+    )
+    parser.add_argument(
+        "--flux-bins",
+        type=_positive_int,
+        help="Override the selected product's conditional-lookup default.",
+    )
     parser.add_argument("--min-cell-count", type=_positive_int, default=10)
+    parser.add_argument(
+        "--noise-bounds",
+        type=float,
+        nargs=2,
+        metavar=("MIN_UJY_BEAM", "MAX_UJY_BEAM"),
+        help="Override the selected product's inclusive physical noise bounds.",
+    )
+    parser.add_argument(
+        "--flux-bounds",
+        type=float,
+        nargs=2,
+        metavar=("MIN_MJY", "MAX_MJY"),
+        help="Override the selected product's inclusive physical flux bounds.",
+    )
     parser.add_argument(
         "--rebuild",
         choices=("none", "noise", "lookup", "all"),
@@ -83,6 +105,16 @@ def precompute(args: argparse.Namespace) -> dict[str, Any]:
         flux_error_noise_bins=args.noise_bins,
         flux_error_flux_bins=args.flux_bins,
         flux_error_min_cell_count=args.min_cell_count,
+        flux_error_noise_bounds_ujy_beam=(
+            tuple(args.noise_bounds)
+            if args.noise_bounds is not None
+            else "product_default"
+        ),
+        flux_error_flux_bounds_mjy=(
+            tuple(args.flux_bounds)
+            if args.flux_bounds is not None
+            else "product_default"
+        ),
     )
     sim = Racs(cfg)
     report: dict[str, Any] = {
@@ -96,6 +128,8 @@ def precompute(args: argparse.Namespace) -> dict[str, Any]:
             "flux_error_noise_bins": cfg.flux_error_noise_bins,
             "flux_error_flux_bins": cfg.flux_error_flux_bins,
             "flux_error_min_cell_count": cfg.flux_error_min_cell_count,
+            "flux_error_noise_bounds_ujy_beam": cfg.flux_error_noise_bounds_ujy_beam,
+            "flux_error_flux_bounds_mjy": cfg.flux_error_flux_bounds_mjy,
             "source_noisemap_filename": cfg.product.source_noisemap_filename,
             "catalogue_path": cfg.catalogue_path,
             "noisemap_data_dir": cfg.noisemap_data_dir,

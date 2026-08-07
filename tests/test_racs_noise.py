@@ -33,6 +33,7 @@ from catsim import RACS_LOW3, RACS_MID1, Racs, RacsConfig
 from catsim.racs_products import RACS_LOW2
 from catsim.racs_noise import (
     ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
+    BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
     NOISE_MAP_CACHE_FORMAT_VERSION,
     RacsCacheValidationError,
     build_conditional_error_lookup,
@@ -73,6 +74,31 @@ def test_product_noisemap_contract_and_config_validation():
     assert RACS_LOW3.source_noisemap_filename == "RACS-low3.iqr.hpx"
     assert RACS_MID1.source_noisemap_filename == "RACS-mid1.iqr.hpx"
     assert RACS_LOW2.source_noisemap_filename is None
+    low3_cfg = RacsConfig(product=RACS_LOW3, flux_min=1.0)
+    assert low3_cfg.flux_error_noise_bins == 200
+    assert low3_cfg.flux_error_flux_bins == 300
+    np.testing.assert_allclose(
+        low3_cfg.flux_error_noise_bounds_ujy_beam,
+        (10.0**1.9, 1000.0),
+    )
+    assert low3_cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
+    mid1_cfg = RacsConfig(product=RACS_MID1, flux_min=1.0)
+    assert mid1_cfg.flux_error_noise_bins == 200
+    assert mid1_cfg.flux_error_flux_bins == 300
+    assert mid1_cfg.flux_error_noise_bounds_ujy_beam == (100.0, 1000.0)
+    assert mid1_cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
+    override = RacsConfig(
+        product=RACS_MID1,
+        flux_min=1.0,
+        flux_error_noise_bins=20,
+        flux_error_flux_bins=30,
+        flux_error_noise_bounds_ujy_beam=(90.0, 900.0),
+        flux_error_flux_bounds_mjy=None,
+    )
+    assert override.flux_error_noise_bins == 20
+    assert override.flux_error_flux_bins == 30
+    assert override.flux_error_noise_bounds_ujy_beam == (90.0, 900.0)
+    assert override.flux_error_flux_bounds_mjy is None
     with pytest.raises(ValueError, match="does not support"):
         Racs(RacsConfig(product=RACS_LOW2, flux_min=1.0)).load_cached_noise_map()
 
@@ -95,6 +121,13 @@ def test_product_noisemap_contract_and_config_validation():
             RacsConfig(flux_min=1.0, **{field_name: True})
     with pytest.raises(TypeError):
         RacsConfig(flux_min=1.0, fractional_error_flux_min_mjy=10.0)
+    for field_name in (
+        "flux_error_noise_bounds_ujy_beam",
+        "flux_error_flux_bounds_mjy",
+    ):
+        for bad_bounds in ((0.0, 1.0), (2.0, 1.0), (1.0, np.inf), (1.0,)):
+            with pytest.raises(ValueError, match=field_name):
+                RacsConfig(flux_min=1.0, **{field_name: bad_bounds})
 
 
 def test_noise_map_build_uses_valid_subpixel_mean_and_nested_cache(tmp_path: Path):
@@ -236,6 +269,109 @@ def test_grid_includes_low_flux_rows_and_uses_inclusive_minimum_count():
         )
 
 
+def test_bounded_grid_excludes_training_outliers_but_clips_runtime_queries():
+    noise = np.asarray([50.0, 100.0, 200.0, 1000.0, 2000.0, 200.0, 200.0])
+    flux = np.asarray([1.0, 0.05, 1.0, 10_000.0, 1.0, 20_000.0, 1.0])
+    error = np.asarray([5001.0, 5002.0, 1.0, 2.0, 5003.0, 5004.0, np.nan])
+    lookup = build_conditional_error_lookup(
+        noise,
+        flux,
+        error,
+        product_key="mid1",
+        noise_map_identity="noise",
+        noise_bins=2,
+        flux_bins=2,
+        min_cell_count=1,
+        noise_bounds_ujy_beam=(100.0, 1000.0),
+        flux_bounds_mjy=(0.1, 10_000.0),
+    )
+
+    np.testing.assert_array_equal(lookup.absolute_error_values, [1.0, 2.0])
+    np.testing.assert_allclose(lookup.log_noise_edges[[0, -1]], [2.0, 3.0])
+    np.testing.assert_allclose(lookup.log_flux_edges[[0, -1]], [-1.0, 4.0])
+    assert lookup.metadata["format_version"] == BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION
+    assert lookup.metadata["training_rows_total"] == 7
+    assert lookup.metadata["training_rows_finite_positive_candidates"] == 6
+    assert lookup.metadata["training_rows_rejected_invalid"] == 1
+    assert lookup.metadata["rows_below_noise_bound"] == 1
+    assert lookup.metadata["rows_above_noise_bound"] == 1
+    assert lookup.metadata["rows_below_flux_bound"] == 1
+    assert lookup.metadata["rows_above_flux_bound"] == 1
+    assert lookup.metadata["rows_excluded_by_bounds_union"] == 4
+    assert lookup.metadata["training_rows_accepted"] == 2
+    assert lookup.metadata["training_rows_rejected"] == 5
+
+    # Inclusive extrema stay in training; finite-positive runtime values beyond
+    # them clip to boundary cells without rejection or retries.
+    edge_cells = lookup.resolve_cells(
+        np.asarray([100.0, 1000.0, 1.0, 1e6]),
+        np.asarray([0.1, 10_000.0, 1e-6, 1e9]),
+    )
+    np.testing.assert_array_equal(edge_cells, [0, 3, 0, 3])
+    counts = lookup.query_range_counts(
+        np.asarray([100.0, 1000.0, 1.0, 1e6, np.nan]),
+        np.asarray([0.1, 10_000.0, 1e-6, 1e9, 1.0]),
+    )
+    assert counts == {
+        "queries_total": 5,
+        "queries_finite_positive": 4,
+        "queries_below_noise_bound": 1,
+        "queries_above_noise_bound": 1,
+        "queries_below_flux_bound": 1,
+        "queries_above_flux_bound": 1,
+        "queries_outside_bounds_union": 2,
+    }
+
+
+def test_bounded_cache_rejects_bounds_and_policy_mismatches(tmp_path: Path):
+    lookup = build_conditional_error_lookup(
+        np.asarray([100.0, 1000.0]),
+        np.asarray([0.1, 10_000.0]),
+        np.asarray([1.0, 2.0]),
+        product_key="mid1",
+        noise_map_identity="noise",
+        noise_bins=2,
+        flux_bins=2,
+        min_cell_count=1,
+        noise_bounds_ujy_beam=(100.0, 1000.0),
+        flux_bounds_mjy=(0.1, 10_000.0),
+    )
+    output = tmp_path / "bounded.npz"
+    save_conditional_error_lookup(lookup, output, diagnostics=False)
+    restored = load_conditional_error_lookup(
+        output,
+        product_key="mid1",
+        noise_map_identity="noise",
+        noise_bins=2,
+        flux_bins=2,
+        min_cell_count=1,
+        noise_bounds_ujy_beam=(100.0, 1000.0),
+        flux_bounds_mjy=(0.1, 10_000.0),
+    )
+    assert restored.identity == lookup.identity
+
+    with pytest.raises(RacsCacheValidationError, match="noise_bounds_ujy_beam"):
+        load_conditional_error_lookup(
+            output,
+            product_key="mid1",
+            noise_map_identity="noise",
+            noise_bins=2,
+            flux_bins=2,
+            min_cell_count=1,
+            noise_bounds_ujy_beam=(90.0, 1000.0),
+            flux_bounds_mjy=(0.1, 10_000.0),
+        )
+    with pytest.raises(RacsCacheValidationError, match="format_version"):
+        load_conditional_error_lookup(
+            output,
+            product_key="mid1",
+            noise_map_identity="noise",
+            noise_bins=2,
+            flux_bins=2,
+            min_cell_count=1,
+        )
+
+
 def test_grid_cache_round_trip_mismatch_and_diagnostics(tmp_path: Path):
     lookup = _lookup()
     output = tmp_path / "absolute.npz"
@@ -341,6 +477,8 @@ def test_racs_helpers_load_both_caches_without_catalogue_or_source(tmp_path: Pat
             flux_error_flux_bins=2,
             flux_error_min_cell_count=2,
             noisemap_data_dir=None,
+            flux_error_noise_bounds_ujy_beam=None,
+            flux_error_flux_bounds_mjy=None,
         )
     )
     sim._cache_dir = lambda: tmp_path  # type: ignore[method-assign]

@@ -262,6 +262,41 @@ class RacsJaxNoiseLookupTests(unittest.TestCase):
         self.assertTrue(set(np.asarray(vmapped[:2])).issubset({1.25, 1.5}))
         self.assertTrue(set(np.asarray(vmapped[2:])).issubset({7.0, 8.0, 9.0}))
 
+    def test_bounded_cell_resolution_and_sampling_match_numpy_lookup(self):
+        from catsim.racs_jax import _sample_absolute_flux_errors_jax
+        from catsim.racs_noise import build_conditional_error_lookup
+
+        lookup = build_conditional_error_lookup(
+            np.asarray([100.0, 1000.0]),
+            np.asarray([0.1, 10_000.0]),
+            np.asarray([1.0, 2.0]),
+            product_key="mid1",
+            noise_map_identity="noise",
+            noise_bins=2,
+            flux_bins=2,
+            min_cell_count=1,
+            noise_bounds_ujy_beam=(100.0, 1000.0),
+            flux_bounds_mjy=(0.1, 10_000.0),
+        )
+        noise = np.asarray([100.0, 1000.0, 1.0, 1e6], dtype=np.float32)
+        flux = np.asarray([0.1, 10_000.0, 1e-6, 1e9], dtype=np.float32)
+        expected_cells = lookup.resolve_cells(noise, flux)
+        samples, cells, valid = jax.jit(_sample_absolute_flux_errors_jax)(
+            jax.random.PRNGKey(91),
+            jnp.asarray(noise),
+            jnp.asarray(flux),
+            jnp.asarray(lookup.log_noise_edges, dtype=jnp.float32),
+            jnp.asarray(lookup.log_flux_edges, dtype=jnp.float32),
+            jnp.asarray(lookup.cell_counts, dtype=jnp.int32),
+            jnp.asarray(lookup.cell_starts, dtype=jnp.int32),
+            jnp.asarray(lookup.resolved_cell_ids, dtype=jnp.int32),
+            jnp.asarray(lookup.absolute_error_values, dtype=jnp.float32),
+        )
+
+        np.testing.assert_array_equal(np.asarray(cells), expected_cells)
+        np.testing.assert_array_equal(np.asarray(valid), np.ones(4, dtype=bool))
+        np.testing.assert_array_equal(np.asarray(samples), [1.0, 2.0, 1.0, 2.0])
+
     def test_cell_resolution_absolute_eta_and_invalid_queries_match_numpy_semantics(self):
         from catsim.racs_jax import (
             _sample_absolute_flux_errors_jax,

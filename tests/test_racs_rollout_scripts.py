@@ -220,8 +220,10 @@ def test_comparison_rejects_mismatched_science_configuration(tmp_path: Path):
 def test_precompute_cli_exposes_default_production_grid():
     args = _PRECOMPUTE_MODULE.parse_args(["--product", "mid1"])
     assert args.noise_map_nside == 256
-    assert args.noise_bins == 400
-    assert args.flux_bins == 400
+    assert args.noise_bins is None
+    assert args.flux_bins is None
+    assert args.noise_bounds is None
+    assert args.flux_bounds is None
     assert args.min_cell_count == 10
     assert args.rebuild == "none"
 

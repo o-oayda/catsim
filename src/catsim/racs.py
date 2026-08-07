@@ -75,6 +75,10 @@ class RacsConfig:
     If ``mask_map`` is provided, it must be a 1D HEALPix mask matching
     ``nside`` in NEST ordering, with ``1`` for kept pixels and ``0`` for
     masked pixels.
+
+    Conditional error-grid dimensions and physical bounds default from the
+    selected product. Passing explicit dimensions or bound pairs overrides the
+    product values; passing ``None`` for a bound makes that axis unbounded.
     """
     flux_min: float
     product: RacsProductSpec | str = RACS_LOW3
@@ -94,9 +98,15 @@ class RacsConfig:
     cluster_r_cut_arcsec: float = 20.0
     noisemap_data_dir: Optional[str] = None
     noise_map_nside: int = 256
-    flux_error_noise_bins: int = 400
-    flux_error_flux_bins: int = 400
+    flux_error_noise_bins: Optional[int] = None
+    flux_error_flux_bins: Optional[int] = None
     flux_error_min_cell_count: int = 10
+    flux_error_noise_bounds_ujy_beam: (
+        tuple[float, float] | None | Literal["product_default"]
+    ) = "product_default"
+    flux_error_flux_bounds_mjy: (
+        tuple[float, float] | None | Literal["product_default"]
+    ) = "product_default"
     flux_temperature_min_mjy: Optional[float] = None
     paf_temperature_data_dir: Optional[str] = None
     paf_reference_temp_c: float = 25.0
@@ -111,6 +121,24 @@ class RacsConfig:
 
     def __post_init__(self) -> None:
         self.product = resolve_racs_product(self.product)
+        if self.flux_error_noise_bins is None:
+            self.flux_error_noise_bins = self.product.default_flux_error_noise_bins
+        if self.flux_error_flux_bins is None:
+            self.flux_error_flux_bins = self.product.default_flux_error_flux_bins
+        if (
+            isinstance(self.flux_error_noise_bounds_ujy_beam, str)
+            and self.flux_error_noise_bounds_ujy_beam == "product_default"
+        ):
+            self.flux_error_noise_bounds_ujy_beam = (
+                self.product.default_flux_error_noise_bounds_ujy_beam
+            )
+        if (
+            isinstance(self.flux_error_flux_bounds_mjy, str)
+            and self.flux_error_flux_bounds_mjy == "product_default"
+        ):
+            self.flux_error_flux_bounds_mjy = (
+                self.product.default_flux_error_flux_bounds_mjy
+            )
         if self.flux_min <= 0:
             raise ValueError("flux_min must be positive.")
         if (
@@ -163,6 +191,28 @@ class RacsConfig:
                 raise ValueError(f"{field_name} must be an integer of at least {minimum}.")
             if value < minimum:
                 raise ValueError(f"{field_name} must be at least {minimum}.")
+        for field_name, bounds in (
+            (
+                "flux_error_noise_bounds_ujy_beam",
+                self.flux_error_noise_bounds_ujy_beam,
+            ),
+            ("flux_error_flux_bounds_mjy", self.flux_error_flux_bounds_mjy),
+        ):
+            if bounds is None:
+                continue
+            if (
+                not isinstance(bounds, (tuple, list))
+                or len(bounds) != 2
+                or not np.all(np.isfinite(bounds))
+                or float(bounds[0]) <= 0
+                or float(bounds[1]) <= float(bounds[0])
+            ):
+                raise ValueError(
+                    f"{field_name} must be None or two finite positive values "
+                    "in strictly increasing order."
+                )
+            # Canonical tuples keep cache metadata and filenames deterministic.
+            setattr(self, field_name, (float(bounds[0]), float(bounds[1])))
         if self.flux_temperature_min_mjy is not None and (
             not np.isfinite(self.flux_temperature_min_mjy)
             or self.flux_temperature_min_mjy <= 0
@@ -294,11 +344,37 @@ class Racs:
         )
 
     def _absolute_error_lookup_cache_path(self) -> Path:
+        noise_bounds = self.cfg.flux_error_noise_bounds_ujy_beam
+        flux_bounds = self.cfg.flux_error_flux_bounds_mjy
+        if noise_bounds is None and flux_bounds is None:
+            # Explicitly unbounded user overrides retain the established v1
+            # contract. Both production product defaults use bounded v2 caches.
+            return self._cache_dir() / (
+                "absolute_error_lookup_"
+                f"noise{self.cfg.noise_map_nside}_"
+                f"grid{self.cfg.flux_error_noise_bins}x{self.cfg.flux_error_flux_bins}_"
+                f"min{self.cfg.flux_error_min_cell_count}_v1.npz"
+            )
+
+        def cache_number(value: float) -> str:
+            return format(value, ".12g").replace(".", "p").replace("-", "m")
+
+        noise_tag = (
+            "unbounded"
+            if noise_bounds is None
+            else f"{cache_number(noise_bounds[0])}to{cache_number(noise_bounds[1])}"
+        )
+        flux_tag = (
+            "unbounded"
+            if flux_bounds is None
+            else f"{cache_number(flux_bounds[0])}to{cache_number(flux_bounds[1])}"
+        )
         return self._cache_dir() / (
             "absolute_error_lookup_"
             f"noise{self.cfg.noise_map_nside}_"
             f"grid{self.cfg.flux_error_noise_bins}x{self.cfg.flux_error_flux_bins}_"
-            f"min{self.cfg.flux_error_min_cell_count}_v1.npz"
+            f"min{self.cfg.flux_error_min_cell_count}_"
+            f"bounds-noise{noise_tag}_flux{flux_tag}_v2.npz"
         )
 
     def _source_noisemap_path(self) -> Path:
@@ -390,6 +466,8 @@ class Racs:
             noise_bins=self.cfg.flux_error_noise_bins,
             flux_bins=self.cfg.flux_error_flux_bins,
             min_cell_count=self.cfg.flux_error_min_cell_count,
+            noise_bounds_ujy_beam=self.cfg.flux_error_noise_bounds_ujy_beam,
+            flux_bounds_mjy=self.cfg.flux_error_flux_bounds_mjy,
             catalogue_columns={
                 "ra": columns.ra,
                 "dec": columns.dec,
@@ -421,6 +499,8 @@ class Racs:
                 noise_bins=self.cfg.flux_error_noise_bins,
                 flux_bins=self.cfg.flux_error_flux_bins,
                 min_cell_count=self.cfg.flux_error_min_cell_count,
+                noise_bounds_ujy_beam=self.cfg.flux_error_noise_bounds_ujy_beam,
+                flux_bounds_mjy=self.cfg.flux_error_flux_bounds_mjy,
                 catalogue_columns={
                     "ra": self.product.columns.ra,
                     "dec": self.product.columns.dec,

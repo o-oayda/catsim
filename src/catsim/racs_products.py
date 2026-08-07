@@ -33,6 +33,10 @@ class RacsProductSpec:
     default_mask_filename: str | None = None
     source_noisemap_filename: str | None = None
     supports_paf_temperature: bool = True
+    default_flux_error_noise_bins: int = 400
+    default_flux_error_flux_bins: int = 400
+    default_flux_error_noise_bounds_ujy_beam: tuple[float, float] | None = None
+    default_flux_error_flux_bounds_mjy: tuple[float, float] | None = None
 
     @property
     def data_loader_args(self) -> tuple[str, str]:
@@ -47,6 +51,11 @@ RACS_LOW3 = RacsProductSpec(
     data_dir_name="racs_low3",
     default_mask_filename="racs-low3_mask_nside64_ring.npy",
     source_noisemap_filename="RACS-low3.iqr.hpx",
+    default_flux_error_noise_bins=200,
+    default_flux_error_flux_bins=300,
+    # Extend LOW3 by exactly 0.1 dex below 100 uJy/beam.
+    default_flux_error_noise_bounds_ujy_beam=(10.0**1.9, 1000.0),
+    default_flux_error_flux_bounds_mjy=(0.1, 10_000.0),
     columns=RacsCatalogueColumns(
         ra="RA",
         dec="Dec",
@@ -68,6 +77,10 @@ RACS_MID1 = RacsProductSpec(
     data_loader_variant="mid1",
     data_dir_name="racs_mid1",
     source_noisemap_filename="RACS-mid1.iqr.hpx",
+    default_flux_error_noise_bins=200,
+    default_flux_error_flux_bins=300,
+    default_flux_error_noise_bounds_ujy_beam=(100.0, 1000.0),
+    default_flux_error_flux_bounds_mjy=(0.1, 10_000.0),
     columns=RacsCatalogueColumns(
         ra="RA",
         dec="DEC",

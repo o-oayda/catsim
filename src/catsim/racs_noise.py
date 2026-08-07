@@ -26,6 +26,7 @@ from scipy.spatial import cKDTree
 
 NOISE_MAP_CACHE_FORMAT_VERSION = 1
 ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION = 1
+BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION = 2
 NOISE_UNIT = "uJy/beam"
 FLUX_UNIT = "mJy"
 ERROR_UNIT = "mJy"
@@ -379,6 +380,27 @@ def _regular_log_edges(values: NDArray[np.float64], bins: int) -> NDArray[np.flo
     return np.linspace(lower, upper, bins + 1, dtype=np.float64)
 
 
+def _normalise_bounds(
+    bounds: tuple[float, float] | None,
+    *,
+    name: str,
+) -> tuple[float, float] | None:
+    if bounds is None:
+        return None
+    if (
+        not isinstance(bounds, (tuple, list))
+        or len(bounds) != 2
+        or not np.all(np.isfinite(bounds))
+        or float(bounds[0]) <= 0
+        or float(bounds[1]) <= float(bounds[0])
+    ):
+        raise ValueError(
+            f"{name} must be None or two finite positive values in strictly "
+            "increasing order."
+        )
+    return float(bounds[0]), float(bounds[1])
+
+
 def conditional_cell_ids(
     log_noise: NDArray[np.floating],
     log_flux: NDArray[np.floating],
@@ -461,6 +483,45 @@ class ConditionalErrorLookup:
         )
         return self.resolved_cell_ids[raw]
 
+    def query_range_counts(
+        self,
+        noise_ujy_beam: NDArray[np.floating],
+        flux_mjy: NDArray[np.floating],
+    ) -> dict[str, int]:
+        """Classify finite-positive runtime queries against training bounds.
+
+        Out-of-range queries are not rejected: ``resolve_cells`` clips them to
+        the corresponding boundary cell. These counters make that runtime
+        behavior auditable without changing sampling semantics.
+        """
+        noise, flux = np.broadcast_arrays(
+            np.asarray(noise_ujy_beam, dtype=np.float64),
+            np.asarray(flux_mjy, dtype=np.float64),
+        )
+        valid = np.isfinite(noise) & (noise > 0) & np.isfinite(flux) & (flux > 0)
+        below_noise = np.zeros(noise.shape, dtype=np.bool_)
+        above_noise = np.zeros(noise.shape, dtype=np.bool_)
+        below_flux = np.zeros(noise.shape, dtype=np.bool_)
+        above_flux = np.zeros(noise.shape, dtype=np.bool_)
+        noise_bounds = self.metadata.get("noise_bounds_ujy_beam")
+        flux_bounds = self.metadata.get("flux_bounds_mjy")
+        if noise_bounds is not None:
+            below_noise = valid & (noise < float(noise_bounds[0]))
+            above_noise = valid & (noise > float(noise_bounds[1]))
+        if flux_bounds is not None:
+            below_flux = valid & (flux < float(flux_bounds[0]))
+            above_flux = valid & (flux > float(flux_bounds[1]))
+        outside = below_noise | above_noise | below_flux | above_flux
+        return {
+            "queries_total": int(noise.size),
+            "queries_finite_positive": int(np.count_nonzero(valid)),
+            "queries_below_noise_bound": int(np.count_nonzero(below_noise)),
+            "queries_above_noise_bound": int(np.count_nonzero(above_noise)),
+            "queries_below_flux_bound": int(np.count_nonzero(below_flux)),
+            "queries_above_flux_bound": int(np.count_nonzero(above_flux)),
+            "queries_outside_bounds_union": int(np.count_nonzero(outside)),
+        }
+
     def sample(
         self,
         noise_ujy_beam: NDArray[np.floating],
@@ -498,6 +559,8 @@ def build_conditional_error_lookup(
     noise_bins: int,
     flux_bins: int,
     min_cell_count: int,
+    noise_bounds_ujy_beam: tuple[float, float] | None = None,
+    flux_bounds_mjy: tuple[float, float] | None = None,
     catalogue_columns: Mapping[str, str] | None = None,
 ) -> ConditionalErrorLookup:
     """Build the compact empirical noise/flux -> absolute-error distribution."""
@@ -505,6 +568,11 @@ def build_conditional_error_lookup(
         raise ValueError("noise_bins and flux_bins must each be at least 2.")
     if min_cell_count < 1:
         raise ValueError("min_cell_count must be at least 1.")
+    noise_bounds = _normalise_bounds(
+        noise_bounds_ujy_beam,
+        name="noise_bounds_ujy_beam",
+    )
+    flux_bounds = _normalise_bounds(flux_bounds_mjy, name="flux_bounds_mjy")
     noise, flux, error = np.broadcast_arrays(
         np.asarray(noise_ujy_beam, dtype=np.float64),
         np.asarray(flux_mjy, dtype=np.float64),
@@ -513,19 +581,60 @@ def build_conditional_error_lookup(
     valid_noise = np.isfinite(noise) & (noise > 0)
     valid_flux = np.isfinite(flux) & (flux > 0)
     valid_error = np.isfinite(error) & (error > 0)
-    valid = valid_noise & valid_flux & valid_error
-    if not np.any(valid):
+    finite_positive = valid_noise & valid_flux & valid_error
+    if not np.any(finite_positive):
         raise ValueError("No finite positive rows are available for the absolute-error lookup.")
 
-    log_noise = np.log10(noise[valid])
-    log_flux = np.log10(flux[valid])
-    noise_edges = _regular_log_edges(log_noise, noise_bins)
-    flux_edges = _regular_log_edges(log_flux, flux_bins)
+    below_noise_bound = np.zeros(noise.shape, dtype=np.bool_)
+    above_noise_bound = np.zeros(noise.shape, dtype=np.bool_)
+    below_flux_bound = np.zeros(noise.shape, dtype=np.bool_)
+    above_flux_bound = np.zeros(noise.shape, dtype=np.bool_)
+    if noise_bounds is not None:
+        below_noise_bound = finite_positive & (noise < noise_bounds[0])
+        above_noise_bound = finite_positive & (noise > noise_bounds[1])
+    if flux_bounds is not None:
+        below_flux_bound = finite_positive & (flux < flux_bounds[0])
+        above_flux_bound = finite_positive & (flux > flux_bounds[1])
+    excluded_by_bounds = (
+        below_noise_bound
+        | above_noise_bound
+        | below_flux_bound
+        | above_flux_bound
+    )
+    accepted = finite_positive & ~excluded_by_bounds
+    if not np.any(accepted):
+        raise ValueError(
+            "No finite positive rows remain inside the configured absolute-error "
+            "lookup bounds."
+        )
+
+    log_noise = np.log10(noise[accepted])
+    log_flux = np.log10(flux[accepted])
+    noise_edges = (
+        np.linspace(
+            np.log10(noise_bounds[0]),
+            np.log10(noise_bounds[1]),
+            noise_bins + 1,
+            dtype=np.float64,
+        )
+        if noise_bounds is not None
+        else _regular_log_edges(log_noise, noise_bins)
+    )
+    flux_edges = (
+        np.linspace(
+            np.log10(flux_bounds[0]),
+            np.log10(flux_bounds[1]),
+            flux_bins + 1,
+            dtype=np.float64,
+        )
+        if flux_bounds is not None
+        else _regular_log_edges(log_flux, flux_bins)
+    )
     cell_ids = conditional_cell_ids(log_noise, log_flux, noise_edges, flux_edges)
     order = np.argsort(cell_ids, kind="stable")
     sorted_cells = cell_ids[order]
-    sorted_errors = error[valid][order].astype(np.float32, copy=False)
-    sorted_fractional_errors = (error[valid][order] / flux[valid][order]).astype(
+    sorted_errors = error[accepted][order].astype(np.float32, copy=False)
+    sorted_fractional_errors = (error[accepted][order] / flux[accepted][order]).astype(
         np.float64,
         copy=False,
     )
@@ -547,7 +656,11 @@ def build_conditional_error_lookup(
             sorted_fractional_errors[start:stop]
         )
     metadata: dict[str, Any] = {
-        "format_version": ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
+        "format_version": (
+            BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION
+            if noise_bounds is not None or flux_bounds is not None
+            else ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION
+        ),
         "product_key": str(product_key),
         "noise_map_identity": str(noise_map_identity),
         "noise_unit": NOISE_UNIT,
@@ -560,15 +673,45 @@ def build_conditional_error_lookup(
         "edge_coordinate_dtype": "float64",
         "value_dtype": "float32",
         "catalogue_columns": dict(catalogue_columns or {}),
+        "training_bounds_policy": (
+            "exclude_outside_inclusive_bounds"
+            if noise_bounds is not None or flux_bounds is not None
+            else "unbounded_data_extrema"
+        ),
+        "runtime_bounds_policy": "clip_to_boundary_cell_no_rejection_no_retry",
+        "noise_bounds_ujy_beam": (
+            list(noise_bounds) if noise_bounds is not None else None
+        ),
+        "flux_bounds_mjy": list(flux_bounds) if flux_bounds is not None else None,
+        "log_noise_bounds": (
+            [float(np.log10(noise_bounds[0])), float(np.log10(noise_bounds[1]))]
+            if noise_bounds is not None
+            else None
+        ),
+        "log_flux_bounds": (
+            [float(np.log10(flux_bounds[0])), float(np.log10(flux_bounds[1]))]
+            if flux_bounds is not None
+            else None
+        ),
         "training_rows_total": int(noise.size),
-        "training_rows_accepted": int(np.count_nonzero(valid)),
-        "training_rows_rejected": int(np.count_nonzero(~valid)),
+        "training_rows_finite_positive_candidates": int(
+            np.count_nonzero(finite_positive)
+        ),
+        "training_rows_accepted": int(np.count_nonzero(accepted)),
+        "training_rows_rejected": int(np.count_nonzero(~accepted)),
+        "training_rows_rejected_invalid": int(np.count_nonzero(~finite_positive)),
+        "rows_below_noise_bound": int(np.count_nonzero(below_noise_bound)),
+        "rows_above_noise_bound": int(np.count_nonzero(above_noise_bound)),
+        "rows_below_flux_bound": int(np.count_nonzero(below_flux_bound)),
+        "rows_above_flux_bound": int(np.count_nonzero(above_flux_bound)),
+        "rows_excluded_by_bounds_union": int(np.count_nonzero(excluded_by_bounds)),
         "rows_invalid_noise": int(np.count_nonzero(~valid_noise)),
         "rows_invalid_flux": int(np.count_nonzero(~valid_flux)),
         "rows_invalid_absolute_error": int(np.count_nonzero(~valid_error)),
-        # These first-failure counts are disjoint and therefore sum to the
-        # total rejected count. The invalid-* counts above intentionally
-        # retain the useful, possibly overlapping, per-field diagnostics.
+        # These first-failure counts are disjoint and sum to the invalid-row
+        # rejection count. Bounds are evaluated only for finite-positive
+        # candidates and have their own union count above. The invalid-* counts
+        # intentionally retain useful, possibly overlapping per-field totals.
         "rows_rejected_first_reason_noise": int(np.count_nonzero(~valid_noise)),
         "rows_rejected_first_reason_flux": int(
             np.count_nonzero(valid_noise & ~valid_flux)
@@ -577,13 +720,13 @@ def build_conditional_error_lookup(
             np.count_nonzero(valid_noise & valid_flux & ~valid_error)
         ),
         "noise_ujy_beam_percentiles_0_1_5_16_50_84_95_99_100": np.percentile(
-            noise[valid], [0, 1, 5, 16, 50, 84, 95, 99, 100]
+            noise[accepted], [0, 1, 5, 16, 50, 84, 95, 99, 100]
         ).tolist(),
         "flux_mjy_percentiles_0_1_5_16_50_84_95_99_100": np.percentile(
-            flux[valid], [0, 1, 5, 16, 50, 84, 95, 99, 100]
+            flux[accepted], [0, 1, 5, 16, 50, 84, 95, 99, 100]
         ).tolist(),
         "absolute_error_mjy_percentiles_0_1_5_16_50_84_95_99_100": np.percentile(
-            error[valid], [0, 1, 5, 16, 50, 84, 95, 99, 100]
+            error[accepted], [0, 1, 5, 16, 50, 84, 95, 99, 100]
         ).tolist(),
     }
     identity = _payload_checksum(
@@ -646,8 +789,15 @@ def load_conditional_error_lookup(
     noise_bins: int,
     flux_bins: int,
     min_cell_count: int,
+    noise_bounds_ujy_beam: tuple[float, float] | None = None,
+    flux_bounds_mjy: tuple[float, float] | None = None,
     catalogue_columns: Mapping[str, str] | None = None,
 ) -> ConditionalErrorLookup:
+    noise_bounds = _normalise_bounds(
+        noise_bounds_ujy_beam,
+        name="noise_bounds_ujy_beam",
+    )
+    flux_bounds = _normalise_bounds(flux_bounds_mjy, name="flux_bounds_mjy")
     input_path = Path(path)
     if not input_path.is_file():
         raise FileNotFoundError(f"RACS conditional-error cache does not exist: {input_path}")
@@ -670,7 +820,11 @@ def load_conditional_error_lookup(
             f"Invalid RACS conditional absolute-error cache: {input_path}"
         ) from exc
     expected = {
-        "format_version": ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
+        "format_version": (
+            BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION
+            if noise_bounds is not None or flux_bounds is not None
+            else ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION
+        ),
         "product_key": product_key,
         "noise_map_identity": noise_map_identity,
         "noise_bins": int(noise_bins),
@@ -683,6 +837,37 @@ def load_conditional_error_lookup(
         "edge_coordinate_dtype": "float64",
         "value_dtype": "float32",
     }
+    if noise_bounds is not None or flux_bounds is not None:
+        expected.update(
+            {
+                "training_bounds_policy": "exclude_outside_inclusive_bounds",
+                "runtime_bounds_policy": (
+                    "clip_to_boundary_cell_no_rejection_no_retry"
+                ),
+                "noise_bounds_ujy_beam": (
+                    list(noise_bounds) if noise_bounds is not None else None
+                ),
+                "flux_bounds_mjy": (
+                    list(flux_bounds) if flux_bounds is not None else None
+                ),
+                "log_noise_bounds": (
+                    [
+                        float(np.log10(noise_bounds[0])),
+                        float(np.log10(noise_bounds[1])),
+                    ]
+                    if noise_bounds is not None
+                    else None
+                ),
+                "log_flux_bounds": (
+                    [
+                        float(np.log10(flux_bounds[0])),
+                        float(np.log10(flux_bounds[1])),
+                    ]
+                    if flux_bounds is not None
+                    else None
+                ),
+            }
+        )
     if catalogue_columns is not None:
         expected["catalogue_columns"] = dict(catalogue_columns)
     mismatches = [
@@ -706,6 +891,14 @@ def load_conditional_error_lookup(
     ):
         if not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0):
             mismatches.append(f"{name} edges must be finite and strictly increasing")
+    if noise_bounds is not None and not np.array_equal(
+        arrays[0][[0, -1]], np.log10(np.asarray(noise_bounds, dtype=np.float64))
+    ):
+        mismatches.append("log-noise edge extrema do not match configured bounds")
+    if flux_bounds is not None and not np.array_equal(
+        arrays[1][[0, -1]], np.log10(np.asarray(flux_bounds, dtype=np.float64))
+    ):
+        mismatches.append("log-flux edge extrema do not match configured bounds")
     if np.any(counts < 0) or int(np.sum(counts)) != values.size:
         mismatches.append("cell counts are inconsistent with flat values")
     if not np.array_equal(starts, np.cumsum(counts, dtype=np.int64) - counts):
@@ -796,24 +989,24 @@ def _save_grid_diagnostics(lookup: ConditionalErrorLookup, cache_path: Path) -> 
     fig.savefig(Path(f"{stem}.diagnostics.png"), dpi=160, bbox_inches="tight")
     plt.close(fig)
 
-    # Cell occupancies are sufficient to recover the exact grid-bin
+    # Cell occupancies are sufficient to recover the exact accepted-training
     # marginals without retaining per-row conditioning coordinates in the
-    # runtime cache. Plot every bin so the full training range and tail cells
-    # remain visible; robust ranges are recorded in the sidecar below.
+    # runtime cache. Rows outside configured bounds were excluded, not folded
+    # into these boundary bins.
     noise_marginal = np.sum(counts, axis=1)
     flux_marginal = np.sum(counts, axis=0)
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), constrained_layout=True)
     axes[0].stairs(noise_marginal, lookup.log_noise_edges, fill=True)
     axes[0].set_xlabel("log10(noise / uJy beam$^{-1}$)")
     axes[0].set_ylabel("accepted catalogue rows")
-    axes[0].set_title("full-range noise marginal")
+    axes[0].set_title("accepted-training noise marginal")
     axes[1].stairs(flux_marginal, lookup.log_flux_edges, fill=True)
     axes[1].set_xlabel("log10(total flux / mJy)")
     axes[1].set_ylabel("accepted catalogue rows")
-    axes[1].set_title("full-range flux marginal")
+    axes[1].set_title("accepted-training flux marginal")
     fig.suptitle(
         f"{lookup.metadata['product_key']} lookup training marginals "
-        "(end bins include all outliers)"
+        "(out-of-bound rows excluded, not clipped)"
     )
     fig.savefig(Path(f"{stem}.marginals.png"), dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -835,8 +1028,11 @@ def _save_grid_diagnostics(lookup: ConditionalErrorLookup, cache_path: Path) -> 
         "fallback_distance_dex_percentiles_50_84_95_99_max": np.percentile(
             distances, [50, 84, 95, 99, 100]
         ).tolist(),
-        "log_noise_full_range": [float(lookup.log_noise_edges[0]), float(lookup.log_noise_edges[-1])],
-        "log_flux_full_range": [float(lookup.log_flux_edges[0]), float(lookup.log_flux_edges[-1])],
+        "log_noise_grid_range": [
+            float(lookup.log_noise_edges[0]),
+            float(lookup.log_noise_edges[-1]),
+        ],
+        "log_flux_grid_range": [float(lookup.log_flux_edges[0]), float(lookup.log_flux_edges[-1])],
         "log_noise_range": [float(lookup.log_noise_edges[0]), float(lookup.log_noise_edges[-1])],
         "log_flux_range": [float(lookup.log_flux_edges[0]), float(lookup.log_flux_edges[-1])],
         "absolute_error_mjy_percentiles_0_1_5_16_50_84_95_99_100": np.percentile(
