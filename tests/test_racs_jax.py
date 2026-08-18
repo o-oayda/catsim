@@ -519,6 +519,8 @@ class RacsJaxTests(unittest.TestCase):
             "clus_stop_prob": np.array([1.0, 0.8]),
             "elevation_amp": np.array([0.0, 0.1]),
             "elevation_trough": np.array([45.0, 50.0]),
+            "alpha_mean": np.array([0.6, 1.0]),
+            "alpha_sigma": np.array([0.1, 0.4]),
         }
         maps, masks = self.sim.batch_generate_dipole(
             theta,
@@ -587,6 +589,8 @@ class RacsJaxTests(unittest.TestCase):
                 "observer_speed": np.zeros(2, dtype=np.float32),
                 "p_clus": np.zeros(2, dtype=np.float32),
                 "clus_stop_prob": np.ones(2, dtype=np.float32),
+                "alpha_mean": np.asarray([0.6, 1.0], dtype=np.float32),
+                "alpha_sigma": np.asarray([0.1, 0.4], dtype=np.float32),
             },
             key=jax.random.PRNGKey(123),
             batch_size=2,

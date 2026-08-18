@@ -420,6 +420,8 @@ def _simulate_one_jax(
     elevation_amp: jax.Array,
     elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
+    alpha_mean: jax.Array,
+    alpha_sigma: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
     cluster_model_code: int,
@@ -428,8 +430,6 @@ def _simulate_one_jax(
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
-    alpha_mean: float,
-    alpha_sigma: float,
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
@@ -673,6 +673,8 @@ def _simulate_one_jax_with_flux_summaries(
     elevation_amp: jax.Array,
     elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
+    alpha_mean: jax.Array,
+    alpha_sigma: jax.Array,
     flux_max: jax.Array,
     temperature_edges: jax.Array,
     temperature_quantiles: jax.Array,
@@ -686,8 +688,6 @@ def _simulate_one_jax_with_flux_summaries(
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
-    alpha_mean: float,
-    alpha_sigma: float,
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
@@ -1040,8 +1040,6 @@ def _simulate_one_jax_with_flux_summaries(
         "noise_map_nside",
         "chunk_size",
         "max_children",
-        "alpha_mean",
-        "alpha_sigma",
         "cluster_r0_arcsec",
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
@@ -1063,6 +1061,8 @@ def _simulate_batch_jax(
     elevation_amp: jax.Array,
     elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
+    alpha_mean: jax.Array,
+    alpha_sigma: jax.Array,
     lookup_tuple: tuple[jax.Array, ...],
     *,
     cluster_model_code: int,
@@ -1071,8 +1071,6 @@ def _simulate_batch_jax(
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
-    alpha_mean: float,
-    alpha_sigma: float,
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
@@ -1089,8 +1087,6 @@ def _simulate_batch_jax(
             n_chunks=n_chunks,
             chunk_size=chunk_size,
             max_children=max_children,
-            alpha_mean=alpha_mean,
-            alpha_sigma=alpha_sigma,
             cluster_r0_arcsec=cluster_r0_arcsec,
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
@@ -1111,6 +1107,8 @@ def _simulate_batch_jax(
         elevation_amp,
         elevation_trough,
         fractional_error_eta,
+        alpha_mean,
+        alpha_sigma,
     )
 
 
@@ -1122,8 +1120,6 @@ def _simulate_batch_jax(
         "noise_map_nside",
         "chunk_size",
         "max_children",
-        "alpha_mean",
-        "alpha_sigma",
         "cluster_r0_arcsec",
         "cluster_r_cut_arcsec",
         "paf_reference_temp_c",
@@ -1149,6 +1145,8 @@ def _simulate_batch_jax_with_flux_summaries(
     elevation_amp: jax.Array,
     elevation_trough: jax.Array,
     fractional_error_eta: jax.Array,
+    alpha_mean: jax.Array,
+    alpha_sigma: jax.Array,
     flux_maxes: jax.Array,
     temperature_edges: jax.Array,
     temperature_quantiles: jax.Array,
@@ -1162,8 +1160,6 @@ def _simulate_batch_jax_with_flux_summaries(
     n_chunks: jax.Array,
     chunk_size: int,
     max_children: int,
-    alpha_mean: float,
-    alpha_sigma: float,
     cluster_r0_arcsec: float,
     cluster_r_cut_arcsec: float,
     paf_reference_temp_c: float,
@@ -1187,8 +1183,6 @@ def _simulate_batch_jax_with_flux_summaries(
             n_chunks=n_chunks,
             chunk_size=chunk_size,
             max_children=max_children,
-            alpha_mean=alpha_mean,
-            alpha_sigma=alpha_sigma,
             cluster_r0_arcsec=cluster_r0_arcsec,
             cluster_r_cut_arcsec=cluster_r_cut_arcsec,
             paf_reference_temp_c=paf_reference_temp_c,
@@ -1213,6 +1207,8 @@ def _simulate_batch_jax_with_flux_summaries(
         elevation_amp,
         elevation_trough,
         fractional_error_eta,
+        alpha_mean,
+        alpha_sigma,
         flux_maxes,
     )
 
@@ -1407,6 +1403,8 @@ class RacsJax:
         elevation_trough: float = 0.0,
         fractional_error_eta: float = 0.0,
         key: Optional[jax.Array] = None,
+        alpha_mean: Optional[float] = None,
+        alpha_sigma: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if key is None:
             key = jax.random.PRNGKey(0)
@@ -1423,6 +1421,12 @@ class RacsJax:
             "elevation_amp": np.asarray([elevation_amp]),
             "elevation_trough": np.asarray([elevation_trough]),
             "fractional_error_eta": np.asarray([fractional_error_eta]),
+            "alpha_mean": np.asarray(
+                [self.cfg.alpha_mean if alpha_mean is None else alpha_mean]
+            ),
+            "alpha_sigma": np.asarray(
+                [self.cfg.alpha_sigma if alpha_sigma is None else alpha_sigma]
+            ),
         }
         maps, masks = self.batch_generate_dipole(theta, key, batch_size=1)
         return maps[0], masks[0]
@@ -1512,6 +1516,8 @@ class RacsJax:
                     chunk["fractional_error_eta"],
                     dtype=jnp.float32,
                 ),
+                alpha_mean=jnp.asarray(chunk["alpha_mean"], dtype=jnp.float32),
+                alpha_sigma=jnp.asarray(chunk["alpha_sigma"], dtype=jnp.float32),
                 lookup_tuple=self._lookup_arrays.as_tuple(),
                 cluster_model_code=self._cluster_model_code(),
                 nside=self.nside,
@@ -1519,8 +1525,6 @@ class RacsJax:
                 n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                 chunk_size=self.chunk_size,
                 max_children=self.max_cluster_children_per_parent,
-                alpha_mean=float(self.cfg.alpha_mean),
-                alpha_sigma=float(self.cfg.alpha_sigma),
                 cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
                 cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                 paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
@@ -1772,6 +1776,8 @@ class RacsJax:
                         chunk["fractional_error_eta"],
                         dtype=jnp.float32,
                     ),
+                    alpha_mean=jnp.asarray(chunk["alpha_mean"], dtype=jnp.float32),
+                    alpha_sigma=jnp.asarray(chunk["alpha_sigma"], dtype=jnp.float32),
                     flux_maxes=jnp.full(
                         (batch_size,),
                         resolved_flux_max,
@@ -1794,8 +1800,6 @@ class RacsJax:
                     n_chunks=jnp.asarray(n_chunks, dtype=jnp.int32),
                     chunk_size=self.chunk_size,
                     max_children=self.max_cluster_children_per_parent,
-                    alpha_mean=float(self.cfg.alpha_mean),
-                    alpha_sigma=float(self.cfg.alpha_sigma),
                     cluster_r0_arcsec=float(self.cfg.cluster_r0_arcsec),
                     cluster_r_cut_arcsec=float(self.cfg.cluster_r_cut_arcsec),
                     paf_reference_temp_c=float(self.cfg.paf_reference_temp_c),
@@ -1886,6 +1890,8 @@ class RacsJax:
             "elevation_amp": 0.0,
             "elevation_trough": 0.0,
             "fractional_error_eta": 0.0,
+            "alpha_mean": self.cfg.alpha_mean,
+            "alpha_sigma": self.cfg.alpha_sigma,
         }
         out: dict[str, NDArray[np.float64]] = {
             "log10_n_initial_samples": log10_samples.astype(np.float64, copy=False),
@@ -1916,6 +1922,12 @@ class RacsJax:
             raise ValueError("elevation_trough must be finite.")
         if np.any(parameters["fractional_error_eta"] < 0):
             raise ValueError("fractional_error_eta must be non-negative.")
+        if np.any(~np.isfinite(parameters["alpha_mean"])):
+            raise ValueError("alpha_mean must be finite.")
+        if np.any(~np.isfinite(parameters["alpha_sigma"])) or np.any(
+            parameters["alpha_sigma"] <= 0
+        ):
+            raise ValueError("alpha_sigma must be finite and positive.")
 
         if self.cfg.cluster_count_model == "geometric":
             if np.any((parameters["p_clus"] < 0) | (parameters["p_clus"] > 1)):

@@ -1781,14 +1781,22 @@ class Racs:
         self,
         n_samples: int,
         rng: Optional[np.random.Generator] = None,
+        alpha_mean: Optional[float] = None,
+        alpha_sigma: Optional[float] = None,
     ) -> NDArray[np.float32]:
-        """Draw per-source radio spectral indices using the current Gaussian model."""
+        """Draw per-source radio spectral indices from a Gaussian model.
+
+        Per-simulation parameters default to the values in ``RacsConfig``.
+        """
         if rng is None:
             rng = np.random.default_rng()
 
+        active_alpha_mean = self.cfg.alpha_mean if alpha_mean is None else alpha_mean
+        active_alpha_sigma = self.cfg.alpha_sigma if alpha_sigma is None else alpha_sigma
+
         alpha = rng.normal(
-            loc=self.cfg.alpha_mean,
-            scale=self.cfg.alpha_sigma,
+            loc=active_alpha_mean,
+            scale=active_alpha_sigma,
             size=n_samples,
         )
         return alpha.astype(np.float32, copy=False)
@@ -2018,6 +2026,8 @@ class Racs:
         elevation_trough: float = 0.0,
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
+        alpha_mean: Optional[float] = None,
+        alpha_sigma: Optional[float] = None,
     ) -> tuple[NDArray[np.float32], NDArray[np.bool_]]:
         output_map, output_mask, _ = self._generate_dipole_impl(
             log10_n_initial_samples=log10_n_initial_samples,
@@ -2032,6 +2042,8 @@ class Racs:
             elevation_amp=elevation_amp,
             elevation_trough=elevation_trough,
             fractional_error_eta=fractional_error_eta,
+            alpha_mean=alpha_mean,
+            alpha_sigma=alpha_sigma,
             rng_key=rng_key,
         )
         return output_map, output_mask
@@ -2074,6 +2086,8 @@ class Racs:
         elevation_trough: float = 0.0,
         fractional_error_eta: float = 0.0,
         rng_key: Optional[NPKey] = None,
+        alpha_mean: Optional[float] = None,
+        alpha_sigma: Optional[float] = None,
         *,
         temperature_edges: Optional[NDArray[np.floating]] = None,
         temperature_quantiles: Optional[tuple[float, ...] | NDArray[np.floating]] = None,
@@ -2110,6 +2124,12 @@ class Racs:
             raise ValueError("elevation_amp must be finite and non-negative.")
         if not np.isfinite(elevation_trough):
             raise ValueError("elevation_trough must be finite.")
+        active_alpha_mean = self.cfg.alpha_mean if alpha_mean is None else alpha_mean
+        active_alpha_sigma = self.cfg.alpha_sigma if alpha_sigma is None else alpha_sigma
+        if not np.isfinite(active_alpha_mean):
+            raise ValueError("alpha_mean must be finite.")
+        if not np.isfinite(active_alpha_sigma) or active_alpha_sigma <= 0:
+            raise ValueError("alpha_sigma must be finite and positive.")
         include_temperature_summary = (
             temperature_edges is not None or temperature_quantiles is not None
         )
@@ -2238,7 +2258,16 @@ class Racs:
             rest_ra_deg, rest_dec_deg = self.sample_points(
                 current_chunk, dtype=self.dtype, rng=rng
             )
-            alpha = self.sample_spectral_indices(current_chunk, rng=rng)
+            alpha_kwargs = {}
+            if alpha_mean is not None:
+                alpha_kwargs["alpha_mean"] = active_alpha_mean
+            if alpha_sigma is not None:
+                alpha_kwargs["alpha_sigma"] = active_alpha_sigma
+            alpha = self.sample_spectral_indices(
+                current_chunk,
+                rng=rng,
+                **alpha_kwargs,
+            )
 
             if (
                 (self.cfg.cluster_count_model == "geometric" and p_clus > 0)
@@ -2268,7 +2297,11 @@ class Racs:
                         dtype=self.dtype,
                     )
                     cluster_flux = self.sample_fluxes(total_n_components, rng=rng)
-                    cluster_alpha = self.sample_spectral_indices(total_n_components, rng=rng)
+                    cluster_alpha = self.sample_spectral_indices(
+                        total_n_components,
+                        rng=rng,
+                        **alpha_kwargs,
+                    )
                     intrinsic_flux = np.concatenate((intrinsic_flux, cluster_flux)).astype(
                         self.dtype,
                         copy=False,

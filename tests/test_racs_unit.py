@@ -190,6 +190,28 @@ class RacsFluxErrorTests(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
 
+    def test_generate_dipole_forwards_spectral_index_overrides(self):
+        self._configure_minimal_generate_dipole_sim(n_samples=4)
+        calls: list[tuple[float | None, float | None]] = []
+
+        def _sample_spectral_indices(
+            n: int,
+            rng=None,
+            alpha_mean: float | None = None,
+            alpha_sigma: float | None = None,
+        ) -> np.ndarray:
+            calls.append((alpha_mean, alpha_sigma))
+            return np.full(n, alpha_mean, dtype=np.float32)
+
+        self.sim.sample_spectral_indices = _sample_spectral_indices
+        self.sim.generate_dipole(
+            log10_n_initial_samples=np.log10(4.0),
+            alpha_mean=0.6,
+            alpha_sigma=0.4,
+        )
+
+        self.assertEqual(calls, [(0.6, 0.4)])
+
     def test_scale_absolute_flux_error_rejects_negative_eta(self):
         with self.assertRaisesRegex(ValueError, "must be non-negative"):
             self.sim.scale_absolute_flux_error(
