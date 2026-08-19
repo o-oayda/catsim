@@ -178,16 +178,17 @@ The script prints:
 
 ## Noise-map and absolute-error caches
 
-LOW3 and MID1 use these external source maps:
+LOW2, LOW3, and MID1 use these external source maps:
 
 | Product | Filename | Native geometry | Physical unit |
 | --- | --- | --- | --- |
+| LOW2 | `RACS-low2.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | LOW3 | `RACS-low3.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | MID1 | `RACS-mid1.iqr.hpx` | nside 1024, RING, equatorial | uJy/beam |
 
 The source headers have no unit keyword. CatSIM assigns `uJy/beam` by contract,
 validates the geometry, averages valid fine pixels to the configured nside, and
-caches float32 values in NESTED order. The MID1 defaults are:
+caches float32 values in NESTED order. The LOW2/MID1 defaults are:
 
 ```python
 noise_map_nside = 256
@@ -210,6 +211,8 @@ files are stored beneath the selected product's package data directory:
 src/catsim/data/racs_low3/lookups/
   absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
 src/catsim/data/racs_mid1/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise100to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2/lookups/
   absolute_error_lookup_noise256_grid200x300_min10_bounds-noise100to1000_flux0p1to10000_v2.npz
 ```
 

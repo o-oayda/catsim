@@ -73,7 +73,7 @@ def _lookup(*, min_cell_count: int = 2):
 def test_product_noisemap_contract_and_config_validation():
     assert RACS_LOW3.source_noisemap_filename == "RACS-low3.iqr.hpx"
     assert RACS_MID1.source_noisemap_filename == "RACS-mid1.iqr.hpx"
-    assert RACS_LOW2.source_noisemap_filename is None
+    assert RACS_LOW2.source_noisemap_filename == "RACS-low2.iqr.hpx"
     low3_cfg = RacsConfig(product=RACS_LOW3, flux_min=1.0)
     assert low3_cfg.flux_error_noise_bins == 200
     assert low3_cfg.flux_error_flux_bins == 300
@@ -87,6 +87,11 @@ def test_product_noisemap_contract_and_config_validation():
     assert mid1_cfg.flux_error_flux_bins == 300
     assert mid1_cfg.flux_error_noise_bounds_ujy_beam == (100.0, 1000.0)
     assert mid1_cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
+    low2_cfg = RacsConfig(product=RACS_LOW2, flux_min=1.0)
+    assert low2_cfg.flux_error_noise_bins == 200
+    assert low2_cfg.flux_error_flux_bins == 300
+    assert low2_cfg.flux_error_noise_bounds_ujy_beam == (100.0, 1000.0)
+    assert low2_cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
     override = RacsConfig(
         product=RACS_MID1,
         flux_min=1.0,
@@ -99,9 +104,6 @@ def test_product_noisemap_contract_and_config_validation():
     assert override.flux_error_flux_bins == 30
     assert override.flux_error_noise_bounds_ujy_beam == (90.0, 900.0)
     assert override.flux_error_flux_bounds_mjy is None
-    with pytest.raises(ValueError, match="does not support"):
-        Racs(RacsConfig(product=RACS_LOW2, flux_min=1.0)).load_cached_noise_map()
-
     with pytest.raises(ValueError, match="positive power of two"):
         RacsConfig(flux_min=1.0, noise_map_nside=3)
     with pytest.raises(ValueError, match="noise_bins must be at least 2"):

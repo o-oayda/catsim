@@ -226,6 +226,7 @@ def test_precompute_cli_exposes_default_production_grid():
     assert args.flux_bounds is None
     assert args.min_cell_count == 10
     assert args.rebuild == "none"
+    assert _PRECOMPUTE_MODULE.parse_args(["--product", "low2"]).product == "low2"
 
 
 def test_comparison_plot_helpers_create_outputs(tmp_path: Path):

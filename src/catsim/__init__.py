@@ -1,7 +1,7 @@
 from .simulator import Catwise
 from .configs import CatwiseConfig
 from .racs import Racs, RacsConfig, RacsLow3, RacsLow3Config
-from .racs_products import RACS_LOW3, RACS_MID1, RACS_PRODUCTS, RacsProductSpec
+from .racs_products import RACS_LOW2, RACS_LOW3, RACS_MID1, RACS_PRODUCTS, RacsProductSpec
 from .racs_summaries import (
     binned_flux_quantile_ndim,
     binned_flux_quantiles_exact,
@@ -61,6 +61,7 @@ __all__ = [
     "RacsLow3",
     "RacsLow3Jax",
     "RacsLow3Config",
+    "RACS_LOW2",
     "RACS_LOW3",
     "RACS_MID1",
     "RACS_PRODUCTS",
