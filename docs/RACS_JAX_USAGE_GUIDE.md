@@ -178,7 +178,9 @@ The script prints:
 
 ## Noise-map and absolute-error caches
 
-LOW2, LOW3, and MID1 use these external source maps:
+LOW2, its 25- and 45-arcsec patched variants, LOW3, and MID1 use these
+external source maps. The LOW2 variants share the LOW2 map but use separate
+lookup caches trained from their respective catalogues:
 
 | Product | Filename | Native geometry | Physical unit |
 | --- | --- | --- | --- |
@@ -188,7 +190,7 @@ LOW2, LOW3, and MID1 use these external source maps:
 
 The source headers have no unit keyword. CatSIM assigns `uJy/beam` by contract,
 validates the geometry, averages valid fine pixels to the configured nside, and
-caches float32 values in NESTED order. The LOW2/MID1 defaults are:
+caches float32 values in NESTED order. The MID1 defaults are:
 
 ```python
 noise_map_nside = 256
@@ -200,8 +202,9 @@ flux_error_flux_bounds_mjy = (0.1, 10_000.0)
 noisemap_data_dir = None
 ```
 
-LOW3 uses the same settings except that its lower noise bound is exactly 0.1
-dex lower: `flux_error_noise_bounds_ujy_beam = (10**1.9, 1000.0)`, or about
+LOW2, its patched variants, and LOW3 use the same settings except that their
+lower noise bound is exactly 0.1 dex lower:
+`flux_error_noise_bounds_ujy_beam = (10**1.9, 1000.0)`, or about
 79.43--1,000 uJy/beam.
 
 `noisemap_data_dir` is an input directory, not a cache directory. Generated
@@ -213,7 +216,11 @@ src/catsim/data/racs_low3/lookups/
 src/catsim/data/racs_mid1/lookups/
   absolute_error_lookup_noise256_grid200x300_min10_bounds-noise100to1000_flux0p1to10000_v2.npz
 src/catsim/data/racs_low2/lookups/
-  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise100to1000_flux0p1to10000_v2.npz
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2_25as/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2_45as/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
 ```
 
 Each product directory also contains `noise_map_nside256_nested_v1.npz`.

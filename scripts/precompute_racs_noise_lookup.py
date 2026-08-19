@@ -14,10 +14,24 @@ from typing import Any
 
 import numpy as np
 
-from catsim import RACS_LOW2, RACS_LOW3, RACS_MID1, Racs, RacsConfig
+from catsim import (
+    RACS_LOW2,
+    RACS_LOW2_25AS,
+    RACS_LOW2_45AS,
+    RACS_LOW3,
+    RACS_MID1,
+    Racs,
+    RacsConfig,
+)
 
 
-PRODUCTS = {"low2": RACS_LOW2, "low3": RACS_LOW3, "mid1": RACS_MID1}
+PRODUCTS = {
+    "low2": RACS_LOW2,
+    "low2-25as": RACS_LOW2_25AS,
+    "low2-45as": RACS_LOW2_45AS,
+    "low3": RACS_LOW3,
+    "mid1": RACS_MID1,
+}
 
 
 def _positive_int(value: str) -> int:

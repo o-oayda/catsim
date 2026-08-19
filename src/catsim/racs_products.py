@@ -120,11 +120,41 @@ RACS_LOW2 = RacsProductSpec(
     ),
 )
 
+RACS_LOW2_25AS = RacsProductSpec(
+    key="low2-25as",
+    label="RACS LOW2 25 arcsec patched",
+    data_loader_catalogue="racs",
+    data_loader_variant="low2-25as-patch",
+    data_dir_name="racs_low2_25as",
+    source_noisemap_filename="RACS-low2.iqr.hpx",
+    default_flux_error_noise_bins=200,
+    default_flux_error_flux_bins=300,
+    default_flux_error_noise_bounds_ujy_beam=(10.0**1.9, 1000.0),
+    default_flux_error_flux_bounds_mjy=(0.1, 10_000.0),
+    columns=RACS_LOW2.columns,
+)
+
+RACS_LOW2_45AS = RacsProductSpec(
+    key="low2-45as",
+    label="RACS LOW2 45 arcsec patched",
+    data_loader_catalogue="racs",
+    data_loader_variant="low2-45as-patch",
+    data_dir_name="racs_low2_45as",
+    source_noisemap_filename="RACS-low2.iqr.hpx",
+    default_flux_error_noise_bins=200,
+    default_flux_error_flux_bins=300,
+    default_flux_error_noise_bounds_ujy_beam=(10.0**1.9, 1000.0),
+    default_flux_error_flux_bounds_mjy=(0.1, 10_000.0),
+    columns=RACS_LOW2.columns,
+)
+
 
 RACS_PRODUCTS: Mapping[str, RacsProductSpec] = {
     RACS_LOW3.key: RACS_LOW3,
     RACS_MID1.key: RACS_MID1,
-    RACS_LOW2.key: RACS_LOW2
+    RACS_LOW2.key: RACS_LOW2,
+    RACS_LOW2_25AS.key: RACS_LOW2_25AS,
+    RACS_LOW2_45AS.key: RACS_LOW2_45AS,
 }
 
 
@@ -141,6 +171,12 @@ def resolve_racs_product(product: str | RacsProductSpec) -> RacsProductSpec:
         "racs_mid1": "mid1",
         "racs-low2": "low2",
         "racs_low2": "low2",
+        "racs-low2-25as": "low2-25as",
+        "racs_low2_25as": "low2-25as",
+        "low2_25as": "low2-25as",
+        "racs-low2-45as": "low2-45as",
+        "racs_low2_45as": "low2-45as",
+        "low2_45as": "low2-45as",
     }
     key = aliases.get(key, key)
     if key not in RACS_PRODUCTS:

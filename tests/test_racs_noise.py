@@ -30,7 +30,7 @@ if "dipoleutils.utils.data_loader" not in sys.modules:
 
 
 from catsim import RACS_LOW3, RACS_MID1, Racs, RacsConfig
-from catsim.racs_products import RACS_LOW2
+from catsim.racs_products import RACS_LOW2, RACS_LOW2_25AS, RACS_LOW2_45AS
 from catsim.racs_noise import (
     ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
     BOUNDED_ABSOLUTE_ERROR_LOOKUP_FORMAT_VERSION,
@@ -74,6 +74,8 @@ def test_product_noisemap_contract_and_config_validation():
     assert RACS_LOW3.source_noisemap_filename == "RACS-low3.iqr.hpx"
     assert RACS_MID1.source_noisemap_filename == "RACS-mid1.iqr.hpx"
     assert RACS_LOW2.source_noisemap_filename == "RACS-low2.iqr.hpx"
+    assert RACS_LOW2_25AS.source_noisemap_filename == "RACS-low2.iqr.hpx"
+    assert RACS_LOW2_45AS.source_noisemap_filename == "RACS-low2.iqr.hpx"
     low3_cfg = RacsConfig(product=RACS_LOW3, flux_min=1.0)
     assert low3_cfg.flux_error_noise_bins == 200
     assert low3_cfg.flux_error_flux_bins == 300
@@ -90,8 +92,20 @@ def test_product_noisemap_contract_and_config_validation():
     low2_cfg = RacsConfig(product=RACS_LOW2, flux_min=1.0)
     assert low2_cfg.flux_error_noise_bins == 200
     assert low2_cfg.flux_error_flux_bins == 300
-    assert low2_cfg.flux_error_noise_bounds_ujy_beam == (100.0, 1000.0)
+    np.testing.assert_allclose(
+        low2_cfg.flux_error_noise_bounds_ujy_beam,
+        (10.0**1.9, 1000.0),
+    )
     assert low2_cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
+    for product in (RACS_LOW2_25AS, RACS_LOW2_45AS):
+        cfg = RacsConfig(product=product, flux_min=1.0)
+        assert cfg.flux_error_noise_bins == 200
+        assert cfg.flux_error_flux_bins == 300
+        np.testing.assert_allclose(
+            cfg.flux_error_noise_bounds_ujy_beam,
+            (10.0**1.9, 1000.0),
+        )
+        assert cfg.flux_error_flux_bounds_mjy == (0.1, 10_000.0)
     override = RacsConfig(
         product=RACS_MID1,
         flux_min=1.0,
