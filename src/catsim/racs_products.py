@@ -18,11 +18,16 @@ class RacsCatalogueColumns:
     field_id: str
     source_name: str
     elevation: str | None = None
+    scheduling_block_id: str | None = None
 
 
 @dataclass(frozen=True)
 class RacsProductSpec:
-    """Dataset-specific metadata for one RACS epoch/passband catalogue."""
+    """Dataset-specific metadata for one RACS epoch/passband catalogue.
+
+    ``encode_tile_ids`` preserves integer downstream lookups for products such
+    as LOW1 whose spatial identity column contains string field names.
+    """
 
     key: str
     label: str
@@ -37,6 +42,7 @@ class RacsProductSpec:
     default_flux_error_flux_bins: int = 400
     default_flux_error_noise_bounds_ujy_beam: tuple[float, float] | None = None
     default_flux_error_flux_bounds_mjy: tuple[float, float] | None = None
+    encode_tile_ids: bool = False
 
     @property
     def data_loader_args(self) -> tuple[str, str]:
@@ -115,11 +121,37 @@ RACS_LOW2 = RacsProductSpec(
     ),
 )
 
+RACS_LOW1 = RacsProductSpec(
+    key="low1",
+    label="RACS LOW1",
+    data_loader_catalogue="racs",
+    data_loader_variant="low1",
+    data_dir_name="racs_low1",
+    source_noisemap_filename="RACS-low1.iqr.hpx",
+    default_flux_error_noise_bounds_ujy_beam=(100.0, 1000.0),
+    default_flux_error_flux_bounds_mjy=(0.1, 10_000.0),
+    encode_tile_ids=True,
+    columns=RacsCatalogueColumns(
+        ra="ra",
+        dec="dec",
+        tile_id="tile_id",
+        total_flux="total_flux_source",
+        total_flux_error="e_total_flux_source",
+        scan_start_mjd="obs_start_time",
+        scan_length=None,
+        field_id="tile_id",
+        source_name="source_name",
+        elevation=None,
+        scheduling_block_id="sbid",
+    ),
+)
+
 
 RACS_PRODUCTS: Mapping[str, RacsProductSpec] = {
     RACS_LOW3.key: RACS_LOW3,
     RACS_MID1.key: RACS_MID1,
-    RACS_LOW2.key: RACS_LOW2
+    RACS_LOW2.key: RACS_LOW2,
+    RACS_LOW1.key: RACS_LOW1
 }
 
 
@@ -136,6 +168,8 @@ def resolve_racs_product(product: str | RacsProductSpec) -> RacsProductSpec:
         "racs_mid1": "mid1",
         "racs-low2": "low2",
         "racs_low2": "low2",
+        "racs-low1": "low1",
+        "racs_low1": "low1",
     }
     key = aliases.get(key, key)
     if key not in RACS_PRODUCTS:

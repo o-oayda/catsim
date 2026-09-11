@@ -1017,6 +1017,177 @@ class RacsInitialiseDataTests(unittest.TestCase):
         self.assertGreater(sim.elevation_lookup_values.size, 0)
         np.testing.assert_array_equal(sim.mask_map, sim.tile_lookup_map >= 0)
 
+    def test_low1_product_uses_encoded_tile_id_identity(self):
+        low1 = resolve_racs_product("low1")
+
+        self.assertTrue(low1.encode_tile_ids)
+        self.assertEqual(low1.columns.tile_id, "tile_id")
+        self.assertEqual(low1.columns.field_id, "tile_id")
+        self.assertEqual(low1.columns.scheduling_block_id, "sbid")
+
+    @staticmethod
+    def _low1_index_test_sim(table: Table) -> Racs:
+        product = RacsProductSpec(
+            key="low1-test",
+            label="RACS LOW1 test",
+            data_loader_catalogue="racs",
+            data_loader_variant="low1-test",
+            data_dir_name="racs_low1_test",
+            encode_tile_ids=True,
+            columns=RacsCatalogueColumns(
+                ra="ra",
+                dec="dec",
+                tile_id="tile_id",
+                total_flux="flux",
+                total_flux_error="flux_error",
+                scan_start_mjd="obs_start_time",
+                scan_length=None,
+                field_id="tile_id",
+                source_name="source_name",
+                scheduling_block_id="sbid",
+            ),
+        )
+        sim = Racs(RacsConfig(product=product, flux_min=1.0, nside=1, chunk_size=16))
+        sim.catalogue = table
+        sim.catalogue_is_loaded = True
+        return sim
+
+    def test_low1_tile_ids_are_deterministic_unique_integer_indices(self):
+        table = Table(
+            {
+                "ra": [90.0, 0.0, 91.0, 1.0],
+                "dec": [0.0, 0.0, 0.1, 0.1],
+                "tile_id": [
+                    "RACS_0100+00A",
+                    "RACS_0000+00A",
+                    "RACS_0100+00A",
+                    "RACS_0000+00A",
+                ],
+                "sbid": [8540, 8540, 8540, 8540],
+                "obs_start_time": [58594.6, 58594.5, 58594.6, 58594.5],
+                "flux": np.ones(4),
+                "flux_error": np.full(4, 0.1),
+                "source_name": ["a", "b", "c", "d"],
+            }
+        )
+        sim = self._low1_index_test_sim(table)
+        row_ids, unique_ids, _ = sim._catalogue_runtime_tile_ids()
+        sim.build_tile_metadata()
+        sim.build_tile_lookup()
+
+        np.testing.assert_array_equal(row_ids, np.array([1, 0, 1, 0], dtype=np.int32))
+        np.testing.assert_array_equal(unique_ids, np.array([0, 1], dtype=np.int32))
+        np.testing.assert_array_equal(sim.tile_sbids, np.array([0, 1], dtype=np.int32))
+        np.testing.assert_array_equal(
+            sim.tile_field_id,
+            np.array(["RACS_0000+00A", "RACS_0100+00A"]),
+        )
+        np.testing.assert_allclose(sim.tile_scan_start_mjd, np.array([58594.5, 58594.6]))
+        self.assertEqual(sim._tile_index_from_sbid, {0: 0, 1: 1})
+
+        reversed_sim = self._low1_index_test_sim(table[::-1])
+        reversed_sim.build_tile_metadata()
+        np.testing.assert_array_equal(reversed_sim.tile_sbids, sim.tile_sbids)
+        np.testing.assert_array_equal(reversed_sim.tile_field_id, sim.tile_field_id)
+        np.testing.assert_allclose(reversed_sim.tile_scan_start_mjd, sim.tile_scan_start_mjd)
+
+        with TemporaryDirectory() as tmpdir:
+            sim._cache_dir = lambda: Path(tmpdir)
+            sim.save_tile_metadata()
+            cached_sim = self._low1_index_test_sim(table)
+            cached_sim._cache_dir = lambda: Path(tmpdir)
+            self.assertTrue(cached_sim.load_tile_metadata())
+            self.assertIsNone(cached_sim.tile_scan_length)
+            np.testing.assert_array_equal(cached_sim.tile_sbids, sim.tile_sbids)
+            np.testing.assert_array_equal(cached_sim.tile_field_id, sim.tile_field_id)
+
+    def test_low1_tile_id_rejects_multiple_observation_times(self):
+        table = Table(
+            {
+                "ra": [0.0, 1.0],
+                "dec": [0.0, 0.1],
+                "tile_id": ["RACS_0000+00A", "RACS_0000+00A"],
+                "sbid": [8540, 8540],
+                "obs_start_time": [58594.5, 58594.6],
+                "flux": [1.0, 1.0],
+                "flux_error": [0.1, 0.1],
+                "source_name": ["a", "b"],
+            }
+        )
+        sim = self._low1_index_test_sim(table)
+
+        with self.assertRaisesRegex(ValueError, "multiple observation times"):
+            sim.build_tile_metadata()
+
+        table["obs_start_time"] = [58594.5, 58594.5]
+        table["sbid"] = [8540, 8541]
+        sim = self._low1_index_test_sim(table)
+        with self.assertRaisesRegex(ValueError, "multiple SBIDs"):
+            sim.build_tile_metadata()
+
+    def test_low1_tile_id_rejects_duplicate_nominal_field_centres(self):
+        table = Table(
+            {
+                "ra": [0.0, 1.0],
+                "dec": [0.0, 0.1],
+                "tile_id": ["RACS_0000+00A", "RACS_0000+00B"],
+                "sbid": [8540, 8541],
+                "obs_start_time": [58594.5, 58595.5],
+                "flux": [1.0, 1.0],
+                "flux_error": [0.1, 0.1],
+                "source_name": ["a", "b"],
+            }
+        )
+        sim = self._low1_index_test_sim(table)
+
+        with self.assertRaisesRegex(ValueError, "same nominal field centre"):
+            sim.build_tile_metadata()
+
+    def test_low1_tile_id_rejects_empty_and_malformed_labels(self):
+        for label, expected_error in (("", "non-empty"), ("field-a", "malformed")):
+            with self.subTest(label=label):
+                table = Table(
+                    {
+                        "ra": [0.0],
+                        "dec": [0.0],
+                        "tile_id": [label],
+                        "sbid": [8540],
+                        "obs_start_time": [58594.5],
+                        "flux": [1.0],
+                        "flux_error": [0.1],
+                        "source_name": ["a"],
+                    }
+                )
+                sim = self._low1_index_test_sim(table)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    sim.build_tile_metadata()
+
+    def test_low1_rejects_legacy_sbid_metadata_cache(self):
+        table = Table(
+            {
+                "ra": [0.0],
+                "dec": [0.0],
+                "tile_id": ["RACS_0000+00A"],
+                "sbid": [8540],
+                "obs_start_time": [58594.5],
+                "flux": [1.0],
+                "flux_error": [0.1],
+                "source_name": ["a"],
+            }
+        )
+        with TemporaryDirectory() as tmpdir:
+            sim = self._low1_index_test_sim(table)
+            sim._cache_dir = lambda: Path(tmpdir)
+            np.savez_compressed(
+                sim._tile_metadata_cache_path(),
+                tile_sbids=np.array([8540], dtype=np.int32),
+                tile_scan_start_mjd=np.array([58594.5]),
+                tile_scan_length=np.array(None, dtype=object),
+                tile_field_id=np.array(["RACS_0000+00A"]),
+            )
+
+            self.assertFalse(sim.load_tile_metadata())
+
     def test_build_elevation_lookup_rejects_missing_elevation_column(self):
         sim = RacsLow3(RacsLow3Config(flux_min=15.0, nside=64, chunk_size=16))
         sim.catalogue = Table(

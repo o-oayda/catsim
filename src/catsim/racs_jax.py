@@ -1230,6 +1230,8 @@ class RacsJax:
         self.lookups_are_initialised = False
         self._lookup_arrays: Optional[_LookupArrays] = None
         self.mask_map: Optional[NDArray[np.bool_]] = None
+        # Compatibility name: LOW1 stores dense Tile_ID codes here, while
+        # other products retain their physical SBIDs.
         self.tile_sbids: Optional[NDArray[np.int32]] = None
         self._tile_index_from_sbid: dict[int, int] = {}
         self.tile_temperature_by_index: Optional[NDArray[np.float32]] = None

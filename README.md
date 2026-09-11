@@ -111,3 +111,11 @@ dmap, mask = batch_simulate(
     rng_key=rng_key
 )
 ```
+
+## RACS LOW1 tile identity
+
+LOW1 uses a dense integer encoding of catalogue `Tile_ID`, because its
+multi-field scheduling blocks do not identify unique sky tiles. See
+[the LOW1 tile-indexing note](docs/RACS_LOW1_TILE_INDEXING.md) for the verified
+catalogue invariants, compatibility details, and remaining temperature-data
+limitation.

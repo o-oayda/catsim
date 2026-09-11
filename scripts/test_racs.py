@@ -6,26 +6,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from catsim import RACS_MID1, Racs, RacsConfig, smooth_map
+from catsim.racs_products import RACS_LOW1
 from catsim.utils.constants import CMB_B, CMB_L
 from dipoleutils.utils.plotting import plot_log_log_histogram
 
 
 reference_mask_path = (
     Path.home()
-    / "Documents/sbi/derived/observations/racs_mid1_flux15_ds4"
+    / "Documents/sbi/derived/observations/racs_low3_flux15_ds4"
     / "reference_observation_native.npz"
 )
 with np.load(reference_mask_path, allow_pickle=False) as reference_observation:
     reference_mask = reference_observation["mask"].astype(np.bool_, copy=False)
 
 config = RacsConfig(
-    product=RACS_MID1,
+    product=RACS_LOW1,
     flux_min=15.0,
     mask_map=reference_mask,
+    noisemap_data_dir='~/catalogue_data/racs/noisemaps',
     chunk_size=100_000,
     store_final_samples=True,
-    paf_reference_temp_c=27.1,
-    cluster_count_model='poisson'
+    temperature_fallback='reference',
+    paf_reference_temp_c=25,
+    max_reference_fallback_tiles=5,
+    cluster_count_model='poisson',
+    paf_max_interpolation_gap_minutes=60
 )
 sim = Racs(config)
 

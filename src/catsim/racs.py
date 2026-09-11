@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Literal, Optional
 
@@ -56,7 +57,9 @@ from .racs_temperature import (
 LOW3_TEMPERATURE_EPSILON_FLOOR = RACS_TEMPERATURE_EPSILON_FLOOR
 LOGGER = logging.getLogger(__name__)
 TemperatureSource = Literal["mean_paf", "open_meteo", "reference"]
-TEMPERATURE_CACHE_FORMAT_VERSION = 2
+TILE_CACHE_FORMAT_VERSION = 2
+TEMPERATURE_CACHE_FORMAT_VERSION = 3
+LOW1_TILE_ID_PATTERN = re.compile(r"^RACS_(\d{4}[+-]\d{2})[A-Z]$")
 
 
 @dataclass
@@ -664,13 +667,125 @@ class Racs:
 
         return True
 
+    def _catalogue_runtime_tile_ids(
+        self,
+    ) -> tuple[NDArray[np.int32], NDArray[np.int32], NDArray[np.int64]]:
+        """Return per-row IDs, unique runtime IDs, and representative rows.
+
+        Most RACS products use their integer SBID directly.  RACS LOW1 used
+        multi-field scheduling blocks, so its string Tile_ID is instead
+        encoded deterministically as a dense integer for downstream arrays.
+        """
+        raw_ids = np.asarray(self.catalogue[self.product.columns.tile_id])
+        if not self.product.encode_tile_ids:
+            numeric_ids = np.asarray(raw_ids, dtype=np.int64)
+            unique_ids, first_indices = np.unique(numeric_ids, return_index=True)
+            int32_info = np.iinfo(np.int32)
+            if np.any(unique_ids < 0) or np.any(unique_ids > int32_info.max):
+                raise ValueError(
+                    f"{self.product.label} tile identifiers must be non-negative int32 values."
+                )
+            return (
+                numeric_ids.astype(np.int32, copy=False),
+                unique_ids.astype(np.int32, copy=False),
+                first_indices.astype(np.int64, copy=False),
+            )
+
+        labels = np.asarray(raw_ids, dtype=np.str_)
+        if labels.ndim != 1 or np.any(np.char.strip(labels) == ""):
+            raise ValueError(f"{self.product.label} Tile_ID values must be non-empty strings.")
+
+        unique_labels, first_indices, inverse = np.unique(
+            labels,
+            return_index=True,
+            return_inverse=True,
+        )
+        runtime_ids = np.arange(unique_labels.size, dtype=np.int32)
+        row_ids = inverse.astype(np.int32, copy=False)
+        if (
+            np.unique(runtime_ids).size != unique_labels.size
+            or not np.array_equal(unique_labels[row_ids], labels)
+        ):
+            raise ValueError(f"{self.product.label} Tile_ID integer encoding is not bijective.")
+
+        self._validate_encoded_tile_labels(unique_labels)
+
+        scan_start_mjd = np.asarray(
+            self.catalogue[self.product.columns.scan_start_mjd],
+            dtype=np.float64,
+        )
+        representative_times = scan_start_mjd[first_indices]
+        if not np.all(np.isfinite(representative_times)):
+            raise ValueError(f"{self.product.label} contains non-finite observation times.")
+        if not np.array_equal(scan_start_mjd, representative_times[row_ids]):
+            raise ValueError(
+                f"{self.product.label} maps at least one Tile_ID to multiple observation times."
+            )
+
+        sbid_column = self.product.columns.scheduling_block_id
+        if sbid_column is not None:
+            scheduling_sbids = np.asarray(self.catalogue[sbid_column])
+            representative_sbids = scheduling_sbids[first_indices]
+            if not np.array_equal(scheduling_sbids, representative_sbids[row_ids]):
+                raise ValueError(
+                    f"{self.product.label} maps at least one Tile_ID to multiple SBIDs."
+                )
+
+        return row_ids, runtime_ids, first_indices.astype(np.int64, copy=False)
+
+    def _validate_encoded_tile_labels(self, labels: NDArray[np.str_]) -> None:
+        """Validate LOW1 field-name syntax and nominal-centre uniqueness."""
+        matches = [LOW1_TILE_ID_PATTERN.fullmatch(str(label)) for label in labels]
+        if any(match is None for match in matches):
+            invalid = [
+                str(label) for label, match in zip(labels, matches) if match is None
+            ]
+            raise ValueError(
+                f"{self.product.label} contains malformed Tile_ID values: "
+                + ", ".join(invalid[:10])
+                + (", ..." if len(invalid) > 10 else "")
+            )
+        field_centres = np.asarray(
+            [match.group(1) for match in matches if match is not None]
+        )
+        if np.unique(field_centres).size != field_centres.size:
+            raise ValueError(
+                f"{self.product.label} contains multiple Tile_ID values for the same "
+                "nominal field centre."
+            )
+
+    def _tile_identity_labels(self) -> NDArray[np.str_]:
+        """Return stable user-facing labels aligned with ``tile_sbids``."""
+        if self.product.encode_tile_ids and hasattr(self, "tile_field_id"):
+            labels = np.asarray(self.tile_field_id, dtype=np.str_)
+            if labels.shape == self.tile_sbids.shape:
+                return labels
+        return self.tile_sbids.astype(np.str_)
+
+    def _tile_identity_label(self) -> str:
+        return "Tile_ID" if self.product.encode_tile_ids else "SBID"
+
+    def _validate_runtime_tile_identity(self) -> None:
+        """Validate cached or newly built runtime tile identity arrays."""
+        tile_ids = np.asarray(self.tile_sbids, dtype=np.int32)
+        if tile_ids.ndim != 1 or np.unique(tile_ids).size != tile_ids.size:
+            raise ValueError(f"{self.product.label} runtime tile identifiers are not unique.")
+        if self.product.encode_tile_ids:
+            expected = np.arange(tile_ids.size, dtype=np.int32)
+            labels = self._tile_identity_labels()
+            if not np.array_equal(tile_ids, expected) or np.unique(labels).size != labels.size:
+                raise ValueError(
+                    f"{self.product.label} Tile_ID encoding must be contiguous and bijective."
+                )
+            self._validate_encoded_tile_labels(labels)
+
     def build_tile_lookup(self) -> None:
-        """Build per-pixel dominant-SBID and SBID-mixture lookup products."""
+        """Build dominant and mixture lookups for the product's tile identity."""
         assert self.catalogue_is_loaded, "Load the catalogue before building tile lookups."
 
         ra = np.asarray(self.catalogue[self.product.columns.ra], dtype=np.float64)
         dec = np.asarray(self.catalogue[self.product.columns.dec], dtype=np.float64)
-        sbid = np.asarray(self.catalogue[self.product.columns.tile_id], dtype=np.int64)
+        sbid, _, _ = self._catalogue_runtime_tile_ids()
 
         pixel_indices = hp.ang2pix(self.nside, ra, dec, lonlat=True, nest=True)
         n_pix = hp.nside2npix(self.nside)
@@ -729,11 +844,16 @@ class Racs:
             self.sbid_mixture_probabilities = np.empty(0, dtype=np.float64)
 
     def save_tile_lookup(self) -> None:
-        """Persist the HEALPix dominant-SBID lookup derived from the uncut catalogue."""
+        """Persist the HEALPix dominant-tile lookup derived from the catalogue."""
         cache_path = self._sbid_lookup_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             cache_path,
+            format_version=np.asarray(TILE_CACHE_FORMAT_VERSION, dtype=np.int64),
+            product_key=np.asarray(self.product.key),
+            tile_id_column=np.asarray(self.product.columns.tile_id),
+            tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
+            tile_identity_labels=self._tile_identity_labels(),
             nside=np.asarray(self.nside, dtype=np.int64),
             tile_lookup_map=self.tile_lookup_map.astype(np.int32, copy=False),
         )
@@ -742,19 +862,26 @@ class Racs:
         self._save_lookup_map_png(
             tile_lookup_map,
             cache_path.with_suffix(".png"),
-            title=f"{self.product.label} Dominant SBID Lookup (nside={self.nside})",
-            unit="SBID",
+            title=(
+                f"{self.product.label} Dominant {self._tile_identity_label()} "
+                f"Lookup (nside={self.nside})"
+            ),
+            unit=("Tile index" if self.product.encode_tile_ids else "SBID"),
             cmap="viridis",
         )
 
     def save_sbid_mixture_lookup(self) -> None:
-        """Persist the per-pixel SBID mixture lookup used during simulation."""
+        """Persist the per-pixel runtime tile-identity mixture."""
         cache_path = self._sbid_mixture_lookup_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             cache_path,
+            format_version=np.asarray(TILE_CACHE_FORMAT_VERSION, dtype=np.int64),
+            product_key=np.asarray(self.product.key),
+            tile_id_column=np.asarray(self.product.columns.tile_id),
             nside=np.asarray(self.nside, dtype=np.int64),
             tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
+            tile_identity_labels=self._tile_identity_labels(),
             counts=self.sbid_mixture_counts.astype(np.int64, copy=False),
             starts=self.sbid_mixture_starts.astype(np.int64, copy=False),
             tile_indices=self.sbid_mixture_tile_indices.astype(np.int32, copy=False),
@@ -762,26 +889,73 @@ class Racs:
         )
 
     def load_tile_lookup(self) -> bool:
-        """Load a cached HEALPix SBID lookup if one exists and matches this config."""
+        """Load a cached HEALPix tile lookup if it matches the tile metadata."""
         cache_path = self._sbid_lookup_cache_path()
         if not cache_path.exists():
             return False
 
-        with np.load(cache_path) as data:
+        with np.load(cache_path, allow_pickle=False) as data:
+            current_fields = {
+                "format_version", "product_key", "tile_id_column", "tile_sbids",
+                "tile_identity_labels", "nside", "tile_lookup_map",
+            }
+            legacy_fields = {"nside", "tile_lookup_map"}
+            is_current = current_fields.issubset(data.files)
+            if is_current:
+                if int(data["format_version"]) != TILE_CACHE_FORMAT_VERSION:
+                    return False
+                if str(data["product_key"]) != self.product.key:
+                    return False
+                if str(data["tile_id_column"]) != self.product.columns.tile_id:
+                    return False
+            elif self.product.encode_tile_ids or not legacy_fields.issubset(data.files):
+                return False
             cache_nside = int(data["nside"])
             if cache_nside != self.nside:
                 return False
-            self.tile_lookup_map = data["tile_lookup_map"].astype(np.int32, copy=False)
+            if is_current:
+                if not np.array_equal(data["tile_sbids"], self.tile_sbids):
+                    return False
+                if not np.array_equal(
+                    data["tile_identity_labels"], self._tile_identity_labels()
+                ):
+                    return False
+            cached_map = data["tile_lookup_map"].astype(np.int32, copy=False)
+            if cached_map.shape != (hp.nside2npix(self.nside),):
+                return False
+            populated_ids = cached_map[cached_map >= 0]
+            if not np.all(np.isin(populated_ids, self.tile_sbids)):
+                return False
+            self.tile_lookup_map = cached_map
 
         return True
 
     def load_sbid_mixture_lookup(self) -> bool:
-        """Load the cached per-pixel SBID mixture lookup if it matches the tile metadata."""
+        """Load the cached per-pixel tile mixture if it matches tile metadata."""
         cache_path = self._sbid_mixture_lookup_cache_path()
         if not cache_path.exists():
             return False
 
-        with np.load(cache_path) as data:
+        with np.load(cache_path, allow_pickle=False) as data:
+            current_fields = {
+                "format_version", "product_key", "tile_id_column", "nside",
+                "tile_sbids", "tile_identity_labels", "counts", "starts",
+                "tile_indices", "probabilities",
+            }
+            legacy_fields = {
+                "nside", "tile_sbids", "counts", "starts", "tile_indices",
+                "probabilities",
+            }
+            is_current = current_fields.issubset(data.files)
+            if is_current:
+                if int(data["format_version"]) != TILE_CACHE_FORMAT_VERSION:
+                    return False
+                if str(data["product_key"]) != self.product.key:
+                    return False
+                if str(data["tile_id_column"]) != self.product.columns.tile_id:
+                    return False
+            elif self.product.encode_tile_ids or not legacy_fields.issubset(data.files):
+                return False
             cache_nside = int(data["nside"])
             if cache_nside != self.nside:
                 return False
@@ -790,7 +964,9 @@ class Racs:
                 return False
             if not np.array_equal(cache_tile_sbids, self.tile_sbids):
                 return False
-            if "tile_indices" not in data.files:
+            if is_current and not np.array_equal(
+                data["tile_identity_labels"], self._tile_identity_labels()
+            ):
                 return False
             self.sbid_mixture_counts = data["counts"].astype(np.int64, copy=False)
             self.sbid_mixture_starts = data["starts"].astype(np.int64, copy=False)
@@ -799,6 +975,18 @@ class Racs:
                 np.float64,
                 copy=False,
             )
+
+        n_pix = hp.nside2npix(self.nside)
+        if self.sbid_mixture_counts.shape != (n_pix,):
+            return False
+        if self.sbid_mixture_starts.shape != (n_pix,):
+            return False
+        if self.sbid_mixture_tile_indices.shape != self.sbid_mixture_probabilities.shape:
+            return False
+        if np.any(self.sbid_mixture_tile_indices < 0) or np.any(
+            self.sbid_mixture_tile_indices >= self.tile_sbids.size
+        ):
+            return False
 
         return True
 
@@ -838,61 +1026,115 @@ class Racs:
         self.mask_map = np.asarray(mask_map == 1, dtype=np.bool_)
 
     def build_tile_metadata(self) -> None:
-        """Collect one row of metadata per SBID for later tile-level systematics."""
+        """Collect metadata per runtime tile identity for tile-level systematics."""
         assert self.catalogue_is_loaded, "Load the catalogue before building tile metadata."
 
-        sbid = np.asarray(self.catalogue[self.product.columns.tile_id], dtype=np.int64)
         field_id = np.asarray(self.catalogue[self.product.columns.field_id])
         scan_start_mjd = np.asarray(
             self.catalogue[self.product.columns.scan_start_mjd],
             dtype=np.float64,
         )
-        scan_length = np.asarray(
-            self.catalogue[self.product.columns.scan_length],
-            dtype=np.float64,
-        )
+        if self.product.columns.scan_length:
+            scan_length = np.asarray(
+                self.catalogue[self.product.columns.scan_length],
+                dtype=np.float64,
+            )
+        else:
+            scan_length = None
 
-        unique_sbid, first_indices = np.unique(sbid, return_index=True)
-        self.tile_sbids = unique_sbid.astype(np.int32, copy=False)
+        _, unique_sbid, first_indices = self._catalogue_runtime_tile_ids()
+        self.tile_sbids = unique_sbid
         self.tile_scan_start_mjd = scan_start_mjd[first_indices].astype(np.float64, copy=False)
-        self.tile_scan_length = scan_length[first_indices].astype(np.float64, copy=False)
+        if self.product.columns.scan_length:
+            self.tile_scan_length = scan_length[first_indices].astype(np.float64, copy=False)
+        else:
+            self.tile_scan_length = None
         self.tile_field_id = field_id[first_indices]
         self._tile_index_from_sbid = {
             int(tile_sbid): int(tile_index)
             for tile_index, tile_sbid in enumerate(self.tile_sbids)
         }
+        self._validate_runtime_tile_identity()
 
     def save_tile_metadata(self) -> None:
-        """Persist one-row-per-SBID tile metadata."""
+        """Persist one row of metadata per runtime tile identity."""
         cache_path = self._tile_metadata_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             cache_path,
+            format_version=np.asarray(TILE_CACHE_FORMAT_VERSION, dtype=np.int64),
+            product_key=np.asarray(self.product.key),
+            tile_id_column=np.asarray(self.product.columns.tile_id),
+            encode_tile_ids=np.asarray(self.product.encode_tile_ids),
             tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
             tile_scan_start_mjd=self.tile_scan_start_mjd.astype(np.float64, copy=False),
-            tile_scan_length=self.tile_scan_length.astype(np.float64, copy=False),
-            tile_field_id=np.asarray(self.tile_field_id),
+            tile_scan_length=(
+                self.tile_scan_length.astype(np.float64, copy=False)
+                if self.tile_scan_length is not None
+                else np.empty(0, dtype=np.float64)
+            ),
+            tile_field_id=np.asarray(self.tile_field_id, dtype=np.str_),
         )
 
     def load_tile_metadata(self) -> bool:
-        """Load cached one-row-per-SBID tile metadata if available."""
+        """Load cached per-tile metadata if its identity schema matches."""
         cache_path = self._tile_metadata_cache_path()
         if not cache_path.exists():
             return False
 
-        with np.load(cache_path, allow_pickle=False) as data:
-            self.tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
-            self.tile_scan_start_mjd = data["tile_scan_start_mjd"].astype(
-                np.float64,
-                copy=False,
-            )
-            self.tile_scan_length = data["tile_scan_length"].astype(np.float64, copy=False)
-            self.tile_field_id = data["tile_field_id"]
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                current_fields = {
+                    "format_version", "product_key", "tile_id_column", "encode_tile_ids",
+                    "tile_sbids", "tile_scan_start_mjd", "tile_scan_length", "tile_field_id",
+                }
+                legacy_fields = {
+                    "tile_sbids", "tile_scan_start_mjd", "tile_scan_length",
+                    "tile_field_id",
+                }
+                is_current = current_fields.issubset(data.files)
+                if is_current:
+                    if int(data["format_version"]) != TILE_CACHE_FORMAT_VERSION:
+                        return False
+                    if str(data["product_key"]) != self.product.key:
+                        return False
+                    if str(data["tile_id_column"]) != self.product.columns.tile_id:
+                        return False
+                    if bool(data["encode_tile_ids"]) != self.product.encode_tile_ids:
+                        return False
+                elif self.product.encode_tile_ids or not legacy_fields.issubset(data.files):
+                    return False
+                self.tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
+                self.tile_scan_start_mjd = data["tile_scan_start_mjd"].astype(
+                    np.float64,
+                    copy=False,
+                )
+                cached_scan_length = data["tile_scan_length"].astype(np.float64, copy=False)
+                self.tile_scan_length = (
+                    cached_scan_length if self.product.columns.scan_length is not None else None
+                )
+                self.tile_field_id = data["tile_field_id"].astype(np.str_, copy=False)
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+        if self.tile_scan_start_mjd.shape != self.tile_sbids.shape:
+            return False
+        if np.asarray(self.tile_field_id).shape != self.tile_sbids.shape:
+            return False
+        if (
+            self.tile_scan_length is not None
+            and self.tile_scan_length.shape != self.tile_sbids.shape
+        ):
+            return False
 
         self._tile_index_from_sbid = {
             int(tile_sbid): int(tile_index)
             for tile_index, tile_sbid in enumerate(self.tile_sbids)
         }
+        try:
+            self._validate_runtime_tile_identity()
+        except ValueError:
+            return False
         return True
 
     def build_temperature_map(self) -> None:
@@ -956,6 +1198,7 @@ class Racs:
             "product_key": np.asarray(self.product.key),
             "temperature_fallback": np.asarray(self.cfg.temperature_fallback),
             "tile_sbids": self.tile_sbids.astype(np.int32, copy=False),
+            "tile_identity_labels": self._tile_identity_labels(),
             "tile_scan_start_mjd": self.tile_scan_start_mjd.astype(np.float64, copy=False),
             "tile_temperature_by_index": self.tile_temperature_by_index.astype(
                 np.float64,
@@ -1054,7 +1297,13 @@ class Racs:
             }
             if not required_fields.issubset(data.files):
                 return False
-            if int(data["format_version"]) != TEMPERATURE_CACHE_FORMAT_VERSION:
+            cache_format_version = int(data["format_version"])
+            if cache_format_version not in {2, TEMPERATURE_CACHE_FORMAT_VERSION}:
+                return False
+            if self.product.encode_tile_ids and (
+                cache_format_version != TEMPERATURE_CACHE_FORMAT_VERSION
+                or "tile_identity_labels" not in data.files
+            ):
                 return False
             if int(data["nside"]) != self.nside or str(data["product_key"]) != self.product.key:
                 return False
@@ -1064,6 +1313,10 @@ class Racs:
             cache_tile_sbids = data["tile_sbids"].astype(np.int32, copy=False)
             cached_scan_start_mjd = data["tile_scan_start_mjd"].astype(np.float64, copy=False)
             if not np.array_equal(cache_tile_sbids, self.tile_sbids):
+                return False
+            if "tile_identity_labels" in data.files and not np.array_equal(
+                data["tile_identity_labels"], self._tile_identity_labels()
+            ):
                 return False
             if not np.array_equal(cached_scan_start_mjd, self.tile_scan_start_mjd):
                 return False
@@ -1107,25 +1360,27 @@ class Racs:
         )
         fallback_mask = cached_sources != "mean_paf"
         if np.any(fallback_mask):
-            fallback_sbids = self.tile_sbids[fallback_mask]
-            preview = ", ".join(str(int(sbid)) for sbid in fallback_sbids[:10])
-            if fallback_sbids.size > 10:
+            fallback_ids = self._tile_identity_labels()[fallback_mask]
+            preview = ", ".join(str(identifier) for identifier in fallback_ids[:10])
+            if fallback_ids.size > 10:
                 preview += ", ..."
             if np.any(cached_sources == "reference"):
                 LOGGER.warning(
                     "%s using cached temperatures with reference fallback %.3f C "
-                    "for %d SBID(s): %s",
+                    "for %d %s(s): %s",
                     self.product.label,
                     self.cfg.paf_reference_temp_c,
-                    fallback_sbids.size,
+                    fallback_ids.size,
+                    self._tile_identity_label(),
                     preview,
                 )
             else:
                 LOGGER.warning(
                     "%s using cached temperatures with Open-Meteo fallback for "
-                    "%d SBID(s): %s",
+                    "%d %s(s): %s",
                     self.product.label,
-                    fallback_sbids.size,
+                    fallback_ids.size,
+                    self._tile_identity_label(),
                     preview,
                 )
         self.build_temperature_map()
@@ -1415,7 +1670,7 @@ class Racs:
         return noisy_flux.astype(dtype, copy=False)
 
     def load_temperature_table(self) -> None:
-        """Load or derive per-SBID temperatures and project them onto the sky."""
+        """Load or derive per-tile temperatures and project them onto the sky."""
         self.tile_temperature_by_index = None
 
         if self.load_temperature_lookup(allow_complete_open_meteo=False):
@@ -1440,11 +1695,12 @@ class Racs:
         else:
             if self.tile_temperature_by_index.shape != self.tile_sbids.shape:
                 raise ValueError(
-                    "PAF temperature lookup shape does not match the tile SBID list."
+                    "PAF temperature lookup shape does not match the tile identity list."
                 )
             invalid_paf = ~np.isfinite(self.tile_temperature_by_index)
             if np.any(invalid_paf):
                 invalid_sbids = self.tile_sbids[invalid_paf]
+                invalid_labels = self._tile_identity_labels()[invalid_paf]
                 if self.cfg.temperature_fallback == "none":
                     self._validate_tile_temperatures(source="mean_paf")
                 if np.all(invalid_paf):
@@ -1460,9 +1716,7 @@ class Racs:
                         "mean_paf",
                         dtype="<U10",
                     )
-                    sbid_preview = ", ".join(
-                        str(int(sbid)) for sbid in invalid_sbids[:10]
-                    )
+                    sbid_preview = ", ".join(str(label) for label in invalid_labels[:10])
                     if invalid_sbids.size > 10:
                         sbid_preview += ", ..."
                     if self.cfg.temperature_fallback == "reference":
@@ -1470,16 +1724,17 @@ class Racs:
                         if invalid_sbids.size > self.cfg.max_reference_fallback_tiles:
                             raise ValueError(
                                 f"{self.product.label} PAF temperature lookup is missing "
-                                f"{invalid_sbids.size} SBID(s), exceeding "
+                                f"{invalid_sbids.size} {self._tile_identity_label()}(s), exceeding "
                                 "max_reference_fallback_tiles="
                                 f"{self.cfg.max_reference_fallback_tiles}: {sbid_preview}."
                             )
                         LOGGER.warning(
-                            "%s PAF temperature lookup is missing %d SBID(s); "
+                            "%s PAF temperature lookup is missing %d %s(s); "
                             "explicitly filling only those with reference temperature "
                             "%.3f C: %s",
                             self.product.label,
                             invalid_sbids.size,
+                            self._tile_identity_label(),
                             self.cfg.paf_reference_temp_c,
                             sbid_preview,
                         )
@@ -1490,10 +1745,11 @@ class Racs:
                         validation_source: TemperatureSource = "reference"
                     else:
                         LOGGER.warning(
-                            "%s PAF temperature lookup is missing %d SBID(s); filling "
+                            "%s PAF temperature lookup is missing %d %s(s); filling "
                             "only those temperatures from Open-Meteo: %s",
                             self.product.label,
                             invalid_sbids.size,
+                            self._tile_identity_label(),
                             sbid_preview,
                         )
                         open_meteo_temperatures = np.asarray(
@@ -1535,10 +1791,11 @@ class Racs:
 
         LOGGER.warning(
             "%s PAF temperature lookup failed; falling back to Open-Meteo "
-            "ambient temperatures for %d SBID(s) (%s): %s",
+            "ambient temperatures for %d %s(s) (%s): %s",
             self.product.label,
             self.tile_sbids.size,
-            ", ".join(str(int(sbid)) for sbid in self.tile_sbids[:10])
+            self._tile_identity_label(),
+            ", ".join(str(label) for label in self._tile_identity_labels()[:10])
             + (", ..." if self.tile_sbids.size > 10 else ""),
             paf_failure,
         )
@@ -1566,7 +1823,7 @@ class Racs:
         self,
         source: TemperatureSource = "mean_paf",
     ) -> None:
-        """Fail initialisation if any SBID has no finite PAF temperature."""
+        """Fail initialisation if any tile has no finite temperature."""
         if self.tile_temperature_by_index is None:
             return
 
@@ -1575,10 +1832,9 @@ class Racs:
         if not np.any(invalid):
             return
 
-        invalid_indices = np.flatnonzero(invalid)
-        invalid_sbids = self.tile_sbids[invalid_indices]
-        preview = ", ".join(str(int(sbid)) for sbid in invalid_sbids[:10])
-        if invalid_sbids.size > 10:
+        invalid_labels = self._tile_identity_labels()[invalid]
+        preview = ", ".join(str(label) for label in invalid_labels[:10])
+        if invalid_labels.size > 10:
             preview += ", ..."
         source_label = {
             "mean_paf": "PAF",
@@ -1587,7 +1843,8 @@ class Racs:
         }[source]
         raise ValueError(
             f"{self.product.label} {source_label} temperature lookup contains non-finite "
-            f"temperatures for {invalid_sbids.size} SBID(s): {preview}."
+            f"temperatures for {invalid_labels.size} {self._tile_identity_label()}(s): "
+            f"{preview}."
         )
 
     def _resolve_paf_temperature_data_dir(self) -> Path:
@@ -1647,15 +1904,20 @@ class Racs:
         need_absolute_error_lookup = not self.load_absolute_error_lookup()
         need_flux_distribution = not self.load_flux_distribution()
         need_tile_metadata = not self.load_tile_metadata()
-        need_tile_lookup = not self.load_tile_lookup()
+        # Tile lookup caches are meaningful only relative to the validated
+        # identity mapping in tile metadata.  If metadata is stale, rebuild
+        # all dependent tile products from the catalogue.
+        need_tile_lookup = need_tile_metadata or not self.load_tile_lookup()
         need_sbid_mixture_lookup = False
         need_elevation_lookup = (
             self.product.columns.elevation is not None
             and not self.load_elevation_lookup()
         )
 
-        if not need_tile_metadata:
+        if not need_tile_metadata and not need_tile_lookup:
             need_sbid_mixture_lookup = not self.load_sbid_mixture_lookup()
+        elif need_tile_metadata:
+            need_sbid_mixture_lookup = True
 
         if (
             need_flux_distribution
@@ -1833,7 +2095,7 @@ class Racs:
         ra_deg: NDArray[np.floating],
         dec_deg: NDArray[np.floating],
     ) -> NDArray[np.int32]:
-        """Assign each source to the dominant observed SBID in its HEALPix pixel."""
+        """Assign each source to the dominant runtime tile in its HEALPix pixel."""
         assert hasattr(self, "tile_lookup_map"), "Run initialise_data() first."
 
         pixel_indices = hp.ang2pix(self.nside, ra_deg, dec_deg, lonlat=True, nest=True)
@@ -1854,7 +2116,7 @@ class Racs:
         pixel_indices: NDArray[np.int_],
         rng: Optional[np.random.Generator] = None,
     ) -> NDArray[np.int32]:
-        """Sample a tile assignment from each pixel's empirical SBID mixture."""
+        """Sample a tile assignment from each pixel's empirical tile mixture."""
         assert hasattr(self, "sbid_mixture_counts"), "Run initialise_data() first."
         if rng is None:
             rng = np.random.default_rng()
