@@ -27,6 +27,11 @@ strings remain in `tile_field_id` for provenance and diagnostics. Existing
 downstream names such as `tile_sbids` are retained for compatibility, but for
 LOW1 they hold encoded Tile_ID values rather than physical SBIDs.
 
+Consumers that hold catalogue rows outside the simulator can call
+`model.runtime_tile_ids(tile_ids)` to apply this same mapping. Unknown LOW1
+labels map to `-1`; products that use physical integer SBIDs return those IDs
+unchanged. Both `Racs` and `RacsJax` expose this method after initialisation.
+
 Construction and cache loading verify that the integer/string mapping is
 bijective, indices are unique and contiguous, each tile has one time and SBID,
 and nominal field centres are unique. Versioned cache metadata prevents legacy

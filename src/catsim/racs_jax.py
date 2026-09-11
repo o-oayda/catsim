@@ -1233,6 +1233,7 @@ class RacsJax:
         # Compatibility name: LOW1 stores dense Tile_ID codes here, while
         # other products retain their physical SBIDs.
         self.tile_sbids: Optional[NDArray[np.int32]] = None
+        self.tile_field_id: Optional[NDArray[np.str_]] = None
         self._tile_index_from_sbid: dict[int, int] = {}
         self.tile_temperature_by_index: Optional[NDArray[np.float32]] = None
         self.elevation_lookup_values: Optional[NDArray[np.float32]] = None
@@ -1250,6 +1251,7 @@ class RacsJax:
 
         self.mask_map = reference.mask_map.astype(np.bool_, copy=False)
         self.tile_sbids = reference.tile_sbids.astype(np.int32, copy=False)
+        self.tile_field_id = np.asarray(reference.tile_field_id, dtype=np.str_)
         self._tile_index_from_sbid = dict(reference._tile_index_from_sbid)
 
         tile_counts = reference.sbid_mixture_counts.astype(np.int32, copy=False)
@@ -1369,6 +1371,10 @@ class RacsJax:
             ),
         )
         self.lookups_are_initialised = True
+
+    def runtime_tile_ids(self, tile_ids: object) -> NDArray[np.int32]:
+        """Map catalogue tile identities to this model's runtime integers."""
+        return Racs.runtime_tile_ids(self, tile_ids)
 
     def _downscale_batch_output(
         self,

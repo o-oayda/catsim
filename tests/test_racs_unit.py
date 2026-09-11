@@ -1084,6 +1084,12 @@ class RacsInitialiseDataTests(unittest.TestCase):
         )
         np.testing.assert_allclose(sim.tile_scan_start_mjd, np.array([58594.5, 58594.6]))
         self.assertEqual(sim._tile_index_from_sbid, {0: 0, 1: 1})
+        np.testing.assert_array_equal(
+            sim.runtime_tile_ids(
+                ["RACS_0100+00A", "RACS_9999+99A", "RACS_0000+00A"]
+            ),
+            np.array([1, -1, 0], dtype=np.int32),
+        )
 
         reversed_sim = self._low1_index_test_sim(table[::-1])
         reversed_sim.build_tile_metadata()

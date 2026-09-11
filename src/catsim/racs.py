@@ -733,6 +733,50 @@ class Racs:
 
         return row_ids, runtime_ids, first_indices.astype(np.int64, copy=False)
 
+    def runtime_tile_ids(self, tile_ids: object) -> NDArray[np.int32]:
+        """Map catalogue tile identities to the simulator's runtime integers.
+
+        For products with encoded tile identities, such as RACS LOW1, this
+        applies the mapping established from the full catalogue during
+        initialisation. Unknown identities map to ``-1``. Other products keep
+        their integer SBIDs unchanged.
+        """
+        raw_ids = np.asarray(tile_ids)
+        if not self.product.encode_tile_ids:
+            numeric_ids = np.asarray(raw_ids, dtype=np.int64)
+            int32_info = np.iinfo(np.int32)
+            if np.any(numeric_ids < 0) or np.any(numeric_ids > int32_info.max):
+                raise ValueError(
+                    f"{self.product.label} tile identifiers must be non-negative "
+                    "int32 values."
+                )
+            return numeric_ids.astype(np.int32, copy=False)
+
+        runtime_ids = getattr(self, "tile_sbids", None)
+        identity_labels = getattr(self, "tile_field_id", None)
+        if runtime_ids is None or identity_labels is None:
+            raise RuntimeError(
+                "Tile metadata is unavailable; call initialise_data() first."
+            )
+        runtime_ids = np.asarray(runtime_ids, dtype=np.int32)
+        identity_labels = np.asarray(identity_labels, dtype=np.str_)
+        if runtime_ids.shape != identity_labels.shape:
+            raise ValueError(
+                "Runtime tile IDs and identity labels must have matching shapes."
+            )
+
+        runtime_id_from_label = {
+            str(label): int(runtime_id)
+            for label, runtime_id in zip(identity_labels, runtime_ids, strict=True)
+        }
+        labels = np.asarray(raw_ids, dtype=np.str_)
+        mapped = np.fromiter(
+            (runtime_id_from_label.get(str(label), -1) for label in labels.flat),
+            dtype=np.int32,
+            count=labels.size,
+        )
+        return mapped.reshape(labels.shape)
+
     def _validate_encoded_tile_labels(self, labels: NDArray[np.str_]) -> None:
         """Validate LOW1 field-name syntax and nominal-centre uniqueness."""
         matches = [LOW1_TILE_ID_PATTERN.fullmatch(str(label)) for label in labels]
