@@ -18,7 +18,7 @@ dependencies = [
     "ipython (>=9.7.0,<10.0.0)",
     "matplotlib (>=3.10.7,<4.0.0)",
     "pytest (>=9.0.2,<10.0.0)",
-    "dipole-utils @ git+https://github.com/o-oayda/dipole-utils.git@main",
+    "dipole-utils",
 ]
 packages = [
   { "include" = "catsim", "from" = "src" }
@@ -37,3 +37,6 @@ matplotlib = "^3.10.7"
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.uv.sources]
+dipole-utils = { git = "https://github.com/o-oayda/dipole-utils.git", rev = "v0.1.0" }

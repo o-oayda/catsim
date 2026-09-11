@@ -895,6 +895,8 @@ class Racs:
             cache_path,
             format_version=np.asarray(TILE_CACHE_FORMAT_VERSION, dtype=np.int64),
             product_key=np.asarray(self.product.key),
+            ra_column=np.asarray(self.product.columns.ra),
+            dec_column=np.asarray(self.product.columns.dec),
             tile_id_column=np.asarray(self.product.columns.tile_id),
             tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
             tile_identity_labels=self._tile_identity_labels(),
@@ -922,6 +924,8 @@ class Racs:
             cache_path,
             format_version=np.asarray(TILE_CACHE_FORMAT_VERSION, dtype=np.int64),
             product_key=np.asarray(self.product.key),
+            ra_column=np.asarray(self.product.columns.ra),
+            dec_column=np.asarray(self.product.columns.dec),
             tile_id_column=np.asarray(self.product.columns.tile_id),
             nside=np.asarray(self.nside, dtype=np.int64),
             tile_sbids=self.tile_sbids.astype(np.int32, copy=False),
@@ -940,19 +944,23 @@ class Racs:
 
         with np.load(cache_path, allow_pickle=False) as data:
             current_fields = {
-                "format_version", "product_key", "tile_id_column", "tile_sbids",
-                "tile_identity_labels", "nside", "tile_lookup_map",
+                "format_version", "product_key", "ra_column", "dec_column",
+                "tile_id_column", "tile_sbids", "tile_identity_labels", "nside",
+                "tile_lookup_map",
             }
-            legacy_fields = {"nside", "tile_lookup_map"}
             is_current = current_fields.issubset(data.files)
             if is_current:
                 if int(data["format_version"]) != TILE_CACHE_FORMAT_VERSION:
                     return False
                 if str(data["product_key"]) != self.product.key:
                     return False
+                if str(data["ra_column"]) != self.product.columns.ra:
+                    return False
+                if str(data["dec_column"]) != self.product.columns.dec:
+                    return False
                 if str(data["tile_id_column"]) != self.product.columns.tile_id:
                     return False
-            elif self.product.encode_tile_ids or not legacy_fields.issubset(data.files):
+            else:
                 return False
             cache_nside = int(data["nside"])
             if cache_nside != self.nside:
@@ -982,13 +990,9 @@ class Racs:
 
         with np.load(cache_path, allow_pickle=False) as data:
             current_fields = {
-                "format_version", "product_key", "tile_id_column", "nside",
-                "tile_sbids", "tile_identity_labels", "counts", "starts",
-                "tile_indices", "probabilities",
-            }
-            legacy_fields = {
-                "nside", "tile_sbids", "counts", "starts", "tile_indices",
-                "probabilities",
+                "format_version", "product_key", "ra_column", "dec_column",
+                "tile_id_column", "nside", "tile_sbids", "tile_identity_labels",
+                "counts", "starts", "tile_indices", "probabilities",
             }
             is_current = current_fields.issubset(data.files)
             if is_current:
@@ -996,9 +1000,13 @@ class Racs:
                     return False
                 if str(data["product_key"]) != self.product.key:
                     return False
+                if str(data["ra_column"]) != self.product.columns.ra:
+                    return False
+                if str(data["dec_column"]) != self.product.columns.dec:
+                    return False
                 if str(data["tile_id_column"]) != self.product.columns.tile_id:
                     return False
-            elif self.product.encode_tile_ids or not legacy_fields.issubset(data.files):
+            else:
                 return False
             cache_nside = int(data["nside"])
             if cache_nside != self.nside:
@@ -1507,6 +1515,8 @@ class Racs:
         np.savez_compressed(
             cache_path,
             nside=np.asarray(self.nside, dtype=np.int64),
+            ra_column=np.asarray(self.product.columns.ra),
+            dec_column=np.asarray(self.product.columns.dec),
             elevation_column=np.asarray(self.product.columns.elevation or ""),
             counts=self.elevation_lookup_pixel_counts.astype(np.int64, copy=False),
             starts=self.elevation_lookup_pixel_starts.astype(np.int64, copy=False),
@@ -1542,14 +1552,19 @@ class Racs:
         if not cache_path.exists():
             return False
 
-        with np.load(cache_path) as data:
+        with np.load(cache_path, allow_pickle=False) as data:
+            if not {"ra_column", "dec_column", "elevation_column"}.issubset(data.files):
+                return False
             cache_nside = int(data["nside"])
             if cache_nside != self.nside:
                 return False
-            if "elevation_column" in data.files:
-                cache_column = str(data["elevation_column"])
-                if cache_column != self.product.columns.elevation:
-                    return False
+            if str(data["ra_column"]) != self.product.columns.ra:
+                return False
+            if str(data["dec_column"]) != self.product.columns.dec:
+                return False
+            cache_column = str(data["elevation_column"])
+            if cache_column != self.product.columns.elevation:
+                return False
             self.elevation_lookup_pixel_counts = data["counts"].astype(np.int64, copy=False)
             self.elevation_lookup_pixel_starts = data["starts"].astype(np.int64, copy=False)
             self.elevation_lookup_values = data["elevation"].astype(np.float32, copy=False)
