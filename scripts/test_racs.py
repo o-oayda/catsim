@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from catsim import RACS_MID1, Racs, RacsConfig, smooth_map
-from catsim.racs_products import RACS_LOW1
+from catsim.racs_products import RACS_LOW1, RACS_LOW2, RACS_LOW3
 from catsim.utils.constants import CMB_B, CMB_L
 from dipoleutils.utils.plotting import plot_log_log_histogram
 

@@ -1,5 +1,6 @@
 import unittest
 import pickle
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -905,13 +906,13 @@ class RacsInitialiseDataTests(unittest.TestCase):
 
         self.assertEqual(low3.data_loader_args, ("racs", "low3"))
         self.assertEqual(low3.data_dir_name, "racs_low3")
-        self.assertEqual(low3.columns.dec, "Dec")
+        self.assertEqual(low3.columns.dec, "Dec_corr")
         self.assertEqual(low3.columns.source_name, "Name")
         self.assertIsNone(low3.columns.elevation)
         self.assertEqual(mid1, RACS_MID1)
-        self.assertEqual(mid1.data_loader_args, ("racs", "mid1"))
+        self.assertEqual(mid1.data_loader_args, ("racs", "mid1-withcor"))
         self.assertEqual(mid1.data_dir_name, "racs_mid1")
-        self.assertEqual(mid1.columns.dec, "DEC")
+        self.assertEqual(mid1.columns.dec, "cDEC")
         self.assertEqual(mid1.columns.field_id, "Tile_ID")
         self.assertEqual(mid1.columns.source_name, "Source_Name")
         self.assertEqual(mid1.columns.elevation, "ALT")
@@ -1432,6 +1433,11 @@ class RacsInitialiseDataTests(unittest.TestCase):
                 np.array([50.0, 60.0], dtype=np.float32),
             )
             np.testing.assert_array_equal(sim.sbid_mixture_tile_indices, np.array([0, 1], dtype=np.int32))
+
+            sim.product = replace(product, columns=replace(product.columns, dec="Dec_corr"))
+            self.assertFalse(sim.load_tile_lookup())
+            self.assertFalse(sim.load_sbid_mixture_lookup())
+            self.assertFalse(sim.load_elevation_lookup())
 
     def test_load_temperature_table_raises_when_paf_directory_missing(self):
         sim = RacsLow3(
