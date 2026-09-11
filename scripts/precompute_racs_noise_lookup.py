@@ -14,10 +14,24 @@ from typing import Any
 
 import numpy as np
 
-from catsim import RACS_LOW3, RACS_MID1, Racs, RacsConfig
+from catsim import (
+    RACS_LOW2,
+    RACS_LOW2_25AS,
+    RACS_LOW2_45AS,
+    RACS_LOW3,
+    RACS_MID1,
+    Racs,
+    RacsConfig,
+)
 
 
-PRODUCTS = {"low3": RACS_LOW3, "mid1": RACS_MID1}
+PRODUCTS = {
+    "low2": RACS_LOW2,
+    "low2-25as": RACS_LOW2_25AS,
+    "low2-45as": RACS_LOW2_45AS,
+    "low3": RACS_LOW3,
+    "mid1": RACS_MID1,
+}
 
 
 def _positive_int(value: str) -> int:
@@ -44,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--product", choices=PRODUCTS, required=True)
     parser.add_argument(
         "--noisemap-data-dir",
-        help="Directory containing RACS-low3.iqr.hpx and/or RACS-mid1.iqr.hpx",
+        help="Directory containing the selected product's RACS-<product>.iqr.hpx",
     )
     parser.add_argument("--catalogue-path", help="Product catalogue used to rebuild the grid")
     parser.add_argument("--noise-map-nside", type=_positive_int, default=256)

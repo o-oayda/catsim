@@ -1,24 +1,24 @@
-## RACS LOW3/MID1 noise-conditioned flux errors
+## RACS LOW2/LOW3/MID1 noise-conditioned flux errors
 
-RACS LOW3 and MID1 use an empirical distribution of **absolute** total-flux
-errors conditioned on local survey noise and deterministic pre-noise total
-flux. The external map contract is:
-
-LOW2 is deliberately unsupported by this noise-conditioned implementation;
-initialization fails clearly rather than silently using a LOW3/MID1 map or a
-legacy fractional-error cache.
+RACS LOW2, its 25- and 45-arcsec patched variants, LOW3, and MID1 use an
+empirical distribution of **absolute** total-flux errors conditioned on local
+survey noise and deterministic pre-noise total flux. The LOW2 variants share
+the LOW2 noise map but retain independent caches because they are trained on
+different catalogues. The external map contract is:
 
 | Product | Source file | Source map | Assigned unit |
 | --- | --- | --- | --- |
+| LOW2 | `RACS-low2.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | LOW3 | `RACS-low3.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | MID1 | `RACS-mid1.iqr.hpx` | nside 1024, RING, equatorial | uJy/beam |
 
 The FITS headers do not supply the unit; `uJy/beam` is part of the CatSIM
 scientific contract. The production defaults cache a NESTED nside-256 map and a
 bounded 200 x 300 `(log10 noise, log10 flux)` grid whose directly sampled cells
-contain at least 10 catalogue sources. Both products use inclusive flux bounds
-of 0.1--10,000 mJy. MID1 uses noise bounds of 100--1,000 uJy/beam; LOW3 extends
-the lower noise edge down by 0.1 dex to 10^1.9 = 79.43 uJy/beam:
+contain at least 10 catalogue sources. All products use inclusive flux bounds
+of 0.1--10,000 mJy. MID1 uses noise bounds of 100--1,000 uJy/beam; LOW2,
+its patched variants, and LOW3 extend the lower noise edge down by 0.1 dex to
+10^1.9 = 79.43 uJy/beam:
 
 ```python
 from catsim import RACS_MID1, Racs, RacsConfig
@@ -40,7 +40,8 @@ sim.initialise_data()
 
 Generated products live under
 `src/catsim/data/racs_low3/lookups/` or
-`src/catsim/data/racs_mid1/lookups/`. The feature-specific files are named
+`src/catsim/data/racs_mid1/lookups/`, or `src/catsim/data/racs_low2/lookups/`.
+The feature-specific files are named
 `noise_map_nside<N>_nested_v1.npz` and
 `absolute_error_lookup_noise<N>_grid<A>x<B>_min<C>_bounds-..._v2.npz`. The
 bounds are included in the v2 filename and validated metadata, so the previous
@@ -60,6 +61,11 @@ uv run python scripts/precompute_racs_noise_lookup.py \
   --rebuild all \
   --benchmark-samples 1000000
 ```
+
+For patched LOW2 catalogues, use `--product low2-25as` or `--product
+low2-45as` with their respective FITS file. Their results are written to
+`src/catsim/data/racs_low2_25as/lookups/` and
+`src/catsim/data/racs_low2_45as/lookups/`.
 
 `--rebuild noise` also rebuilds the identity-dependent error grid;
 `--rebuild lookup` reuses a valid noise-map cache. Every build emits sidecar

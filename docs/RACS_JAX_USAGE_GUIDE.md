@@ -178,10 +178,13 @@ The script prints:
 
 ## Noise-map and absolute-error caches
 
-LOW3 and MID1 use these external source maps:
+LOW2, its 25- and 45-arcsec patched variants, LOW3, and MID1 use these
+external source maps. The LOW2 variants share the LOW2 map but use separate
+lookup caches trained from their respective catalogues:
 
 | Product | Filename | Native geometry | Physical unit |
 | --- | --- | --- | --- |
+| LOW2 | `RACS-low2.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | LOW3 | `RACS-low3.iqr.hpx` | nside 2048, RING, equatorial | uJy/beam |
 | MID1 | `RACS-mid1.iqr.hpx` | nside 1024, RING, equatorial | uJy/beam |
 
@@ -199,8 +202,9 @@ flux_error_flux_bounds_mjy = (0.1, 10_000.0)
 noisemap_data_dir = None
 ```
 
-LOW3 uses the same settings except that its lower noise bound is exactly 0.1
-dex lower: `flux_error_noise_bounds_ujy_beam = (10**1.9, 1000.0)`, or about
+LOW2, its patched variants, and LOW3 use the same settings except that their
+lower noise bound is exactly 0.1 dex lower:
+`flux_error_noise_bounds_ujy_beam = (10**1.9, 1000.0)`, or about
 79.43--1,000 uJy/beam.
 
 `noisemap_data_dir` is an input directory, not a cache directory. Generated
@@ -211,6 +215,12 @@ src/catsim/data/racs_low3/lookups/
   absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
 src/catsim/data/racs_mid1/lookups/
   absolute_error_lookup_noise256_grid200x300_min10_bounds-noise100to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2_25as/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
+src/catsim/data/racs_low2_45as/lookups/
+  absolute_error_lookup_noise256_grid200x300_min10_bounds-noise79p4328234724to1000_flux0p1to10000_v2.npz
 ```
 
 Each product directory also contains `noise_map_nside256_nested_v1.npz`.
