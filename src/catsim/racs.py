@@ -574,7 +574,7 @@ class Racs:
                 raise FileNotFoundError(
                     f"RacsConfig.catalogue_path points to missing file: {catalogue_path}"
                 )
-            self.catalogue = Table.read(catalogue_path, unit_parse_strict="silent")
+            self.catalogue = Table.read(catalogue_path)
         else:
             self.catalogue = DataLoader(*self.product.data_loader_args).load()
 
