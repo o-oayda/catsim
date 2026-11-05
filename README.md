@@ -119,3 +119,33 @@ multi-field scheduling blocks do not identify unique sky tiles. See
 [the LOW1 tile-indexing note](docs/RACS_LOW1_TILE_INDEXING.md) for the verified
 catalogue invariants, compatibility details, and remaining temperature-data
 limitation.
+
+## CatWISE source catalogue and hashgrid cache
+
+The source catalogue and generated hashgrids are not distributed through Git LFS.
+Supply `CatwiseConfig.source_catalogue_path` when building lookup data, including
+on the first `initialise_data()` call without a compatible hashgrid cache.
+The expected filename and SHA-256 for each supported set of cuts are tracked in
+`src/catsim/data/catwise_catalogues.json`. Files with a different checksum are
+rejected before loading. The S21 sample catalogue (`s21_catalogue_path`) is a
+separate input.
+
+```python
+config = CatwiseConfig(
+    cat_w1_max=17.0, cat_w12_min=0.5, magnitude_error_dist="gaussian",
+    source_catalogue_path="/data/catwise2020_corr_w120p5_w117p0.fits",
+)
+model = Catwise(config)  # CatwiseJax accepts the same config
+model.initialise_data()
+```
+
+Hashgrids are built with the defaults used by `precompute_data()` and saved
+under `$XDG_CACHE_HOME/catsim/catwise` (normally `~/.cache/catsim/catwise`).
+Set `CatwiseConfig.hashgrid_cache_dir` to override that directory. Cache metadata
+records the source digest, mask version, ecliptic mask setting, and grid settings.
+Compatible caches are reused without requiring the source catalogue. Legacy grids
+without provenance, LFS pointers, and incompatible caches are rebuilt.
+The other precomputed CatWISE data products must still be available.
+
+Removing LFS tracking does not rewrite old commits; historical LFS references
+remain in repository history.

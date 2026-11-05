@@ -232,3 +232,6 @@ src/catsim/data/racs_low1/lookups/*
 src/catsim/data/catwise2020_corrnodust_w120p5_w117p0.fits
 
 .codex
+
+# Generated locally from a checksum-verified catalogue
+src/catsim/data/**/mag_coverage/w1w2_magcov_hashgrid*.npz

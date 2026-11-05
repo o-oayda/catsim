@@ -2,6 +2,7 @@ from typing import Optional
 from os import PathLike
 from numpy.typing import NDArray
 import numpy as np
+import json
 
 
 class HashGrid:
@@ -258,12 +259,15 @@ class HashGrid:
             "offsets": self.offsets,
             "members": self.members,
         }
+        if hasattr(self, "metadata"):
+            state["metadata"] = np.array(json.dumps(self.metadata, sort_keys=True))
         np.savez_compressed(path, **state)
 
     @classmethod
     def load(cls, path: str | PathLike[str]) -> "HashGrid":
         with np.load(path, allow_pickle=True) as data:
             obj = cls.__new__(cls)
+            obj.metadata = json.loads(str(data["metadata"].item())) if "metadata" in data else {}
             obj.grid_dim_labels = data["grid_dim_labels"].astype(str).tolist()
             obj.grid_value_labels = data["grid_value_labels"].astype(str).tolist()
             obj.grid_step = data["grid_step"]

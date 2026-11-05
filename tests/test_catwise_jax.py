@@ -248,6 +248,7 @@ class CatwiseJaxTests(unittest.TestCase):
         from catsim import CatwiseJax
 
         cfg = CatwiseConfig(
+            source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
             cat_w1_max=17.0,
             cat_w12_min=0.5,
             magnitude_error_dist="gaussian",
@@ -255,7 +256,15 @@ class CatwiseJaxTests(unittest.TestCase):
             store_final_samples=False,
         )
         cls.sim = CatwiseJax(cfg)
-        cls.sim.initialise_data()
+        try:
+            cls.sim.initialise_data()
+        except FileNotFoundError as exc:
+            if cfg.source_catalogue_path or 'source_catalogue_path' not in str(exc):
+                raise
+            raise unittest.SkipTest(
+                "Integration data unavailable: supply CATSIM_TEST_SOURCE_CATALOGUE_PATH "
+                "or build a compatible hashgrid cache first."
+            )
 
     def test_generate_dipole_returns_expected_shapes_and_is_deterministic(self):
         key = jax.random.PRNGKey(123)
@@ -322,6 +331,7 @@ class CatwiseJaxTests(unittest.TestCase):
         from catsim import CatwiseJax
 
         cfg = CatwiseConfig(
+            source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
             cat_w1_max=17.0,
             cat_w12_min=0.5,
             magnitude_error_dist="students-t",
@@ -398,6 +408,7 @@ class CatwiseJaxTests(unittest.TestCase):
         from catsim import CatwiseJax
 
         cfg = CatwiseConfig(
+            source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
             cat_w1_max=17.0,
             cat_w12_min=0.5,
             magnitude_error_dist="gaussian",
@@ -424,6 +435,7 @@ class CatwiseJaxTests(unittest.TestCase):
         unsupported_configs = [
             (
                 CatwiseConfig(
+                    source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
                     cat_w1_max=17.0,
                     cat_w12_min=0.5,
                     magnitude_error_dist="gaussian",
@@ -433,6 +445,7 @@ class CatwiseJaxTests(unittest.TestCase):
             ),
             (
                 CatwiseConfig(
+                    source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
                     cat_w1_max=17.0,
                     cat_w12_min=0.5,
                     magnitude_error_dist="gaussian",
@@ -442,6 +455,7 @@ class CatwiseJaxTests(unittest.TestCase):
             ),
             (
                 CatwiseConfig(
+                    source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
                     cat_w1_max=17.0,
                     cat_w12_min=0.5,
                     magnitude_error_dist="gaussian",
@@ -465,6 +479,7 @@ class CatwiseJaxTests(unittest.TestCase):
         log10_n = 4.0
 
         cfg = CatwiseConfig(
+            source_catalogue_path=os.environ.get("CATSIM_TEST_SOURCE_CATALOGUE_PATH"),
             cat_w1_max=17.0,
             cat_w12_min=0.5,
             magnitude_error_dist="gaussian",

@@ -26,6 +26,10 @@ from .utils.healsphere import Mask, ParameterMap, downgrade_ignore_nan
 from .utils.package_data import data_path
 from collections import defaultdict
 import pickle
+import hashlib
+import json
+import tempfile
+import zipfile
 from scipy.stats import binned_statistic_2d
 from sklearn.neighbors import NearestNeighbors
 from scipy.interpolate import RegularGridInterpolator
@@ -33,6 +37,10 @@ from numpy.typing import NDArray
 from datetime import datetime
 import matplotlib.pyplot as plt
 from .utils.rng import NPKey
+
+
+_DEFAULT_HASHGRID_STEP = (0.1, 0.01, 0.1, 0.02)
+_DEFAULT_HASHGRID_PROJECT_COVERAGE = True
 
 
 class Catwise:
@@ -131,16 +139,40 @@ class Catwise:
             f'full path of {self.s21_cat_fname}.'
         )
 
+    def _source_catalogue_spec(self) -> dict:
+        with data_path('catwise_catalogues.json') as manifest_path:
+            manifest = json.loads(manifest_path.read_text())
+        if self.cut_path not in manifest:
+            raise ValueError(
+                f'No trusted source catalogue is registered for cuts {self.cut_path}.'
+            )
+        return manifest[self.cut_path]
+
     def load_catalogue(self):
-        self.file_path = f'src/catsim/data/{self.file_name}'
-        print('Loading CatWISE2020...')
-        self.catalogue = Table.read(
-            self.file_path,
-            unit_parse_strict='silent' # supress unit warning printouts
-        )
-        print('Finished loading CatWISE2020.')
+        spec = self._source_catalogue_spec()
+        if not self.cfg.source_catalogue_path:
+            raise FileNotFoundError(
+                'Rebuilding CatWISE lookups requires CatwiseConfig.source_catalogue_path '
+                f'pointing to {spec["filename"]} (SHA-256 {spec["sha256"]}).'
+            )
+        path = Path(self.cfg.source_catalogue_path).expanduser().resolve()
+        print(f'Verifying CatWISE source catalogue: {path}')
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            if digest != spec['sha256']:
+                raise ValueError(
+                    f'CatWISE source catalogue SHA-256 mismatch for {path}: '
+                    f'expected {spec["sha256"]}, got {digest}.'
+                )
+            stream.seek(0)
+            # Read the same file descriptor that was checked above.
+            catalogue = Table.read(stream, format='fits', unit_parse_strict='silent')
+        self.catalogue = catalogue
+        self.file_path = str(path)
+        self.source_catalogue_sha256 = digest
         self.catalogue_is_loaded = True
-    
+        print('Finished loading verified CatWISE2020.')
+
     def generate_dipole(self,
             log10_n_initial_samples: float,
             w1_max: float = 16.4,
@@ -872,10 +904,7 @@ class Catwise:
         self.create_confusion_skylookup()
         self.create_w1_w2_distribution()
         self.create_coverage_maps()
-        self.create_mag_cov_hashgrid(
-            grid_step=[0.1, 0.01, 0.1, 0.02], 
-            project_coverage=True
-        )
+        self._create_default_mag_cov_hashgrid()
     
     def make_masked_catalogue(self):
         assert self.catalogue_is_loaded, 'Load catalogue first.'
@@ -1054,11 +1083,68 @@ class Catwise:
 
             print(f'Saved coverage map figures at {coverage_dir}.')
 
+    def _create_default_mag_cov_hashgrid(self) -> None:
+        self.create_mag_cov_hashgrid(
+            grid_step=list(_DEFAULT_HASHGRID_STEP),
+            project_coverage=_DEFAULT_HASHGRID_PROJECT_COVERAGE,
+        )
+
+    def _hashgrid_cache_path(self, mask_north_ecliptic: bool) -> Path:
+        root = (
+            Path(self.cfg.hashgrid_cache_dir).expanduser()
+            if self.cfg.hashgrid_cache_dir else
+            Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'catsim' / 'catwise'
+        )
+        suffix = '' if mask_north_ecliptic else '_no_eclmask'
+        return root / self.cut_path / self.cfg.base_mask_version / f'w1w2_magcov_hashgrid{suffix}.npz'
+
+    def _hashgrid_metadata(self, grid_step, project_coverage, mask_north_ecliptic) -> dict:
+        return {
+            'format_version': 1,
+            'source_catalogue_sha256': self._source_catalogue_spec()['sha256'],
+            'cut_path': self.cut_path,
+            'base_mask_version': self.cfg.base_mask_version,
+            'mask_north_ecliptic': bool(mask_north_ecliptic),
+            'nside': self.nside,
+            'grid_step': list(grid_step),
+            'project_coverage': bool(project_coverage),
+        }
+
+    def _initialise_mag_cov_hashgrid(self) -> None:
+        mask_north_ecliptic = not self.use_noecl_mask
+        filepath = self._hashgrid_cache_path(mask_north_ecliptic)
+        expected = self._hashgrid_metadata(
+            _DEFAULT_HASHGRID_STEP, _DEFAULT_HASHGRID_PROJECT_COVERAGE, mask_north_ecliptic
+        )
+        if filepath.exists():
+            try:
+                with np.load(filepath, allow_pickle=False) as data:
+                    compatible = (
+                        'metadata' in data
+                        and json.loads(str(data['metadata'].item())) == expected
+                    )
+                if compatible:
+                    self.hashgrid = HashGrid.load(filepath)
+                    return
+            except (ValueError, OSError, EOFError, KeyError, pickle.UnpicklingError, zipfile.BadZipFile):
+                pass
+        print(f'Building missing or incompatible CatWISE hashgrid: {filepath}')
+        self.northecl_is_masked = mask_north_ecliptic
+        if not self.catalogue_is_loaded or getattr(self, 'source_catalogue_sha256', None) != expected['source_catalogue_sha256']:
+            self.load_catalogue()
+        self.determine_masked_pixels(mask_north_ecliptic=mask_north_ecliptic)
+        self.make_masked_catalogue()
+        self._create_default_mag_cov_hashgrid()
+        self.hashgrid = HashGrid.load(filepath)
+
     def create_mag_cov_hashgrid(
             self, 
             grid_step: list[float], 
             project_coverage: bool = False
     ) -> None:
+        expected_sha256 = self._source_catalogue_spec()['sha256']
+        if getattr(self, 'source_catalogue_sha256', None) != expected_sha256:
+            raise ValueError('Load a checksum-verified source catalogue before building a hashgrid.')
         cat = self.masked_catalogue
         logw1cov = np.log10(cat['w1cov'])
         logw2cov = np.log10(cat['w2cov'])
@@ -1090,11 +1176,19 @@ class Catwise:
             grid_step=grid_step
         )
 
-        with data_path(self.cut_path, 'mag_coverage') as file_dir:
-            if self.northecl_is_masked:
-                hashgrid.save(file_dir / f'w1w2_magcov_hashgrid.npz')
-            else:
-                hashgrid.save(file_dir / f'w1w2_magcov_hashgrid_no_eclmask.npz')
+        hashgrid.metadata = self._hashgrid_metadata(
+            grid_step, project_coverage, self.northecl_is_masked
+        )
+        filepath = self._hashgrid_cache_path(self.northecl_is_masked)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replacement also avoids modifying hard-linked legacy files.
+        with tempfile.NamedTemporaryFile(dir=filepath.parent, suffix='.npz', delete=False) as stream:
+            temporary_path = Path(stream.name)
+        try:
+            hashgrid.save(temporary_path)
+            temporary_path.replace(filepath)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def create_magnitude_coverage_cell_dist(self):
         cat = self.masked_catalogue
@@ -1303,12 +1397,7 @@ class Catwise:
                 fname_append=fname_append if self.use_noecl_mask else None
             )
 
-        with data_path(
-            self.cut_path, 
-            'mag_coverage', 
-            f'w1w2_magcov_hashgrid{fname_append}.npz'
-        ) as filepath:
-            self.hashgrid = HashGrid.load(filepath)
+        self._initialise_mag_cov_hashgrid()
 
         # loads things back into numpy
         # for now we just hardcode the use of the unmasked covmaps;

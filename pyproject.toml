@@ -30,6 +30,8 @@ jax = [
 ]
 
 [tool.poetry]
+include = [{ path = "src/catsim/data/catwise_catalogues.json", format = ["sdist", "wheel"] }]
+exclude = ["src/catsim/data/**/mag_coverage/w1w2_magcov_hashgrid*.npz"]
 
 [tool.poetry.group.dev.dependencies]
 matplotlib = "^3.10.7"

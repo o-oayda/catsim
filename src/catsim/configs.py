@@ -15,6 +15,8 @@ class CatwiseConfig:
     downscale_nside: Optional[int] = None
     generate_correlated_points: bool = False
     s21_catalogue_path: Optional[str] = None
+    source_catalogue_path: Optional[str] = None
+    hashgrid_cache_dir: Optional[str] = None
     use_noecl_mask: bool = False
     add_confusion_noise: bool = False
     max_cluster_children_per_parent: int = 16
